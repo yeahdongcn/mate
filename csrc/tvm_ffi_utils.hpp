@@ -83,6 +83,38 @@ inline void expect_shape(ffi::TensorView tensor, std::initializer_list<int64_t> 
   }
 }
 
+inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, const char* a_name, const char* b_name) {
+  TVM_FFI_ICHECK_EQ(a.ndim(), b.ndim()) << a_name << ".ndim() and " << b_name << ".ndim() mismatch";
+  for (int i = 0; i < a.ndim(); ++i) {
+    TVM_FFI_ICHECK_EQ(a.size(i), b.size(i))
+        << a_name << ".size(" << i << ") and " << b_name << ".size(" << i << ") mismatch";
+  }
+}
+
+inline void check_shape(const tvm::ffi::TensorView& a,
+                        const tvm::ffi::TensorView& b,
+                        const char*                 a_name,
+                        const char*                 b_name) {
+  TVM_FFI_ICHECK_EQ(a.ndim(), b.ndim()) << a_name << ".ndim() and " << b_name << ".ndim() mismatch";
+  for (int i = 0; i < a.ndim(); ++i) {
+    TVM_FFI_ICHECK_EQ(a.size(i), b.size(i))
+        << a_name << ".size(" << i << ") and " << b_name << ".size(" << i << ") mismatch";
+  }
+}
+
+inline void check_shape_at_dims(const ffi::TensorView&         tensor,
+                                const ffi::TensorView&         ref,
+                                std::initializer_list<int32_t> dims,
+                                const char*                    name,
+                                const char*                    ref_name) {
+  TVM_FFI_ICHECK_EQ(tensor.ndim(), ref.ndim()) << name << " rank must match " << ref_name;
+  for (int32_t dim : dims) {
+    TVM_FFI_ICHECK_GE(dim, 0);
+    TVM_FFI_ICHECK_LT(dim, tensor.ndim()) << name << " invalid dim " << dim;
+    TVM_FFI_ICHECK_EQ(tensor.size(dim), ref.size(dim)) << name << " shape must match " << ref_name << " at dim " << dim;
+  }
+}
+
 struct StridedTensorView {
   ffi::Shape      shape;
   ffi::Shape      strides;

@@ -7,7 +7,9 @@
 
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <initializer_list>
+#include <mute/layout.hpp>
 #include <optional>
 
 #include "asm_common.hpp"
@@ -24,39 +26,39 @@ struct FlashAttenASMArgs {
   int32_t num_mp{};
 
   // shape
-  int32_t batch{};
-  int32_t nr_heads{};
-  int32_t seqlen_q{};
-  int32_t headdim_qk{};
+  int64_t batch{};
+  int64_t nr_heads{};
+  int64_t seqlen_q{};
+  int64_t headdim_qk{};
 
-  int32_t seqlen_kv{};
-  int32_t nr_heads_kv{};
+  int64_t seqlen_kv{};
+  int64_t nr_heads_kv{};
 
-  int32_t headdim_v{};
+  int64_t headdim_v{};
 
   // stride
-  int32_t batch_stride_q{};
-  int32_t head_stride_q{};
-  int32_t seq_stride_q{};
+  int64_t batch_stride_q{};
+  int64_t head_stride_q{};
+  int64_t seq_stride_q{};
 
-  int32_t batch_stride_k{};
-  int32_t head_stride_k{};
-  int32_t seq_stride_k{};
+  int64_t batch_stride_k{};
+  int64_t head_stride_k{};
+  int64_t seq_stride_k{};
 
-  int32_t batch_stride_v{};
-  int32_t head_stride_v{};
-  int32_t seq_stride_v{};
+  int64_t batch_stride_v{};
+  int64_t head_stride_v{};
+  int64_t seq_stride_v{};
 
   // unused
-  int32_t batch_stride_mask{};
-  int32_t head_stride_mask{};
-  int32_t seq_stride_mask{};
+  int64_t batch_stride_mask{};
+  int64_t head_stride_mask{};
+  int64_t seq_stride_mask{};
 
-  int32_t batch_stride_out{};
-  int32_t head_stride_out{};
-  int32_t seq_stride_out{};
+  int64_t batch_stride_out{};
+  int64_t head_stride_out{};
+  int64_t seq_stride_out{};
 
-  int32_t nr_k{};
+  size_t  nr_k{};
   int32_t nr_mask{};  // unused
 
   double softmax_scale{};
@@ -79,34 +81,34 @@ struct FlashAttenVarlenASMArgs {
 
   int32_t num_mp{};
 
-  int32_t batch{};
+  int64_t batch{};
 
   // shape
-  int32_t total_seqlen_q{};
-  int32_t nr_heads{};
-  int32_t headdim_qk{};
+  int64_t total_seqlen_q{};
+  int64_t nr_heads{};
+  int64_t headdim_qk{};
 
-  int32_t total_seqlen_kv{};
-  int32_t nr_heads_kv{};
+  int64_t total_seqlen_kv{};
+  int64_t nr_heads_kv{};
 
-  int32_t headdim_v{};
+  int64_t headdim_v{};
 
   // stride
-  int32_t total_seqlen_stride_q{};
-  int32_t head_stride_q{};
+  int64_t total_seqlen_stride_q{};
+  int64_t head_stride_q{};
 
-  int32_t total_seqlen_stride_k{};
-  int32_t head_stride_k{};
+  int64_t total_seqlen_stride_k{};
+  int64_t head_stride_k{};
 
-  int32_t total_seqlen_stride_v{};
-  int32_t head_stride_v{};
+  int64_t total_seqlen_stride_v{};
+  int64_t head_stride_v{};
 
-  int32_t total_seqlen_stride_out{};
-  int32_t head_stride_out{};
+  int64_t total_seqlen_stride_out{};
+  int64_t head_stride_out{};
 
-  int32_t nr_k{};
-  int32_t max_seqlen_q{};
-  int32_t max_seqlen_kv{};
+  size_t  nr_k{};
+  int64_t max_seqlen_q{};
+  int64_t max_seqlen_kv{};
 
   double softmax_scale{};
 
@@ -149,7 +151,7 @@ struct FlashAttenASMDispatcher {
 
     Config config;
 
-    const int headdim_qk = args.headdim_qk <= 128 ? 128 : args.headdim_qk;
+    const int headdim_qk = args.headdim_qk <= 128 ? 128 : static_cast<int32_t>(args.headdim_qk);
 
     if (headdim_qk == 128) {
       config.nr_thr    = 512;
@@ -335,47 +337,47 @@ class FlashAttentionAsmKernel {
     params.rln2_scale  = args.softmax_scale * log2e;
     params.nr_ln2      = 1.0 / log2e;
 
-    params.batch     = args.batch;
-    params.nheads    = args.nr_heads;
-    params.kv_heads  = args.nr_heads_kv;
-    params.seqlen_q  = args.seqlen_q;
-    params.seqlen_kv = args.seqlen_kv;
-    params.headdim_v = args.headdim_v;
+    params.batch     = static_cast<int32_t>(args.batch);
+    params.nheads    = static_cast<int32_t>(args.nr_heads);
+    params.kv_heads  = static_cast<int32_t>(args.nr_heads_kv);
+    params.seqlen_q  = static_cast<int32_t>(args.seqlen_q);
+    params.seqlen_kv = static_cast<int32_t>(args.seqlen_kv);
+    params.headdim_v = static_cast<int32_t>(args.headdim_v);
 
-    int  head_group       = args.nr_heads / args.nr_heads_kv;
+    int  head_group       = static_cast<int32_t>(args.nr_heads / args.nr_heads_kv);
     auto fast_head_group  = mutlass::FastDivmod(head_group);
     params.head_group_ori = fast_head_group.divisor;
     params.head_group_mul = fast_head_group.multiplier;
     params.head_group_sft = fast_head_group.shift_right;
 
+    params.batch_stride_k = static_cast<int32_t>(args.batch_stride_k);
+    params.head_stride_k  = static_cast<int32_t>(args.head_stride_k);
+    params.seq_stride_k   = static_cast<int32_t>(args.seq_stride_k);
+
     // sizeof(half) == sizeof(bfloat16)
-    params.ldg_key_stride = args.seq_stride_k * config.tile_n * sizeof(mutlass::half_t);
+    params.ldg_key_stride = params.seq_stride_k * config.tile_n * sizeof(mutlass::half_t);
 
-    params.batch_stride_k = args.batch_stride_k;
-    params.head_stride_k  = args.head_stride_k;
-    params.seq_stride_k   = args.seq_stride_k;
+    params.batch_stride_mask = 0;
+    params.head_stride_mask  = 0;
+    params.seq_stride_mask   = 0;
 
-    params.batch_stride_mask = args.batch_stride_mask;
-    params.head_stride_mask  = args.head_stride_mask;
-    params.seq_stride_mask   = args.seq_stride_mask;
-
-    params.batch_stride_out = args.batch_stride_out;
-    params.head_stride_out  = args.head_stride_out;
-    params.seq_stride_out   = args.seq_stride_out;
+    params.batch_stride_out = static_cast<int32_t>(args.batch_stride_out);
+    params.head_stride_out  = static_cast<int32_t>(args.head_stride_out);
+    params.seq_stride_out   = static_cast<int32_t>(args.seq_stride_out);
 
     // sizeof(half) == sizeof(bfloat16)
     params.tile_size_q = config.tile_m * config.tile_k * sizeof(mutlass::half_t);
     params.tile_size_k = config.tile_n * config.tile_k * sizeof(mutlass::half_t);
     params.tile_size_v = config.tile_hdim * config.tile_k * sizeof(mutlass::half_t);
 
-    int seq_q_tile_num = mutlass::ceil_div(args.seqlen_q, config.tile_m);
-    params.tile_num    = seq_q_tile_num * args.batch * args.nr_heads;
+    int seq_q_tile_num = mutlass::ceil_div(params.seqlen_q, config.tile_m);
+    params.tile_num    = seq_q_tile_num * params.batch * params.nheads;
 
     int nr_persistence           = std::min(args.num_mp, params.tile_num);
     params.double_block_num_sub1 = 2 * nr_persistence - 1;
     params.double_block_num      = 2 * nr_persistence;
 
-    auto fast_seqq_mul_heads  = mutlass::FastDivmod(args.nr_heads * seq_q_tile_num);
+    auto fast_seqq_mul_heads  = mutlass::FastDivmod(params.nheads * seq_q_tile_num);
     params.seqq_mul_heads_div = fast_seqq_mul_heads.divisor;
     params.seqq_mul_heads_mul = fast_seqq_mul_heads.multiplier;
     params.seqq_mul_heads_sft = fast_seqq_mul_heads.shift_right;
@@ -400,7 +402,7 @@ class FlashAttentionAsmKernel {
     params.tile_v_dim2 = 1;
     params.tile_v_dim3 = 1;
 
-    params.tile_out_dim0 = args.headdim_v;
+    params.tile_out_dim0 = static_cast<int32_t>(args.headdim_v);
     params.tile_out_dim1 = 4;
     params.tile_out_dim2 = 1;
     params.tile_out_dim3 = 1;
@@ -535,28 +537,29 @@ class FlashAttentionVarlenAsmKernel {
     params.rln2_scale  = args.softmax_scale * log2e;
     params.nr_ln2      = 1.0 / log2e;
 
-    params.batch         = args.batch;
-    params.nheads        = args.nr_heads;
-    params.kv_heads      = args.nr_heads_kv;
-    params.max_seqlen_q  = args.max_seqlen_q;
-    params.max_seqlen_kv = args.max_seqlen_kv;
-    params.headdim_v     = args.headdim_v;
+    params.batch         = static_cast<int32_t>(args.batch);
+    params.nheads        = static_cast<int32_t>(args.nr_heads);
+    params.kv_heads      = static_cast<int32_t>(args.nr_heads_kv);
+    params.max_seqlen_q  = static_cast<int32_t>(args.max_seqlen_q);
+    params.max_seqlen_kv = static_cast<int32_t>(args.max_seqlen_kv);
+    params.headdim_v     = static_cast<int32_t>(args.headdim_v);
 
-    int  head_group       = args.nr_heads / args.nr_heads_kv;
+    int  head_group       = static_cast<int32_t>(args.nr_heads / args.nr_heads_kv);
     auto fast_head_group  = mutlass::FastDivmod(head_group);
     params.head_group_ori = fast_head_group.divisor;
     params.head_group_mul = fast_head_group.multiplier;
     params.head_group_sft = fast_head_group.shift_right;
 
+    params.total_seqlen_q = static_cast<int32_t>(args.total_seqlen_q);
+
+    params.total_seqlen_stride_k = static_cast<int32_t>(args.total_seqlen_stride_k);
+    params.head_stride_k         = static_cast<int32_t>(args.head_stride_k);
+
     // sizeof(half) == sizeof(bfloat16)
-    params.ldg_key_stride = args.total_seqlen_stride_k * config.tile_n * sizeof(mutlass::half_t);
-    params.total_seqlen_q = args.total_seqlen_q;
+    params.ldg_key_stride = params.total_seqlen_stride_k * config.tile_n * sizeof(mutlass::half_t);
 
-    params.total_seqlen_stride_k = args.total_seqlen_stride_k;
-    params.head_stride_k         = args.head_stride_k;
-
-    params.total_seqlen_stride_out = args.total_seqlen_stride_out;
-    params.head_stride_out         = args.head_stride_out;
+    params.total_seqlen_stride_out = static_cast<int32_t>(args.total_seqlen_stride_out);
+    params.head_stride_out         = static_cast<int32_t>(args.head_stride_out);
 
     // sizeof(half) == sizeof(bfloat16)
     params.tile_size_q = config.tile_m * config.tile_k * sizeof(mutlass::half_t);
@@ -613,6 +616,32 @@ class FlashAttentionVarlenAsmKernel {
 
 }  // namespace mate::flash_attention
 
+namespace {
+
+size_t logical_span_elements(ffi::TensorView tensor, const char* name) {
+  TVM_FFI_ICHECK(tensor.ndim() == 3 || tensor.ndim() == 4) << name << " must be a 3D or 4D tensor";
+  if (tensor.size(0) == 0) {
+    return 0;
+  }
+  for (int32_t dim = 0; dim < tensor.ndim(); ++dim) {
+    if (tensor.size(dim) == 0) {
+      return 0;
+    }
+    TVM_FFI_ICHECK_GE(tensor.stride(dim), 0) << name << " must have non-negative strides";
+  }
+  if (tensor.ndim() == 3) {
+    auto layout = mute::make_layout(mute::make_shape(tensor.size(0), tensor.size(1), tensor.size(2)),
+                                    mute::make_stride(tensor.stride(0), tensor.stride(1), tensor.stride(2)));
+    return static_cast<size_t>(mute::cosize(layout));
+  }
+  auto layout =
+      mute::make_layout(mute::make_shape(tensor.size(0), tensor.size(1), tensor.size(2), tensor.size(3)),
+                        mute::make_stride(tensor.stride(0), tensor.stride(1), tensor.stride(2), tensor.stride(3)));
+  return static_cast<size_t>(mute::cosize(layout));
+}
+
+}  // namespace
+
 void dispatch_flash_atten_asm(ffi::TensorView q,
                               ffi::TensorView k,
                               ffi::TensorView v,
@@ -657,17 +686,20 @@ void dispatch_flash_atten_asm(ffi::TensorView q,
   MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, q.device().device_id));
   args.num_mp = dprops.multiProcessorCount;
 
-  args.batch       = static_cast<int32_t>(q.size(0));
-  args.seqlen_q    = static_cast<int32_t>(q.size(1));
-  args.nr_heads    = static_cast<int32_t>(q.size(2));
-  args.headdim_qk  = static_cast<int32_t>(q.size(3));
-  args.seqlen_kv   = static_cast<int32_t>(k.size(1));
-  args.nr_heads_kv = static_cast<int32_t>(k.size(2));
-  args.headdim_v   = static_cast<int32_t>(v.size(3));
+  args.batch       = q.size(0);
+  args.seqlen_q    = q.size(1);
+  args.nr_heads    = q.size(2);
+  args.headdim_qk  = q.size(3);
+  args.seqlen_kv   = k.size(1);
+  args.nr_heads_kv = k.size(2);
+  args.headdim_v   = v.size(3);
 
   const bool is_192_128         = args.headdim_qk == 192 && args.headdim_v == 128;
   const bool is_128_128_or_less = args.headdim_qk == args.headdim_v && args.headdim_qk <= 128;
   TVM_FFI_ICHECK(is_192_128 || is_128_128_or_less) << "HeadDim unsupported";
+  TVM_FFI_ICHECK_GT(args.nr_heads_kv, 0) << "nr_heads_kv must be positive";
+  TVM_FFI_ICHECK_GE(args.nr_heads, args.nr_heads_kv) << "nr_heads must be >= nr_heads_kv";
+  TVM_FFI_ICHECK_EQ(args.nr_heads % args.nr_heads_kv, 0) << "nr_heads must be divisible by nr_heads_kv";
 
   expect_shape(q, {args.batch, args.seqlen_q, args.nr_heads, args.headdim_qk}, "q");
   expect_shape(k, {args.batch, args.seqlen_kv, args.nr_heads_kv, args.headdim_qk}, "k");
@@ -675,20 +707,20 @@ void dispatch_flash_atten_asm(ffi::TensorView q,
   expect_shape(out, {args.batch, args.seqlen_q, args.nr_heads, args.headdim_v}, "out");
   expect_shape(out_lse, {args.batch, args.nr_heads, args.seqlen_q}, "out_lse");
 
-  args.batch_stride_q   = static_cast<int32_t>(q.stride(0));
-  args.head_stride_q    = static_cast<int32_t>(q.stride(2));
-  args.seq_stride_q     = static_cast<int32_t>(q.stride(1));
-  args.batch_stride_k   = static_cast<int32_t>(k.stride(0));
-  args.head_stride_k    = static_cast<int32_t>(k.stride(2));
-  args.seq_stride_k     = static_cast<int32_t>(k.stride(1));
-  args.batch_stride_v   = static_cast<int32_t>(v.stride(0));
-  args.head_stride_v    = static_cast<int32_t>(v.stride(2));
-  args.seq_stride_v     = static_cast<int32_t>(v.stride(1));
-  args.batch_stride_out = static_cast<int32_t>(out.stride(0));
-  args.head_stride_out  = static_cast<int32_t>(out.stride(2));
-  args.seq_stride_out   = static_cast<int32_t>(out.stride(1));
+  args.batch_stride_q   = q.stride(0);
+  args.head_stride_q    = q.stride(2);
+  args.seq_stride_q     = q.stride(1);
+  args.batch_stride_k   = k.stride(0);
+  args.head_stride_k    = k.stride(2);
+  args.seq_stride_k     = k.stride(1);
+  args.batch_stride_v   = v.stride(0);
+  args.head_stride_v    = v.stride(2);
+  args.seq_stride_v     = v.stride(1);
+  args.batch_stride_out = out.stride(0);
+  args.head_stride_out  = out.stride(2);
+  args.seq_stride_out   = out.stride(1);
 
-  args.nr_k          = static_cast<int32_t>(k.numel());
+  args.nr_k          = logical_span_elements(k, "k");
   args.softmax_scale = softmax_scale;
   args.p_q           = q.data_ptr();
   args.p_k           = k.data_ptr();
@@ -758,7 +790,7 @@ void dispatch_flash_atten_varlen_asm(ffi::TensorView q,
   Args args{};
   args.is_causal = is_causal;
   args.data_type = q.dtype();
-  args.batch     = static_cast<int32_t>(input_cu_seqlen_q.size(0) - 1);
+  args.batch     = input_cu_seqlen_q.size(0) - 1;
 
   if (args.batch == 1) {
     std::array<int64_t, 4> q_shape{1, q.size(0), q.size(1), q.size(2)};
@@ -791,12 +823,12 @@ void dispatch_flash_atten_varlen_asm(ffi::TensorView q,
   MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, q.device().device_id));
   args.num_mp = dprops.multiProcessorCount;
 
-  args.total_seqlen_q  = static_cast<int32_t>(q.size(0));
-  args.nr_heads        = static_cast<int32_t>(q.size(1));
-  args.headdim_qk      = static_cast<int32_t>(q.size(2));
-  args.total_seqlen_kv = static_cast<int32_t>(k.size(0));
-  args.nr_heads_kv     = static_cast<int32_t>(k.size(1));
-  args.headdim_v       = static_cast<int32_t>(v.size(2));
+  args.total_seqlen_q  = q.size(0);
+  args.nr_heads        = q.size(1);
+  args.headdim_qk      = q.size(2);
+  args.total_seqlen_kv = k.size(0);
+  args.nr_heads_kv     = k.size(1);
+  args.headdim_v       = v.size(2);
 
   const bool is_192_128         = args.headdim_qk == 192 && args.headdim_v == 128;
   const bool is_128_128_or_less = args.headdim_qk == args.headdim_v && args.headdim_qk <= 128;
@@ -810,18 +842,18 @@ void dispatch_flash_atten_varlen_asm(ffi::TensorView q,
   expect_shape(out, {args.total_seqlen_q, args.nr_heads, args.headdim_v}, "out");
   expect_shape(out_lse, {args.nr_heads, args.total_seqlen_q}, "out_lse");
 
-  args.total_seqlen_stride_q   = static_cast<int32_t>(q.stride(0));
-  args.head_stride_q           = static_cast<int32_t>(q.stride(1));
-  args.total_seqlen_stride_k   = static_cast<int32_t>(k.stride(0));
-  args.head_stride_k           = static_cast<int32_t>(k.stride(1));
-  args.total_seqlen_stride_v   = static_cast<int32_t>(v.stride(0));
-  args.head_stride_v           = static_cast<int32_t>(v.stride(1));
-  args.total_seqlen_stride_out = static_cast<int32_t>(out.stride(0));
-  args.head_stride_out         = static_cast<int32_t>(out.stride(1));
+  args.total_seqlen_stride_q   = q.stride(0);
+  args.head_stride_q           = q.stride(1);
+  args.total_seqlen_stride_k   = k.stride(0);
+  args.head_stride_k           = k.stride(1);
+  args.total_seqlen_stride_v   = v.stride(0);
+  args.head_stride_v           = v.stride(1);
+  args.total_seqlen_stride_out = out.stride(0);
+  args.head_stride_out         = out.stride(1);
 
-  args.nr_k                = static_cast<int32_t>(k.numel());
-  args.max_seqlen_q        = static_cast<int32_t>(max_seqlen_q);
-  args.max_seqlen_kv       = static_cast<int32_t>(max_seqlen_kv);
+  args.nr_k                = logical_span_elements(k, "k");
+  args.max_seqlen_q        = max_seqlen_q;
+  args.max_seqlen_kv       = max_seqlen_kv;
   args.p_q                 = q.data_ptr();
   args.p_k                 = k.data_ptr();
   args.p_v                 = v.data_ptr();

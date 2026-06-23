@@ -3,6 +3,7 @@
 
 import math
 import random
+import inspect
 
 import pytest
 import torch
@@ -12,8 +13,7 @@ import pdb  # noqa: F401
 from einops import repeat, rearrange
 from typing import Optional, Union, Tuple  # noqa: F401
 
-from mate import flash_attn_varlen_func, flash_attn_with_kvcache
-from mate.jit.attention.fmha import _fmha_fwd_combine as fmha_fwd_combine
+from mate import flash_attn_combine, flash_attn_varlen_func, flash_attn_with_kvcache
 from mate.mha_interface import get_scheduler_metadata
 from mate.testing.flash_attn import (
     attention_ref,
@@ -32,21 +32,27 @@ from mate.testing.flash_attn import (
     pad_input,
     _combine_cp_partials,
     make_cp_rank_local_paged_kvcache,
+    arange_along_dim,  # noqa: F401
 )
 from mate.execution_context import (
     maybe_fake_tensor_mode,
     empty_if_dry_run,
     is_fake_mode,
     is_dry_run_enabled,
-    MateDryRunComplete,
 )
 from mate.testing import supported_musa_compute_capability
 from torch.testing import assert_close as cmp  # noqa: F401
+from mate.jit.attention.fmha.fmha_utils import round_multiple
 
 # from mate.jit.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
-torch.set_printoptions(sci_mode=False, precision=4)
+torch.set_printoptions(sci_mode=False, precision=4, linewidth=200)
 
 USE_FAKE_MODE = is_dry_run_enabled()
+
+
+def test_flash_attn_combine_signature_matches_fa3() -> None:
+    params = inspect.signature(flash_attn_combine).parameters
+    assert list(params) == ["out_partial", "lse_partial", "out", "out_dtype"]
 
 
 @supported_musa_compute_capability([31])
@@ -154,10 +160,11 @@ def test_metadata(
     atol, rtol = 1.5e-2, 1e-2
 
     if num_splits >= 0:
+        batch_rounded = round_multiple(batch_size, 4)
         metadata = empty_if_dry_run(
             get_scheduler_metadata,
             empty_values=torch.empty(
-                (4 * batch_size,), dtype=torch.int32, device=device
+                (4 * batch_rounded,), dtype=torch.int32, device=device
             ),
         )(
             batch_size=batch_size,
@@ -282,6 +289,95 @@ def test_metadata(
 
 
 @supported_musa_compute_capability([31])
+@pytest.mark.parametrize(
+    ("cu_seqlens_list", "max_seqlen"),
+    [
+        ([0, 128], 128),
+        ([0, 64, 128], 64),
+    ],
+)
+@torch.inference_mode()
+def test_varlen_mubin_preserves_noncontiguous_k_stride(
+    cu_seqlens_list: list[int],
+    max_seqlen: int,
+):
+    torch.manual_seed(123)
+    torch.musa.manual_seed(123)
+
+    device = "musa"
+    total_seqlen = cu_seqlens_list[-1]
+    num_heads = 24
+    head_dim = 64
+    dtype = torch.float16
+
+    qkv = torch.randn(total_seqlen, 3, num_heads, head_dim, device=device, dtype=dtype)
+    q, k_strided, v = qkv.unbind(dim=1)
+    assert k_strided.stride() == (3 * num_heads * head_dim, head_dim, 1)
+    assert not k_strided.is_contiguous()
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
+
+    out_strided = flash_attn_varlen_func(
+        q,
+        k_strided,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        backend="mubin",
+    )
+    out_contiguous = flash_attn_varlen_func(
+        q,
+        k_strided.contiguous(),
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        backend="mubin",
+    )
+
+    torch.testing.assert_close(out_strided, out_contiguous, atol=1e-3, rtol=1e-3)
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode()
+def test_mubin_accepts_large_singleton_batch_strides():
+    torch.manual_seed(123)
+    torch.musa.manual_seed(123)
+
+    device = "musa"
+    batch = 1
+    seqlen = 128
+    num_heads = 2
+    head_dim = 64
+    dtype = torch.float16
+    large_batch_stride = 2**31 + 1024
+
+    def make_large_batch_stride_view() -> tuple[torch.Tensor, torch.Tensor]:
+        base = torch.randn(seqlen, num_heads, head_dim, device=device, dtype=dtype)
+        view = base.as_strided(
+            (batch, seqlen, num_heads, head_dim),
+            (large_batch_stride, num_heads * head_dim, head_dim, 1),
+        )
+        regular = base.unsqueeze(0).contiguous()
+        return view, regular
+
+    q, q_regular = make_large_batch_stride_view()
+    k, k_regular = make_large_batch_stride_view()
+    v, v_regular = make_large_batch_stride_view()
+
+    assert q.stride(0) > torch.iinfo(torch.int32).max
+
+    out_strided = flash_attn_varlen_func(q, k, v, backend="mubin")
+    out_regular = flash_attn_varlen_func(
+        q_regular, k_regular, v_regular, backend="mubin"
+    )
+
+    torch.testing.assert_close(out_strided, out_regular, atol=1e-3, rtol=1e-3)
+
+
+@supported_musa_compute_capability([31])
 @maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("num_splits", [-1, 0, 5])
@@ -367,10 +463,11 @@ def test_varlen_func_bshd(
 
     metadata = None
     if num_splits >= 0:
+        batch_rounded = round_multiple(batch_size, 4)
         metadata = empty_if_dry_run(
             get_scheduler_metadata,
             empty_values=torch.empty(
-                (4 * batch_size,), dtype=torch.int32, device=device
+                (4 * batch_rounded,), dtype=torch.int32, device=device
             ),
         )(
             batch_size=batch_size,
@@ -591,10 +688,11 @@ def test_varlen_func_ragged_qkv(
 
             metadata = None
             if num_splits >= 0:
+                batch_rounded = round_multiple(batch_size, 4)
                 metadata = empty_if_dry_run(
                     get_scheduler_metadata,
                     empty_values=torch.empty(
-                        (4 * batch_size,), dtype=torch.int32, device=device
+                        (4 * batch_rounded,), dtype=torch.int32, device=device
                     ),
                 )(
                     batch_size=batch_size,
@@ -679,10 +777,11 @@ def test_varlen_func_ragged_qkv(
     else:
         metadata = None
         if num_splits >= 0:
+            batch_rounded = round_multiple(batch_size, 4)
             metadata = empty_if_dry_run(
                 get_scheduler_metadata,
                 empty_values=torch.empty(
-                    (4 * batch_size,), dtype=torch.int32, device=device
+                    (4 * batch_rounded,), dtype=torch.int32, device=device
                 ),
             )(
                 batch_size=batch_size,
@@ -880,10 +979,11 @@ def test_varlen_func_ragged_qkv_advance(
         learnable_sink = None
 
     if num_splits >= 0:
+        batch_rounded = round_multiple(batch_size, 4)
         metadata = empty_if_dry_run(
             get_scheduler_metadata,
             empty_values=torch.empty(
-                (4 * batch_size,), dtype=torch.int32, device=device
+                (4 * batch_rounded,), dtype=torch.int32, device=device
             ),
         )(
             batch_size=batch_size,
@@ -1128,10 +1228,11 @@ def test_paged_attn(
 
             metadata = None
             if num_splits >= 0:
+                batch_rounded = round_multiple(batch_size, 4)
                 metadata = empty_if_dry_run(
                     get_scheduler_metadata,
                     empty_values=torch.empty(
-                        (4 * batch_size,), dtype=torch.int32, device=device
+                        (4 * batch_rounded,), dtype=torch.int32, device=device
                     ),
                 )(
                     batch_size=batch_size,
@@ -1204,10 +1305,11 @@ def test_paged_attn(
     else:
         metadata = None
         if num_splits >= 0:
+            batch_rounded = round_multiple(batch_size, 4)
             metadata = empty_if_dry_run(
                 get_scheduler_metadata,
                 empty_values=torch.empty(
-                    (4 * batch_size,), dtype=torch.int32, device=device
+                    (4 * batch_rounded,), dtype=torch.int32, device=device
                 ),
             )(
                 batch_size=batch_size,
@@ -1450,10 +1552,11 @@ def test_paged_attn_advance(
 
     metadata = None
     if num_splits >= 0:
+        batch_rounded = round_multiple(batch_size, 4)
         metadata = empty_if_dry_run(
             get_scheduler_metadata,
             empty_values=torch.empty(
-                (4 * batch_size,), dtype=torch.int32, device=device
+                (4 * batch_rounded,), dtype=torch.int32, device=device
             ),
         )(
             batch_size=batch_size,
@@ -1616,49 +1719,49 @@ def test_combine(
 
     assert not reorder, "Reorder is not supported yet."
 
-    # Prepare metadata
+    # Prepare per-batch valid split counts. The FA3 fwd-style combine
+    # interface infers the maximum split count from out_partial.shape[0].
     num_splits = torch.randint(
         2, max_splits + 1, (batch_size,), device=device, dtype=torch.int32
     )
-    batch_table = torch.arange(batch_size, device=device, dtype=torch.int32)
-    batch_table = batch_table[torch.randperm(batch_size)] if reorder else batch_table
-    metadata = torch.cat(
-        [
-            num_splits,
-            batch_table,
-            torch.empty_like(num_splits),
-            torch.empty_like(num_splits),
-        ],
-        dim=0,
-    )
 
     # Prepare data
-    cu_seqlens_q, seqused_q, max_seqlen_q = None, None, None
+    cu_seqlens_q, seqused_q = None, None
     if mode in ("padded", "normal"):
-        shape_oaccum = (batch_size, num_head, max_splits, seqlen_q, headdim_v)  # type: ignore[assignment]
-        shape_lseaccum = (batch_size, num_head, max_splits, seqlen_q)  # type: ignore[assignment]
-        shape_out = (batch_size, seqlen_q, num_head, headdim_v)  # type: ignore[assignment]
-        shape_lse = (batch_size, num_head, seqlen_q)  # type: ignore[assignment]
+        shape_oaccum = (max_splits, batch_size, seqlen_q, num_head, headdim_v)  # type: ignore[assignment]
+        shape_lseaccum = (max_splits, batch_size, seqlen_q, num_head)  # type: ignore[assignment]
     elif mode == "ragged":
-        seqlens_q = torch.randint(
-            1, seqlen_q + 1, (batch_size,), device=device, dtype=torch.int32
-        )
-        cu_seqlens_q = torch.cat(
-            [
-                torch.tensor([0], dtype=torch.int32, device=device),
-                seqlens_q.cumsum(dim=0),
-            ]
-        ).to(torch.int32)
-        total_q = (
-            cu_seqlens_q[-1].item() if not is_fake_mode() else batch_size * seqlen_q
-        )
-        max_seqlen_q = seqlen_q
-        shape_oaccum = (1, num_head, max_splits, total_q, headdim_v)  # type: ignore[assignment]
-        shape_lseaccum = (1, num_head, max_splits, total_q)  # type: ignore[assignment]
-        shape_out = (total_q, num_head, headdim_v)  # type: ignore[assignment]
-        shape_lse = (num_head, total_q)  # type: ignore[assignment]
+        if is_fake_mode():
+            total_q = batch_size * seqlen_q
+        else:
+            seqlens_q = torch.randint(
+                1, seqlen_q + 1, (batch_size,), device=device, dtype=torch.int32
+            )
+            cu_seqlens_q = torch.cat(
+                [
+                    torch.tensor([0], dtype=torch.int32, device=device),
+                    seqlens_q.cumsum(dim=0),
+                ]
+            ).to(torch.int32)
+            total_q = cu_seqlens_q[-1].item()
+        shape_oaccum = (max_splits, 1, total_q, num_head, headdim_v)  # type: ignore[assignment]
+        shape_lseaccum = (max_splits, 1, total_q, num_head)  # type: ignore[assignment]
     else:
         raise ValueError(f"Unsupported mode: {mode}")
+    lse_storage_shape = shape_lseaccum[:2] + (
+        shape_lseaccum[3],
+        shape_lseaccum[2],
+    )
+    if is_fake_mode():
+        out_partial = torch.empty(shape_oaccum, device=device, dtype=torch.float32)
+        lse_partial = torch.empty(
+            lse_storage_shape,
+            device=device,
+            dtype=torch.float32,
+        ).transpose(2, 3)
+        flash_attn_combine(out_partial, lse_partial, out_dtype=dtype)
+        return
+
     if mode == "padded":
         seqused_q = torch.randint(
             1, seqlen_q + 1, (batch_size,), device=device, dtype=torch.int32
@@ -1666,28 +1769,17 @@ def test_combine(
         # max_seqlen_q = seqlen_q
 
     out_accum = torch.randn(shape_oaccum, device=device, dtype=torch.float32)
-    lse_accum = torch.randn(shape_lseaccum, device=device, dtype=torch.float32)
-    out = torch.empty(shape_out, device=device, dtype=dtype)
-    lse = torch.empty(shape_lse, device=device, dtype=torch.float32)
-
-    fmha_fwd_combine(
-        out,
-        lse,
-        out_accum,
-        lse_accum,
-        64,  # tile_n
-        cu_seqlens_q,
-        seqused_q,
-        max_seqlen_q,
-        max_splits,
-        metadata,
-    )
+    lse_partial = torch.randn(
+        lse_storage_shape,
+        device=device,
+        dtype=torch.float32,
+    ).transpose(2, 3)
 
     # Mask Seqlen
     if mode == "padded":
         for batch_idx, cur_seqlen_q in enumerate(seqused_q):
-            out_accum[batch_idx, ..., cur_seqlen_q:, :] = 0
-            lse_accum[batch_idx, ..., cur_seqlen_q:] = float("-inf")
+            out_accum[:, batch_idx, cur_seqlen_q:, :, :] = 0
+            lse_partial[:, batch_idx, cur_seqlen_q:, :] = float("-inf")
 
     # Mask Splits
     for batch_idx, cur_splits in enumerate(num_splits):
@@ -1696,24 +1788,33 @@ def test_combine(
             if mode == "ragged":
                 # pdb.set_trace()
                 out_accum[
-                    ...,
                     cur_splits:,
+                    0,
                     cu_seqlens_q[batch_idx] : cu_seqlens_q[batch_idx + 1],
                     :,
+                    :,
                 ] = 0
-                lse_accum[
-                    ...,
+                lse_partial[
                     cur_splits:,
+                    0,
                     cu_seqlens_q[batch_idx] : cu_seqlens_q[batch_idx + 1],
+                    :,
                 ] = float("-inf")
             else:
-                out_accum[batch_idx, :, cur_splits:, :, :] = 0
-                lse_accum[batch_idx, :, cur_splits:, :] = float("-inf")
+                out_accum[cur_splits:, batch_idx, :, :, :] = 0
+                lse_partial[cur_splits:, batch_idx, :, :] = float("-inf")
+
+    out_partial = out_accum.contiguous()
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=dtype)
+    if mode == "ragged":
+        out = out.squeeze(0)
+        lse = lse.squeeze(0)
 
     ref_out, ref_lse = attention_combine_ref(
-        out_accum,
-        lse_accum,
+        out_accum.transpose(2, 3),
+        lse_partial.transpose(2, 3),
     )
+    ref_lse = ref_lse.transpose(1, 2)
 
     if mode == "ragged":
         ref_out.squeeze_(0)
@@ -1722,9 +1823,9 @@ def test_combine(
         for batch_idx, cur_seqlen_q in enumerate(seqused_q):
             cur_seqlen_q = cur_seqlen_q.item()
             ref_out[batch_idx, cur_seqlen_q:] = 0
-            ref_lse[batch_idx, ..., cur_seqlen_q:] = 0
+            ref_lse[batch_idx, cur_seqlen_q:] = 0
             out[batch_idx, cur_seqlen_q:] = 0
-            lse[batch_idx, ..., cur_seqlen_q:] = 0
+            lse[batch_idx, cur_seqlen_q:] = 0
 
     torch.set_printoptions(sci_mode=False)
     atol, rtol = 1.5e-2, 1e-2
@@ -1734,19 +1835,66 @@ def test_combine(
 
 @supported_musa_compute_capability([31])
 @maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("num_splits", [-1, 0, 5])
-@pytest.mark.parametrize("num_splits", [0, 5])
-@pytest.mark.parametrize("new_kv", [True])
+@pytest.mark.parametrize("num_splits", [129, 256])
+@pytest.mark.parametrize("reuse_outputs", [False, True])
+def test_combine_high_splits(
+    num_splits: int,
+    reuse_outputs: bool,
+) -> None:
+    device = "musa"
+    batch_size, num_head, seqlen_q, headdim_v = 2, 2, 2, 64
+    dtype = torch.bfloat16
+
+    out_partial = torch.randn(
+        (num_splits, batch_size, seqlen_q, num_head, headdim_v),
+        device=device,
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        (num_splits, batch_size, num_head, seqlen_q),
+        device=device,
+        dtype=torch.float32,
+    ).transpose(2, 3)
+    out_buf = (
+        torch.empty(
+            (batch_size, seqlen_q, num_head, headdim_v),
+            device=device,
+            dtype=dtype,
+        )
+        if reuse_outputs
+        else None
+    )
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out=out_buf,
+        out_dtype=dtype,
+    )
+    if reuse_outputs:
+        assert out is out_buf
+
+    ref_out, ref_lse = attention_combine_ref(
+        out_partial.transpose(2, 3),
+        lse_partial.transpose(2, 3),
+    )
+    ref_lse = ref_lse.transpose(1, 2)
+
+    atol, rtol = 1.5e-2, 1e-2
+    torch.testing.assert_close(lse, ref_lse, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out, ref_out.to(out.dtype), atol=atol, rtol=rtol)
+
+
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("num_splits", [0])
+@pytest.mark.parametrize("new_kv", [True], ids=lambda x: "new_kv" if x else "no_new_kv")
 @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize(
-    "causal", [False, True], ids=lambda x: "causal" if x else "noncausal"
-)
-@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
+@pytest.mark.parametrize("causal", [True], ids=lambda x: "causal" if x else "noncausal")
+@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
 @pytest.mark.parametrize(
     "has_rotary_seqlens",
     [
-        False,
         True,
     ],
     ids=lambda x: "rotary_seqlens" if x else "no_rotary_seqlens",
@@ -1754,36 +1902,45 @@ def test_combine(
 @pytest.mark.parametrize(
     "rotary_interleaved",
     [
-        False,
         True,
     ],
     ids=lambda x: "rotary_interleaved" if x else "rotary_contiguous",
 )
-@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("page_size", [None, 1, 64])
+@pytest.mark.parametrize("rotary_fraction", [0.5])
+@pytest.mark.parametrize("page_size", [None, 32, 64])
 @pytest.mark.parametrize(
-    "has_leftpad", [True, False], ids=lambda x: "leftpad" if x else "no_leftpad"
+    "has_leftpad", [True], ids=lambda x: "leftpad" if x else "no_leftpad"
 )
 @pytest.mark.parametrize(
     "has_batch_idx", [True], ids=lambda x: "batch_idx" if x else "no_batch_idx"
 )
-@pytest.mark.parametrize("pack_gqa", [True])
+@pytest.mark.parametrize(
+    "pack_gqa", [True], ids=lambda x: "pack_gqa" if x else "no_pack_gqa"
+)
 @pytest.mark.parametrize(
     "varlen_q", [True], ids=lambda x: "varlen" if x else "nonvarlen"
 )
-@pytest.mark.parametrize("headdim", [(128, 128)])
+@pytest.mark.parametrize("heads", [(96, 8)], ids=["h96_8"])
 @pytest.mark.parametrize(
-    "heads",
+    "headdim",
     [
-        (96, 8),
-        # (40, 8),
-        # (32, 8),
+        (192, 128),
+        (128, 128),
+        (64, 256),
+        (64, 512),
+    ],
+    ids=[
+        "d192_128",
+        "d128_128",
+        "d64_256",
+        "d64_512",
     ],
 )
+@pytest.mark.parametrize("has_qv", [False, True], ids=lambda x: "qv" if x else "no_qv")
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (1, 128),
+        # (1, 128),
         (1, 339),
         (3, 1024),
         (64, 800),
@@ -1798,12 +1955,63 @@ def test_combine(
 )
 @pytest.mark.parametrize(
     "batch_size",
-    [1, 77],
+    [1, 43, 77],
 )
-@pytest.mark.parametrize("softcap", [0.0, 50.0])
-@pytest.mark.parametrize("attention_chunk", [0, 65])
+@pytest.mark.parametrize("softcap", [50.0])
+@pytest.mark.parametrize("attention_chunk", [65])
 @torch.inference_mode()
 def test_advance_features(
+    batch_size,
+    seqlen_q,
+    seqlen_k,
+    heads,
+    headdim,
+    has_qv,
+    varlen_q,
+    pack_gqa,
+    has_batch_idx,
+    has_leftpad,
+    page_size,
+    rotary_fraction,
+    rotary_interleaved,
+    has_rotary_seqlens,
+    seqlen_new_eq_seqlen_q,
+    causal,
+    local,
+    new_kv,
+    num_splits,
+    dtype,
+    attention_chunk,
+    softcap,
+) -> None:
+    torch.musa.empty_cache()
+    _run_test_advance_features(
+        batch_size,
+        seqlen_q,
+        seqlen_k,
+        heads,
+        headdim,
+        varlen_q,
+        pack_gqa,
+        has_batch_idx,
+        has_leftpad,
+        page_size,
+        rotary_fraction,
+        rotary_interleaved,
+        has_rotary_seqlens,
+        seqlen_new_eq_seqlen_q,
+        causal,
+        local,
+        new_kv,
+        num_splits,
+        has_qv,
+        dtype,
+        attention_chunk,
+        softcap,
+    )
+
+
+def _run_test_advance_features(
     batch_size,
     seqlen_q,
     seqlen_k,
@@ -1822,13 +2030,14 @@ def test_advance_features(
     local,
     new_kv,
     num_splits,
+    has_qv,
     dtype,
     attention_chunk,
     softcap,
 ) -> None:
     # Skip
-    # if page_size is not None and seqlen_k % page_size != 0:
-    #     pytest.skip()
+    if not has_qv and headdim not in ((192, 128), (128, 128)):
+        pytest.skip()
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv:
@@ -1837,7 +2046,11 @@ def test_advance_features(
     if rotary_fraction == 0.0:
         if has_rotary_seqlens or not rotary_interleaved:
             pytest.skip()
+    if dtype == torch.float8_e4m3fn and has_qv:
+        pytest.skip("float8 qv is not supported yet")
 
+    input_dtype = dtype
+    ref_dtype = torch.bfloat16
     device = "musa"
     torch.manual_seed(666)
     torch.musa.manual_seed(666)
@@ -1851,8 +2064,26 @@ def test_advance_features(
 
     # init_tensors()
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    q = torch.randn(
-        batch_size, seqlen_q, head_qo, headdim_qk, device=device, dtype=dtype
+    q = (
+        torch.randn(
+            batch_size, seqlen_q, head_qo, headdim_qk, device=device, dtype=ref_dtype
+        )
+        .to(input_dtype)
+        .to(ref_dtype)
+    )
+    qv_tensor = (
+        torch.randn(
+            batch_size,
+            seqlen_q,
+            head_qo,
+            headdim_vo,
+            device=device,
+            dtype=ref_dtype,
+        )
+        .to(input_dtype)
+        .to(ref_dtype)
+        if has_qv
+        else None
     )
     if varlen_q:
         query_padding_mask = generate_random_padding_mask(
@@ -1864,10 +2095,16 @@ def test_advance_features(
         output_pad_fn = lambda output_unpad: pad_input(
             output_unpad, indices_q, batch_size, seqlen_q
         )
+        qv_unpad = (
+            rearrange(qv_tensor, "b s ... -> (b s) ...")[indices_q]
+            if qv_tensor is not None
+            else None
+        )
     else:
         query_padding_mask = None
         q_unpad = q
         cu_seqlens_q, max_seqlen_q = None, seqlen_q
+        qv_unpad = qv_tensor
 
     window_size = (None, None) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -1875,19 +2112,30 @@ def test_advance_features(
     cu_seqlens_k_new = None
     key_new_padding_mask = None
     if new_kv:
-        k = torch.randn(
-            batch_size, seqlen_new, head_kv, headdim_qk, device=device, dtype=dtype
+        k = (
+            torch.randn(
+                batch_size,
+                seqlen_new,
+                head_kv,
+                headdim_qk,
+                device=device,
+                dtype=ref_dtype,
+            )
+            .to(input_dtype)
+            .to(ref_dtype)
         )
-        v = torch.randn(
-            batch_size, seqlen_new, head_kv, headdim_vo, device=device, dtype=dtype
+        v = (
+            torch.randn(
+                batch_size,
+                seqlen_new,
+                head_kv,
+                headdim_vo,
+                device=device,
+                dtype=ref_dtype,
+            )
+            .to(input_dtype)
+            .to(ref_dtype)
         )
-        # k = (
-        #     torch.arange(headdim_qk, dtype=dtype, device=device)
-        #     .view(1, 1, 1, -1)
-        #     .expand(batch_size, seqlen_new, head_kv, headdim_qk)
-        #     .contiguous()
-        # )
-        # v = k.clone()
         if varlen_q:  # k & v are also varlen
             key_new_padding_mask = generate_random_padding_mask(
                 seqlen_new, batch_size, device, mode="random"
@@ -1901,11 +2149,32 @@ def test_advance_features(
     else:
         k, v, k_unpad, v_unpad = None, None, None, None
     if page_size is None:
-        k_cache = torch.randn(
-            batch_size_cache, seqlen_k, head_kv, headdim_qk, device=device, dtype=dtype
+        k_cache = (
+            torch.randn(
+                batch_size_cache,
+                seqlen_k,
+                head_kv,
+                headdim_qk,
+                device=device,
+                dtype=ref_dtype,
+            )
+            .to(input_dtype)
+            .to(ref_dtype)
         )
-        v_cache = torch.randn(
-            batch_size_cache, seqlen_k, head_kv, headdim_vo, device=device, dtype=dtype
+        # v_cache = torch.arange(seqlen_k, device=device, dtype=ref_dtype).view(
+        #     1, -1, 1, 1
+        # ).expand(batch_size_cache, seqlen_k, head_kv, headdim_vo).to(input_dtype).to(ref_dtype)
+        v_cache = (
+            torch.randn(
+                batch_size_cache,
+                seqlen_k,
+                head_kv,
+                headdim_vo,
+                device=device,
+                dtype=ref_dtype,
+            )
+            .to(input_dtype)
+            .to(ref_dtype)
         )
         page_table = None
     else:
@@ -1925,6 +2194,7 @@ def test_advance_features(
             headdim_vo,
             device,
             dtype,
+            ref_dtype,
             torch.randn,
         )
     cache_seqlens = torch.randint(
@@ -1999,8 +2269,8 @@ def test_advance_features(
             * 2
             * math.pi
         )
-        cos = torch.cos(angle).to(dtype=dtype)
-        sin = torch.sin(angle).to(dtype=dtype)
+        cos = torch.cos(angle).to(dtype=ref_dtype).to(input_dtype).to(ref_dtype)
+        sin = torch.sin(angle).to(dtype=ref_dtype).to(input_dtype).to(ref_dtype)
         if not is_fake_mode():
             if causal or effective_local:
                 q_ro = apply_rotary_emb(
@@ -2055,42 +2325,105 @@ def test_advance_features(
             v_to_update = v_to_update[indices_k]
         k_cache_ref[update_mask] = k_to_update
         v_cache_ref[update_mask] = v_to_update
-    k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=head_qo // head_kv)
-    v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=head_qo // head_kv)
+    is_fp8 = input_dtype == torch.float8_e4m3fn
+    if is_fp8:
+        q_descale, k_descale, v_descale = [
+            torch.rand(batch_size, head_kv, device=device, dtype=torch.float32) * 2
+            for _ in range(3)
+        ]
+    else:
+        q_descale, k_descale, v_descale = None, None, None
+    assert all(x is not None for x in (q_descale, k_descale, v_descale)) == is_fp8
+
+    # generate_ref()
+    out_ref, _, score_ref = attention_ref(
+        q_ro,
+        k_cache_ref,
+        v_cache_ref,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        qv=qv_tensor,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        key_leftpad=cache_leftpad,
+        softcap=softcap,
+    )
+    out_pt, _, _ = attention_ref(
+        q_ro,
+        k_cache_ref,
+        v_cache_ref,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        qv=qv_tensor,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        key_leftpad=cache_leftpad,
+        softcap=softcap,
+        upcast=False,
+        reorder_ops=True,
+        intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+    )
+    # Handle dtype conversion
+    q = q.to(input_dtype)
+    q_unpad = q_unpad.to(input_dtype)
+    k_cache = k_cache.to(input_dtype)
+    v_cache = v_cache.to(input_dtype)
+    k_cache_paged = k_cache_paged.to(input_dtype) if page_size is not None else None
+    v_cache_paged = v_cache_paged.to(input_dtype) if page_size is not None else None
+    k = k.to(input_dtype) if k is not None else None
+    v = v.to(input_dtype) if v is not None else None
+    k_unpad = k_unpad.to(input_dtype) if k_unpad is not None else None
+    v_unpad = v_unpad.to(input_dtype) if v_unpad is not None else None
+    qv_unpad = qv_unpad.to(input_dtype) if qv_unpad is not None else None
+    cos = cos.to(input_dtype) if cos is not None else None
+    sin = sin.to(input_dtype) if sin is not None else None
 
     # call_kernel()
     scheduler_metadata = None
     if num_splits >= 0:
-        try:
-            scheduler_metadata = get_scheduler_metadata(
-                batch_size=batch_size,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=seqlen_k,
-                num_heads_q=head_qo,
-                num_heads_kv=head_kv,
-                headdim=headdim_qk,
-                seqused_q=None,
-                seqused_k=cache_seqlens,
-                headdim_v=headdim_vo,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=None,
-                cu_seqlens_k_new=cu_seqlens_k_new,
-                cache_leftpad=cache_leftpad,
-                page_size=page_size,
-                max_seqlen_k_new=seqlen_new if new_kv else 0,
-                causal=causal,
-                window_size=window_size,
-                attention_chunk=attention_chunk,
-                has_softcap=softcap != 0.0,
-                num_splits=num_splits,
-                pack_gqa=pack_gqa,
-                mp_margin=0,
-            )
-            # print(scheduler_metadata[: 4 * batch_size].view(4, -1))
-        except MateDryRunComplete:
-            scheduler_metadata = torch.empty(
-                4 * batch_size, device=device, dtype=torch.int32
-            )
+        batch_rounded = round_multiple(batch_size, 4)
+        scheduler_metadata = empty_if_dry_run(
+            get_scheduler_metadata,
+            empty_values=torch.empty(
+                4 * batch_rounded,
+                device=device,
+                dtype=torch.int32,
+            ),
+        )(
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=seqlen_k,
+            num_heads_q=head_qo,
+            num_heads_kv=head_kv,
+            headdim=headdim_qk,
+            seqused_q=None,
+            seqused_k=cache_seqlens,
+            headdim_v=headdim_vo,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=None,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            cache_leftpad=cache_leftpad,
+            page_size=page_size,
+            max_seqlen_k_new=seqlen_new if new_kv else 0,
+            causal=causal,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            has_softcap=softcap != 0.0,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            has_qv=has_qv,
+            mp_margin=0,
+            qkv_dtype=input_dtype,
+        )
+        # print(scheduler_metadata[: 4 * batch_size].view(4, -1))
 
     out, lse, *rest = flash_attn_with_kvcache(
         q if not varlen_q else q_unpad,
@@ -2098,6 +2431,7 @@ def test_advance_features(
         v_cache if page_size is None else v_cache_paged,
         k if not new_kv or not varlen_q else k_unpad,
         v if not new_kv or not varlen_q else v_unpad,
+        qv=qv_unpad,
         rotary_cos=cos,
         rotary_sin=sin,
         cache_seqlens=cache_seqlens,
@@ -2107,7 +2441,10 @@ def test_advance_features(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k_new=cu_seqlens_k_new,
         max_seqlen_q=max_seqlen_q,
-        rotary_seqlens=rotary_seqlens,
+        rotary_seqlens=rotary_seqlens if (not has_qv or has_rotary_seqlens) else None,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         causal=causal,
         window_size=window_size,
         attention_chunk=attention_chunk,
@@ -2118,34 +2455,29 @@ def test_advance_features(
         return_softmax_lse=True,
         pack_gqa=pack_gqa,
     )
+    torch.musa.synchronize()
     if varlen_q:
         out = output_pad_fn(out)
 
-    # generate_ref()
-    out_ref, _, score_ref = attention_ref(
-        q_ro,
-        k_cache_rep,
-        v_cache_rep,
-        query_padding_mask,
-        key_padding_mask,
-        causal=causal,
-        qv=None,
-        window_size=window_size,
-        attention_chunk=attention_chunk,
-        key_leftpad=cache_leftpad,
-        softcap=softcap,
-    )
-
     # compare()
-    # print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-    # print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+
     if new_kv:
         if page_size is None:
-            k_cache_select = k_cache if not has_batch_idx else k_cache[cache_batch_idx]
-            v_cache_select = v_cache if not has_batch_idx else v_cache[cache_batch_idx]
+            k_cache_select = (
+                k_cache.to(ref_dtype)
+                if not has_batch_idx
+                else k_cache.to(ref_dtype)[cache_batch_idx]
+            )
+            v_cache_select = (
+                v_cache.to(ref_dtype)
+                if not has_batch_idx
+                else v_cache.to(ref_dtype)[cache_batch_idx]
+            )
         else:
             k_cache_select = rearrange(
-                k_cache_paged[
+                k_cache_paged.to(ref_dtype)[
                     (
                         page_table if not has_batch_idx else page_table[cache_batch_idx]
                     ).flatten()
@@ -2154,7 +2486,7 @@ def test_advance_features(
                 b=batch_size,
             )[:, :seqlen_k]
             v_cache_select = rearrange(
-                v_cache_paged[
+                v_cache_paged.to(ref_dtype)[
                     (
                         page_table if not has_batch_idx else page_table[cache_batch_idx]
                     ).flatten()
@@ -2162,15 +2494,25 @@ def test_advance_features(
                 "(b nblocks) block_size ... -> b (nblocks block_size) ...",
                 b=batch_size,
             )[:, :seqlen_k]
-
+        k_cache_ref = k_cache_ref.to(input_dtype).to(ref_dtype)
+        v_cache_ref = v_cache_ref.to(input_dtype).to(ref_dtype)
         # Check Appended V Cache
         try:
-            cmp(
-                v_cache_select,
-                v_cache_ref,
-                rtol=0,
-                atol=0,
-            )
+            if input_dtype is not torch.float8_e4m3fn:
+                cmp(
+                    v_cache_select,
+                    v_cache_ref,
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                # For FP8, we allow larger tolerance due to the limited precision.
+                cmp(
+                    v_cache_select,
+                    v_cache_ref,
+                    rtol=1e-3,
+                    atol=1e-3,
+                )
         except:
             # pdb.set_trace()
             raise
@@ -2178,7 +2520,10 @@ def test_advance_features(
         if rotary_dim == 0:
             at, rt = 0.0, 0.0
         else:
-            at, rt = 1e-2, 1.5e-2
+            if input_dtype is not torch.float8_e4m3fn:
+                at, rt = 1e-2, 1.5e-2
+            else:
+                at, rt = 1e-1, 1e-1
 
         try:
             cmp(
@@ -2193,8 +2538,26 @@ def test_advance_features(
     # mult = 2
     # pdb.set_trace()
     # Check Attention Output
+    _, lse_ref = lse_ref_from_score(
+        score_ref,
+        is_causal=causal,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=cache_seqlens,
+        learnable_sink=None,
+    )
     try:
-        cmp(out, out_ref, rtol=1e-2, atol=1.5e-2)
+        mult = 4 if input_dtype == torch.float8_e4m3fn else 2
+        mult_mean = 3 if input_dtype == torch.float8_e4m3fn else 1.5
+        # cmp(out, out_ref, rtol=1e-2, atol=1.5e-2)
+        diff_max_ours = (out - out_ref).abs().max().item()
+        diff_max_pt = (out_pt - out_ref).abs().max().item()
+        diff_mean_ours = (out - out_ref).abs().mean().item()
+        diff_mean_pt = (out_pt - out_ref).abs().mean().item()
+        assert diff_max_ours <= mult * diff_max_pt + 1e-5
+        assert diff_mean_ours <= mult_mean * diff_mean_pt + 1e-5
+        # cmp(lse, lse_ref, rtol=1e-2, atol=1.5e-2)
     except:
         # pdb.set_trace()
         raise

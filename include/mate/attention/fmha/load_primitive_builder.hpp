@@ -34,8 +34,10 @@ struct Mp31FmhaTmeLoadKeyBuilder {
 
   static constexpr int ElementBits = sizeof_bits_v<Element>;
 
-  using PermuteTileN =
+  using MmaPermuteTile =
       decltype(filter(make_ordered_layout(Shape<Int<MmaAtomN>, Int<Fragment>, Int<Repeats>>{}, Step<_2, _1, _3>{})));
+  using PermuteTileN =
+      decltype(filter(make_ordered_layout(Shape<Int<Fragment>, Int<MmaAtomN>, Int<Repeats>>{}, Step<_2, _1, _3>{})));
 
   // (int64_t, _1, int64_t, int64_t) -> ((int64_t, int64_t), _1, int64_t, int64_t)
   using StrideK = decltype(replace<0>(StrideK_{}, Stride<IndexType, IndexType>{}));

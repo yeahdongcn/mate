@@ -92,6 +92,7 @@ def sparse_attention_fwd_kernel(
     finalize_left = make_scheduled_decode_finalize_left(
         h_per_block=heads_per_block,
         out_width=dim_qk // 4,
+        num_heads=num_heads,
         accum_dtype=accum_dtype,
         sm_scale=sm_scale,
         has_attn_sink=has_attn_sink,
@@ -102,14 +103,17 @@ def sparse_attention_fwd_kernel(
         wait_before_final=True,
         l0_start=0,
         l1_start=dim_qk // 4,
+        out_dtype=dtype,
     )
     finalize_right = make_scheduled_decode_finalize_right(
         h_per_block=heads_per_block,
         out_width=dim_qk // 4,
+        num_heads=num_heads,
         has_attn_sink=has_attn_sink,
         wait_after_scale=True,
         r0_start=dim_qk // 2,
         r1_start=dim_qk // 2 + dim_qk // 4,
+        out_dtype=dtype,
     )
     stage_value_shared = make_scheduled_decode_stage_value_shared(
         block_i=block_i,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from functools import cache
 import warnings
 
@@ -11,6 +12,58 @@ from pathlib import Path
 
 from mate.execution_context import MateDryRunComplete
 from mate.testing.arch import MUSA_ARCH_CHECKER_ATTR, MUSA_ARCH_REQUIREMENT_ATTR
+
+
+_ENV_ENABLE = "MATE_PYTEST_GUARD_ALLOC"
+_ENV_MODE = "MATE_PYTEST_GUARD_MODE"
+_ENV_LOG_ALLOCATIONS = "MATE_PYTEST_GUARD_LOG_ALLOCATIONS"
+_SKIP_REASON = "guard allocator debug mode does not support MUSA graph capture"
+
+
+@dataclasses.dataclass(frozen=True)
+class _PytestGuardConfig:
+    enabled: bool
+    mode: str
+    log_allocations: bool
+
+
+def _parse_bool_env(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise pytest.UsageError(f"Invalid boolean value for {name}: {value!r}")
+
+
+def _resolve_guard_config(config: pytest.Config) -> _PytestGuardConfig:
+    enabled_opt = config.getoption("guard_alloc")
+    if enabled_opt is None:
+        enabled = _parse_bool_env(_ENV_ENABLE, default=False)
+    else:
+        enabled = enabled_opt
+
+    mode_opt = config.getoption("guard_mode")
+    mode = (mode_opt or os.environ.get(_ENV_MODE, "tail")).strip().lower()
+    if mode not in {"tail", "head"}:
+        raise pytest.UsageError(
+            f"Invalid {_ENV_MODE} value: {mode!r}. Expected 'tail' or 'head'."
+        )
+
+    log_allocations_opt = config.getoption("guard_log_allocations")
+    if log_allocations_opt is None:
+        log_allocations = _parse_bool_env(_ENV_LOG_ALLOCATIONS, default=False)
+    else:
+        log_allocations = log_allocations_opt
+
+    return _PytestGuardConfig(
+        enabled=enabled,
+        mode=mode,
+        log_allocations=log_allocations,
+    )
 
 
 def _format_cc(cc: int) -> str:
@@ -99,31 +152,118 @@ def _is_musa_oom(excinfo) -> bool:
         return True
 
     # TVM-FFI/DLPack allocation failures can surface as a plain MemoryError.
-    if excinfo.errisinstance(MemoryError):
+    # Some torch_musa paths surface OOM as RuntimeError: "MUSA error: out of memory".
+    if excinfo.errisinstance((MemoryError, RuntimeError)):
         message = str(excinfo.value).lower()
         return "musa" in message and "out of memory" in message
 
     return False
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("mate-guard")
+    group.addoption(
+        "--guard-alloc",
+        action="store_true",
+        dest="guard_alloc",
+        default=None,
+        help=(
+            "Install the MATE guard allocator before collecting tests. "
+            f"Can also be enabled with {_ENV_ENABLE}=1."
+        ),
+    )
+    group.addoption(
+        "--no-guard-alloc",
+        action="store_false",
+        dest="guard_alloc",
+        default=None,
+        help="Disable the MATE guard allocator even if the environment enables it.",
+    )
+    group.addoption(
+        "--guard-mode",
+        action="store",
+        choices=("tail", "head"),
+        default=None,
+        help=(
+            "Select which side of each allocation should use the unmapped guard page. "
+            f"Can also be set with {_ENV_MODE}=tail|head."
+        ),
+    )
+    group.addoption(
+        "--guard-log-allocations",
+        action="store_true",
+        dest="guard_log_allocations",
+        default=None,
+        help=(
+            "Log guard allocator alloc/free events to stderr. "
+            f"Can also be enabled with {_ENV_LOG_ALLOCATIONS}=1."
+        ),
+    )
+    group.addoption(
+        "--no-guard-log-allocations",
+        action="store_false",
+        dest="guard_log_allocations",
+        default=None,
+        help="Disable guard allocator allocation logging.",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "guard_incompatible: skip this test when pytest guard allocator mode is active",
+    )
+
+    guard_config = _resolve_guard_config(config)
+    setattr(config, "_mate_guard_config", guard_config)
+    if not guard_config.enabled:
+        return
+
+    from mate.memory_debug import GuardAllocatorConfig, install_guard_allocator
+
+    try:
+        install_guard_allocator(
+            GuardAllocatorConfig(
+                mode=guard_config.mode,
+                log_allocations=guard_config.log_allocations,
+            )
+        )
+    except RuntimeError as exc:
+        raise pytest.UsageError(
+            f"Failed to enable the MATE guard allocator before test collection: {exc}"
+        ) from exc
+
+
 def pytest_collection_modifyitems(
-    config: pytest.Config, items: list[pytest.Item]
+    config: pytest.Config,
+    items: list[pytest.Item],
 ) -> None:
     current_cc, detail = _current_musa_compute_capability()
+    guard_config = getattr(config, "_mate_guard_config", None)
+    guard_enabled = guard_config is not None and guard_config.enabled
+    skip_graph = pytest.mark.skip(reason=_SKIP_REASON)
 
     for item in items:
         test_func = getattr(item, "obj", None)
         requirement = getattr(test_func, MUSA_ARCH_REQUIREMENT_ATTR, None)
-        if requirement is None:
+        if requirement is not None:
+            checker = getattr(test_func, MUSA_ARCH_CHECKER_ATTR)
+            if current_cc is None or not checker(current_cc):
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=_musa_arch_skip_reason(requirement, current_cc, detail)
+                    )
+                )
+
+        if not guard_enabled:
             continue
 
-        checker = getattr(test_func, MUSA_ARCH_CHECKER_ATTR)
-        if current_cc is None or not checker(current_cc):
-            item.add_marker(
-                pytest.mark.skip(
-                    reason=_musa_arch_skip_reason(requirement, current_cc, detail)
-                )
-            )
+        should_skip = item.get_closest_marker("guard_incompatible") is not None
+        callspec = getattr(item, "callspec", None)
+        if callspec is not None and callspec.params.get("use_graph", False):
+            should_skip = True
+        if should_skip:
+            item.add_marker(skip_graph)
 
 
 @pytest.hookimpl(wrapper=True)

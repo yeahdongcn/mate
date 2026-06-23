@@ -379,7 +379,12 @@ def lse_ref_from_score(
         if learnable_sink is not None:
             lse_ref = torch.logaddexp(lse_ref, learnable_sink)
 
-        lse_ref = torch.nan_to_num(lse_ref)
+        lse_ref = torch.nan_to_num(
+            lse_ref,
+            nan=float("-inf"),
+            posinf=float("inf"),
+            neginf=float("-inf"),
+        )
 
         if is_causal and seqlen_q > seqlen_k:
             lse_ref[:, : seqlen_q - seqlen_k] = float("-inf")
@@ -527,17 +532,28 @@ def generate_block_kvcache(
     headdim_vo,
     device,
     dtype,
+    dtype_ref=None,
     rand_op=torch.randn,
 ):
     """
     Adapted from FlashAttention
     """
+    if dtype_ref is None:
+        dtype_ref = dtype
     num_blocks = math.ceil(max_seqlen_kv / page_size) * batch_size * 3
-    k_cache_paged = rand_op(
-        num_blocks, page_size, head_kv, headdim_qk, device=device, dtype=dtype
+    k_cache_paged = (
+        rand_op(
+            num_blocks, page_size, head_kv, headdim_qk, device=device, dtype=dtype_ref
+        )
+        .to(dtype)
+        .to(dtype_ref)
     )
-    v_cache_paged = rand_op(
-        num_blocks, page_size, head_kv, headdim_vo, device=device, dtype=dtype
+    v_cache_paged = (
+        rand_op(
+            num_blocks, page_size, head_kv, headdim_vo, device=device, dtype=dtype_ref
+        )
+        .to(dtype)
+        .to(dtype_ref)
     )
     page_table = rearrange(
         torch.randperm(num_blocks, dtype=torch.int32, device=device),
@@ -556,6 +572,96 @@ def generate_block_kvcache(
     )[:, :max_seqlen_kv]
 
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+
+
+def arange_along_dim(
+    tensor: torch.Tensor,
+    dim: int,
+) -> torch.Tensor:
+    assert 0 <= dim < tensor.dim(), (
+        f"Dimension {dim} out of range for tensor with {tensor.dim()} dimensions"
+    )
+    return (
+        torch.arange(tensor.size(dim), device=tensor.device, dtype=tensor.dtype)
+        .view(*[1 if i != dim else -1 for i in range(tensor.dim())])
+        .expand(*tensor.shape)
+    )
+
+
+def address_to_tensor_coords(
+    tensor: torch.Tensor,
+    address: int,
+) -> Tuple[int, ...]:
+    """
+    Convert a memory address to tensor coordinates.
+
+    Args:
+        tensor:
+            A PyTorch tensor.
+        address:
+            Target memory address (integer).
+
+    Returns:
+        Tuple of coordinates corresponding to the element.
+
+    Raises:
+        ValueError:
+            If the address is outside the tensor storage range or
+            does not align to an element boundary.
+    """
+
+    # Base address of tensor storage
+    base_addr = tensor.data_ptr()
+
+    # Element size in bytes
+    elem_size = tensor.element_size()
+
+    # Tensor metadata
+    shape = tensor.shape
+    strides = tensor.stride()
+
+    # Compute valid address range
+    max_offset = 0
+    for dim_size, stride in zip(shape, strides):
+        if dim_size > 0:
+            max_offset += (dim_size - 1) * stride
+
+    storage_bytes = (max_offset + 1) * elem_size
+    end_addr = base_addr + storage_bytes
+
+    # Range check
+    if not (base_addr <= address < end_addr):
+        raise ValueError(
+            f"Address 0x{address:x} is outside tensor range "
+            f"[0x{base_addr:x}, 0x{end_addr:x})"
+        )
+
+    # Byte offset from tensor base
+    byte_offset = address - base_addr
+
+    # Must align to element boundary
+    if byte_offset % elem_size != 0:
+        raise ValueError(
+            f"Address 0x{address:x} is not aligned to element size ({elem_size} bytes)"
+        )
+
+    # Convert to element offset
+    elem_offset = byte_offset // elem_size
+
+    # Recover coordinates using strides
+    coords = []
+    remaining = elem_offset
+
+    for dim_size, stride in zip(shape, strides):
+        coord = remaining // stride
+        remaining = remaining % stride
+
+        if coord >= dim_size:
+            raise ValueError("Address does not map to a valid tensor coordinate")
+
+        coords.append(coord)
+
+    return tuple(coords)
 
 
 def construct_local_mask(
@@ -785,12 +891,12 @@ def attention_accum_ref(
     assert cu_seqlens_kv is None or cu_seqlens_kv.shape[0] == batch_size + 1
 
     ref_o_accum = torch.zeros(
-        (batch_size, head_q, num_splits, seqlen_q, headdim_q),
+        (num_splits, batch_size, head_q, seqlen_q, headdim_q),
         dtype=torch.float,
         device=device,
     )
     ref_lse_accum = torch.zeros(
-        (batch_size, head_q, num_splits, seqlen_q), dtype=torch.float, device=device
+        (num_splits, batch_size, head_q, seqlen_q), dtype=torch.float, device=device
     )
 
     # print(
@@ -837,8 +943,8 @@ def attention_accum_ref(
             lse = torch.logsumexp(score, dim=-1)
             output = torch.einsum("hts,shd->htd", attn, v).to(torch.float)
 
-            ref_o_accum[real_batch_idx, :, split, :real_seqlen_q, :] = output
-            ref_lse_accum[real_batch_idx, :, split, :real_seqlen_q] = lse
+            ref_o_accum[split, real_batch_idx, :, :real_seqlen_q, :] = output
+            ref_lse_accum[split, real_batch_idx, :, :real_seqlen_q] = lse
 
     return ref_o_accum, ref_lse_accum
 
@@ -853,9 +959,9 @@ def attention_combine_ref(
     Parameters
     ----------
     out_accum : torch.Tensor
-        (batch, head, split, seqlen_q, dv) / (1, head, split, total_q, dv)
+        (split, batch, head, seqlen_q, dv) / (split, 1, head, total_q, dv)
     lse_accum : torch.Tensor
-        (batch, head, split, seqlen_q) / (1, head, split, total_q)
+        (split, batch, head, seqlen_q) / (split, 1, head, total_q)
 
     Returns
     -------
@@ -864,12 +970,12 @@ def attention_combine_ref(
     lse : torch.Tensor
         (batch, head, seqlen_q) or (1, head, total_q)
     """
-    lse = torch.logsumexp(lse_accum, dim=2)
-    scale = torch.exp(lse_accum - lse.unsqueeze(2))
+    lse = torch.logsumexp(lse_accum, dim=0)
+    scale = torch.exp(lse_accum - lse.unsqueeze(0))
     scale = torch.where(
         torch.isinf(scale) | torch.isnan(scale), torch.zeros_like(scale), scale
     )
-    out = (scale.unsqueeze(-1) * out_accum).sum(dim=2).transpose(1, 2)
+    out = (scale.unsqueeze(-1) * out_accum).sum(dim=0).transpose(1, 2)
     return out, lse
 
 

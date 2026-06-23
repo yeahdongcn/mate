@@ -5,6 +5,7 @@
 #include <mutlass/fast_math.h>
 
 #include <cmath>
+#include <cstdint>
 #include <mute/algorithm/tuple_algorithms.hpp>
 #include <mute/arch/copy_mp31_desc.hpp>
 #include <mutex>
@@ -25,42 +26,42 @@ struct MLAAsmArgs {
   DLDataType data_type;
 
   // int32_t tile_k{};
-  int32_t page_block_size{};
-  int32_t nr_block{};
+  int64_t page_block_size{};
+  int64_t nr_block{};
 
   // shape
-  int32_t batch{};
-  int32_t seqlen_q{};  // total_seqlen_q if is_varlen_q
-  int32_t nr_heads{};
-  int32_t headdim_qk{};
+  int64_t batch{};
+  int64_t seqlen_q{};  // total_seqlen_q if is_varlen_q
+  int64_t nr_heads{};
+  int64_t headdim_qk{};
 
-  int32_t seqlen_kv{};
-  int32_t nr_heads_kv{};
-  int32_t headdim_v{};
+  int64_t seqlen_kv{};
+  int64_t nr_heads_kv{};
+  int64_t headdim_v{};
 
-  int32_t total_q{};  // for varlen q
+  int64_t total_q{};  // for varlen q
 
   // stride
-  int32_t stride_q[4]{};
-  int32_t stride_q_rope[4]{};
-  int32_t stride_k[4]{};
-  int32_t stride_v[4]{};
+  int64_t stride_q[4]{};
+  int64_t stride_q_rope[4]{};
+  int64_t stride_k[4]{};
+  int64_t stride_v[4]{};
 
-  int32_t batch_stride_out{};
-  int32_t nosplit_batch_stride_out{};
-  int32_t head_stride_out{};
-  int32_t seq_stride_out{};
+  int64_t batch_stride_out{};
+  int64_t nosplit_batch_stride_out{};
+  int64_t head_stride_out{};
+  int64_t seq_stride_out{};
 
-  int32_t batch_stride_lse{};
-  int32_t nosplit_batch_stride_lse{};
-  int32_t head_stride_lse{};
-  int32_t seq_stride_lse{};
+  int64_t batch_stride_lse{};
+  int64_t nosplit_batch_stride_lse{};
+  int64_t head_stride_lse{};
+  int64_t seq_stride_lse{};
 
-  int32_t block_table_stride0{};
-  int32_t q_seq_per_hk{};
-  int32_t max_q_seq_per_hk{};
+  int64_t block_table_stride0{};
+  int64_t q_seq_per_hk{};
+  int64_t max_q_seq_per_hk{};
 
-  int32_t nr_mp_parts{};
+  int64_t nr_mp_parts{};
 
   double softmax_scale{};
 
@@ -321,32 +322,32 @@ struct MLAAsmKernel {
     params.rln2_scale  = args.softmax_scale * log2e;
     params.nr_ln2      = 1.0 / log2e;
 
-    params.batch        = args.batch;
-    params.nheads       = args.nr_heads;
-    params.kv_heads     = args.nr_heads_kv;
-    params.seqlen_q     = args.seqlen_q;
-    params.total_q      = args.total_q;
-    params.seqlen_kv    = args.seqlen_kv;
-    params.headdim_qk   = args.headdim_qk;
-    params.headdim_v    = args.headdim_v;
-    params.q_seq_per_hk = args.q_seq_per_hk;
+    params.batch        = static_cast<int32_t>(args.batch);
+    params.nheads       = static_cast<int32_t>(args.nr_heads);
+    params.kv_heads     = static_cast<int32_t>(args.nr_heads_kv);
+    params.seqlen_q     = static_cast<int32_t>(args.seqlen_q);
+    params.total_q      = static_cast<int32_t>(args.total_q);
+    params.seqlen_kv    = static_cast<int32_t>(args.seqlen_kv);
+    params.headdim_qk   = static_cast<int32_t>(args.headdim_qk);
+    params.headdim_v    = static_cast<int32_t>(args.headdim_v);
+    params.q_seq_per_hk = static_cast<int32_t>(args.q_seq_per_hk);
 
-    int  head_group       = args.nr_heads / args.nr_heads_kv;
+    int  head_group       = static_cast<int32_t>(args.nr_heads / args.nr_heads_kv);
     auto fast_head_group  = mutlass::FastDivmod(head_group);
     params.head_group_ori = fast_head_group.divisor;
     params.head_group_mul = fast_head_group.multiplier;
     params.head_group_sft = fast_head_group.shift_right;
 
-    params.batch_stride_block_table = args.block_table_stride0;
+    params.batch_stride_block_table = static_cast<int32_t>(args.block_table_stride0);
 
-    params.batch_stride_out         = args.batch_stride_out;
-    params.nosplit_batch_stride_out = args.nosplit_batch_stride_out;
-    params.head_stride_out          = args.head_stride_out;
-    params.seq_stride_out           = args.seq_stride_out;
-    params.seq_stride_lse           = args.seq_stride_lse;
+    params.batch_stride_out         = static_cast<int32_t>(args.batch_stride_out);
+    params.nosplit_batch_stride_out = static_cast<int32_t>(args.nosplit_batch_stride_out);
+    params.head_stride_out          = static_cast<int32_t>(args.head_stride_out);
+    params.seq_stride_out           = static_cast<int32_t>(args.seq_stride_out);
+    params.seq_stride_lse           = static_cast<int32_t>(args.seq_stride_lse);
 
-    params.batch_stride_lse = args.batch_stride_lse;
-    params.head_stride_lse  = args.head_stride_lse;
+    params.batch_stride_lse = static_cast<int32_t>(args.batch_stride_lse);
+    params.head_stride_lse  = static_cast<int32_t>(args.head_stride_lse);
 
     // only support 2 byte datatype
     params.tile_size_q      = 8 * config.tile_m * config.tile_k * sizeof(mutlass::half_t);
@@ -381,9 +382,9 @@ struct MLAAsmKernel {
     launch_config.blockDimX      = config.nr_thr;
     launch_config.blockDimY      = 1;
     launch_config.blockDimZ      = 1;
-    launch_config.gridDimX       = mutlass::ceil_div(args.seqlen_q * args.nr_heads, config.tile_m);
-    launch_config.gridDimY       = args.nr_heads_kv;
-    launch_config.gridDimZ       = args.nr_mp_parts;
+    launch_config.gridDimX       = mutlass::ceil_div(params.seqlen_q * params.nheads, config.tile_m);
+    launch_config.gridDimY       = static_cast<int32_t>(args.nr_heads_kv);
+    launch_config.gridDimZ       = static_cast<int32_t>(args.nr_mp_parts);
     launch_config.hStream        = reinterpret_cast<MUstream>(stream);
     launch_config.sharedMemBytes = 0;
     launch_config.attrs          = NULL;
@@ -546,18 +547,16 @@ void flash_mla_asm(ffi::TensorView                q_nope,
   args.is_varlen_q     = is_varlen_q;
   args.data_type       = q_nope.dtype();
   args.page_block_size = 64;
-  args.nr_block        = static_cast<int32_t>(ckv.size(0));
+  args.nr_block        = ckv.size(0);
 
-  args.batch =
-      !is_varlen_q ? static_cast<int32_t>(q_nope.size(0)) : static_cast<int32_t>(cu_seqlens_q.value().size(0) - 1);
-  args.seqlen_q   = !is_varlen_q ? static_cast<int32_t>(q_nope.size(1)) : static_cast<int32_t>(max_seqlen_q.value());
-  args.nr_heads   = static_cast<int32_t>(q_nope.size(-2));
-  args.headdim_qk = static_cast<int32_t>(q_nope.size(-1) + q_pe.size(-1));
-  args.total_q =
-      !is_varlen_q ? static_cast<int32_t>(q_nope.size(0) * q_nope.size(1)) : static_cast<int32_t>(q_nope.size(0));
+  args.batch       = !is_varlen_q ? q_nope.size(0) : cu_seqlens_q.value().size(0) - 1;
+  args.seqlen_q    = !is_varlen_q ? q_nope.size(1) : max_seqlen_q.value();
+  args.nr_heads    = q_nope.size(-2);
+  args.headdim_qk  = q_nope.size(-1) + q_pe.size(-1);
+  args.total_q     = !is_varlen_q ? q_nope.size(0) * q_nope.size(1) : q_nope.size(0);
   args.seqlen_kv   = args.page_block_size;
   args.nr_heads_kv = 1;
-  args.headdim_v   = static_cast<int32_t>(ckv.size(-1));
+  args.headdim_v   = ckv.size(-1);
 
   TVM_FFI_ICHECK_EQ(args.headdim_qk, 576) << "flash_mla_asm() headdim_qk must be 576";
   TVM_FFI_ICHECK_EQ(args.headdim_v, 512) << "flash_mla_asm() headdim_v must be 512";
@@ -590,16 +589,16 @@ void flash_mla_asm(ffi::TensorView                q_nope,
     TVM_FFI_ICHECK_EQ(kpe.stride(0) % 576, 0) << "flash_mla_asm() kpe stride 0 must be multiple of 576";
   }
 
-  const int max_num_blocks_per_seq = static_cast<int>(block_table.size(1));
+  const int64_t max_num_blocks_per_seq = block_table.size(1);
   expect_shape(seqlens_k, {args.batch}, "seqlens_k");
   expect_shape(block_table, {args.batch, max_num_blocks_per_seq}, "block_table");
   TVM_FFI_ICHECK_EQ(tile_scheduler_metadata.size(1), mate::flash_mla::TileSchedulerMetaDataSize)
       << "tile_scheduler_metadata has unexpected second dimension";
   TVM_FFI_ICHECK_EQ(num_splits.size(0), args.batch + 1) << "num_splits must have shape [batch + 1]";
 
-  const int heads_ratio = args.nr_heads / args.nr_heads_kv;
+  const int64_t heads_ratio = args.nr_heads / args.nr_heads_kv;
   TVM_FFI_ICHECK_EQ(args.nr_heads % args.nr_heads_kv, 0) << "nr_heads must be divisible by nr_heads_kv";
-  const int q_seq_per_hk = args.seqlen_q * heads_ratio;
+  const int64_t q_seq_per_hk = args.seqlen_q * heads_ratio;
 
   CHECK_MUSA(out);
   CHECK_MUSA(out_lse);
@@ -645,40 +644,40 @@ void flash_mla_asm(ffi::TensorView                q_nope,
   auto q_nope_work = q_nope_reshaped.view;
   auto q_pe_work   = q_pe_reshaped.view;
   if (!is_varlen_q) {
-    args.stride_q[0]      = static_cast<int32_t>(q_nope_work.stride(2));
-    args.stride_q[1]      = static_cast<int32_t>(q_nope_work.stride(1));
-    args.stride_q[2]      = static_cast<int32_t>(q_nope_work.stride(3));
-    args.stride_q[3]      = static_cast<int32_t>(q_nope_work.stride(0));
-    args.stride_q_rope[0] = static_cast<int32_t>(q_pe_work.stride(2));
-    args.stride_q_rope[1] = static_cast<int32_t>(q_pe_work.stride(1));
-    args.stride_q_rope[2] = static_cast<int32_t>(q_pe_work.stride(3));
-    args.stride_q_rope[3] = static_cast<int32_t>(q_pe_work.stride(0));
+    args.stride_q[0]      = q_nope_work.stride(2);
+    args.stride_q[1]      = q_nope_work.stride(1);
+    args.stride_q[2]      = q_nope_work.stride(3);
+    args.stride_q[3]      = q_nope_work.stride(0);
+    args.stride_q_rope[0] = q_pe_work.stride(2);
+    args.stride_q_rope[1] = q_pe_work.stride(1);
+    args.stride_q_rope[2] = q_pe_work.stride(3);
+    args.stride_q_rope[3] = q_pe_work.stride(0);
   } else {
-    args.stride_q[0]      = static_cast<int32_t>(q_nope_work.stride(1));
-    args.stride_q[1]      = static_cast<int32_t>(q_nope_work.stride(0));
-    args.stride_q[2]      = static_cast<int32_t>(q_nope_work.stride(2));
-    args.stride_q_rope[0] = static_cast<int32_t>(q_pe_work.stride(1));
-    args.stride_q_rope[1] = static_cast<int32_t>(q_pe_work.stride(0));
-    args.stride_q_rope[2] = static_cast<int32_t>(q_pe_work.stride(2));
+    args.stride_q[0]      = q_nope_work.stride(1);
+    args.stride_q[1]      = q_nope_work.stride(0);
+    args.stride_q[2]      = q_nope_work.stride(2);
+    args.stride_q_rope[0] = q_pe_work.stride(1);
+    args.stride_q_rope[1] = q_pe_work.stride(0);
+    args.stride_q_rope[2] = q_pe_work.stride(2);
   }
 
   const int64_t ckv_stride_block     = ckv.stride(0);
   const int64_t ckv_stride_page_size = ckv.stride(1);
-  args.stride_k[0]                   = static_cast<int32_t>(8 * ckv_stride_page_size);
-  args.stride_k[1]                   = static_cast<int32_t>(ckv_stride_page_size);
-  args.stride_k[2]                   = static_cast<int32_t>(64 * ckv_stride_page_size);
-  args.stride_k[3]                   = static_cast<int32_t>(ckv_stride_block);
-  args.stride_v[0]                   = static_cast<int32_t>(ckv_stride_page_size);
-  args.stride_v[1]                   = static_cast<int32_t>(ckv_stride_page_size);
-  args.stride_v[2]                   = static_cast<int32_t>(ckv_stride_page_size);
-  args.stride_v[3]                   = static_cast<int32_t>(ckv_stride_block);
+  args.stride_k[0]                   = 8 * ckv_stride_page_size;
+  args.stride_k[1]                   = ckv_stride_page_size;
+  args.stride_k[2]                   = 64 * ckv_stride_page_size;
+  args.stride_k[3]                   = ckv_stride_block;
+  args.stride_v[0]                   = ckv_stride_page_size;
+  args.stride_v[1]                   = ckv_stride_page_size;
+  args.stride_v[2]                   = ckv_stride_page_size;
+  args.stride_v[3]                   = ckv_stride_block;
 
-  args.block_table_stride0 = static_cast<int32_t>(block_table.stride(0));
+  args.block_table_stride0 = block_table.stride(0);
   args.softmax_scale       = softmax_scale;
   args.q_seq_per_hk        = q_seq_per_hk;
-  args.nr_mp_parts         = static_cast<int32_t>(tile_scheduler_metadata.size(0));
+  args.nr_mp_parts         = tile_scheduler_metadata.size(0);
 
-  const int                        head_out = args.nr_heads_kv;
+  const int64_t                    head_out = args.nr_heads_kv;
   std::optional<StridedTensorView> out_view;
   std::optional<StridedTensorView> out_lse_view;
   ffi::TensorView                  out_work     = out;
@@ -694,30 +693,31 @@ void flash_mla_asm(ffi::TensorView                q_nope,
   }
 
   if (!is_varlen_q) {
-    args.batch_stride_out         = static_cast<int32_t>(out_work.stride(0));
-    args.nosplit_batch_stride_out = static_cast<int32_t>(out_work.stride(0));
-    args.seq_stride_out           = static_cast<int32_t>(out_work.stride(1));
-    args.head_stride_out          = static_cast<int32_t>(out_work.stride(2));
-    args.batch_stride_lse         = static_cast<int32_t>(out_lse_work.stride(0));
-    args.nosplit_batch_stride_lse = static_cast<int32_t>(out_lse_work.stride(0));
-    args.head_stride_lse          = static_cast<int32_t>(out_lse_work.stride(1));
+    args.batch_stride_out         = out_work.stride(0);
+    args.nosplit_batch_stride_out = out_work.stride(0);
+    args.seq_stride_out           = out_work.stride(1);
+    args.head_stride_out          = out_work.stride(2);
+    args.batch_stride_lse         = out_lse_work.stride(0);
+    args.nosplit_batch_stride_lse = out_lse_work.stride(0);
+    args.head_stride_lse          = out_lse_work.stride(1);
   } else {
-    args.seq_stride_out   = static_cast<int32_t>(out.stride(-3));
-    args.head_stride_out  = static_cast<int32_t>(out.stride(-2));
-    args.head_stride_lse  = static_cast<int32_t>(out_lse.stride(-2));
+    args.seq_stride_out   = out.stride(-3);
+    args.head_stride_out  = out.stride(-2);
+    args.head_stride_lse  = out_lse.stride(-2);
     args.batch_stride_lse = args.seqlen_q * 128;
     args.seq_stride_lse   = 128;
   }
 
-  const int   total_num_splits = args.batch + static_cast<int>(tile_scheduler_metadata.size(0));
-  const int   num_mp_parts     = static_cast<int>(tile_scheduler_metadata.size(0));
-  ffi::Tensor softmax_lse_accum =
+  const int64_t scheduler_parts  = tile_scheduler_metadata.size(0);
+  const int64_t total_num_splits = args.batch + scheduler_parts;
+  const int     num_mp_parts     = static_cast<int32_t>(scheduler_parts);
+  ffi::Tensor   softmax_lse_accum =
       alloc_tensor(ffi::Shape{total_num_splits, head_out, q_seq_per_hk}, dl_float32, q_nope.device());
   ffi::Tensor out_accum =
       alloc_tensor(ffi::Shape{total_num_splits, head_out, q_seq_per_hk, headdim_latent}, dl_float32, q_nope.device());
 
   if (is_varlen_q) {
-    args.batch_stride_out = static_cast<int32_t>(out_accum.stride(0));
+    args.batch_stride_out = out_accum.stride(0);
   }
 
   args.p_output                    = !is_varlen_q ? out_work.data_ptr() : out.data_ptr();
@@ -750,15 +750,15 @@ void flash_mla_asm(ffi::TensorView                q_nope,
   combine_params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
   combine_params.num_splits_ptr       = static_cast<int*>(num_splits.data_ptr());
   combine_params.seqlens_q_ptr        = static_cast<int*>(args.seqlens_q_ptr);
-  combine_params.o_batch_stride       = !is_varlen_q ? static_cast<int>(out_work.stride(0)) : q_seq_per_hk;
-  combine_params.o_row_stride  = !is_varlen_q ? static_cast<int>(out_work.stride(1)) : static_cast<int>(out.stride(1));
-  combine_params.o_head_stride = !is_varlen_q ? static_cast<int>(out_work.stride(2)) : 0;
-  combine_params.max_q_seq_per_hk = q_seq_per_hk;
-  combine_params.total_q          = args.total_q;
-  combine_params.h_r              = args.nr_heads;
-  combine_params.h_k              = 1;
-  combine_params.batch_size       = args.batch;
-  combine_params.num_mp_parts     = num_mp_parts;
+  combine_params.o_batch_stride       = !is_varlen_q ? out_work.stride(0) : q_seq_per_hk;
+  combine_params.o_row_stride         = !is_varlen_q ? out_work.stride(1) : out.stride(1);
+  combine_params.o_head_stride        = !is_varlen_q ? out_work.stride(2) : 0;
+  combine_params.max_q_seq_per_hk     = static_cast<int32_t>(q_seq_per_hk);
+  combine_params.total_q              = static_cast<int32_t>(args.total_q);
+  combine_params.h_r                  = static_cast<int32_t>(args.nr_heads);
+  combine_params.h_k                  = 1;
+  combine_params.batch_size           = static_cast<int32_t>(args.batch);
+  combine_params.num_mp_parts         = num_mp_parts;
 
   if (dtype_equal(args.data_type, dl_float16)) {
     if (is_varlen_q) {

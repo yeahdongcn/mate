@@ -7,7 +7,8 @@ from mate.testing.utils import bench_kineto
 from mate import flash_attn_varlen_func, flash_attn_with_kvcache
 from mate.mha_interface import get_scheduler_metadata
 
-MATE_BENCH_FMHA_DTYPE = torch.bfloat16
+# MATE_BENCH_FMHA_DTYPE = torch.bfloat16
+MATE_BENCH_FMHA_DTYPE = torch.float8_e4m3fn
 MATE_BENCH_FMHA_DEVICE = "musa"
 
 MATE_BENCH_FMHA_ENABLE_TRACE = False
@@ -49,51 +50,11 @@ def gen_bench_config() -> List[dict]:
             "is_packgqa": True,
             "is_causal": True,
             "window_size": (None, None),
-            "page_size": 64,
+            "page_size": 128
+            if MATE_BENCH_FMHA_DTYPE in [torch.float8_e4m3fn, torch.float8_e5m2]
+            else 64,
             "num_splits": 0,
             "backend": "mutlass",
-            "dtype": MATE_BENCH_FMHA_DTYPE,
-            "device": MATE_BENCH_FMHA_DEVICE,
-            "force_flash_attn_with_kvcache": False,
-            "seqused_q": None,
-            "seqused_kv": None,
-        },
-        {
-            "name": "mubin-bshd",
-            "batch_size": 56,
-            "seqlen_q": 1024,
-            "seqlen_kv": 4096,
-            "head_q": 16,
-            "head_kv": 1,
-            "headdim_qk": 128,
-            "headdim_vo": 128,
-            "is_packgqa": True,
-            "is_causal": False,
-            "window_size": (None, None),
-            "page_size": None,
-            "num_splits": 0,
-            "backend": "mubin",
-            "dtype": MATE_BENCH_FMHA_DTYPE,
-            "device": MATE_BENCH_FMHA_DEVICE,
-            "force_flash_attn_with_kvcache": False,
-            "seqused_q": None,
-            "seqused_kv": None,
-        },
-        {
-            "name": "mubin-raggqkv",
-            "batch_size": 56,
-            "seqlen_q": [1024] * 56,
-            "seqlen_kv": [4096] * 56,
-            "head_q": 32,
-            "head_kv": 2,
-            "headdim_qk": 128,
-            "headdim_vo": 128,
-            "is_packgqa": True,
-            "is_causal": True,
-            "window_size": (None, None),
-            "page_size": None,
-            "num_splits": 0,
-            "backend": "mubin",
             "dtype": MATE_BENCH_FMHA_DTYPE,
             "device": MATE_BENCH_FMHA_DEVICE,
             "force_flash_attn_with_kvcache": False,

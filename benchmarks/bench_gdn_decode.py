@@ -10,7 +10,7 @@ from mate.testing.utils import bench_kineto
 
 
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
-DEFAULT_HEAD_CONFIGS = ("8,16", "16,32", "16,64")
+DEFAULT_HEAD_CONFIGS = ("2,8", "4,8", "16, 16", "16,32", "16, 48", "16,64")
 KERNEL_NAME = "gated_deltanet_decode_fp32_vk"
 
 

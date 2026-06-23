@@ -1,8 +1,10 @@
-# MATE CLI
+# MATE CLI Reference
 
-MATE CLI provides command-line utilities for installation checks, configuration inspection, environment diagnostics, and Level 10 dump replay.
+MATE CLI provides command-line utilities for installation checks, configuration inspection, environment diagnostics, guarded-memory debugging, and Level 10 dump replay.
 
 All examples below use `mate`, but `python -m mate` is equivalent after MATE is installed correctly.
+
+For the end-to-end guarded allocator workflow, including pytest integration and troubleshooting, see [Guard Allocator Debugging](guard_allocator.md).
 
 ## Installation
 
@@ -23,8 +25,8 @@ package.
 From a local wheel:
 
 ```bash
-python -m pip install --no-deps /abs/path/mate-0.1.3+mu436-cp310-cp310-linux_x86_64.whl
-python -m pip install --force-reinstall --no-deps /abs/path/mate-0.1.3+mu436-cp310-cp310-linux_x86_64.whl
+python -m pip install --no-deps /abs/path/mate-0.1.3-cp310-cp310-linux_x86_64.whl
+python -m pip install --force-reinstall --no-deps /abs/path/mate-0.1.3-cp310-cp310-linux_x86_64.whl
 ```
 
 If you plan to load or replay dumps written in `safetensors` format, install the CLI extra or install `safetensors` directly.
@@ -38,7 +40,7 @@ pip install "mate[cli]"
 If you only have a local wheel, use the standard direct-reference syntax instead of `./wheel.whl[cli]`:
 
 ```bash
-python -m pip install "mate[cli] @ file:///abs/path/mate-0.1.3+mu436-cp310-cp310-linux_x86_64.whl"
+python -m pip install "mate[cli] @ file:///abs/path/mate-0.1.3-cp310-cp310-linux_x86_64.whl"
 ```
 
 If preserving an existing MUSA PyTorch stack matters more than resolving extras
@@ -46,7 +48,7 @@ through pip metadata, install the wheel with `--no-deps` first and then install
 `safetensors` explicitly:
 
 ```bash
-python -m pip install --force-reinstall --no-deps /abs/path/mate-0.1.3+mu436-cp310-cp310-linux_x86_64.whl
+python -m pip install --force-reinstall --no-deps /abs/path/mate-0.1.3-cp310-cp310-linux_x86_64.whl
 python -m pip install safetensors
 ```
 
@@ -69,6 +71,7 @@ Notes:
 | `mate clear-cache` | Remove the runtime JIT cache directory only |
 | `mate env` | Show relevant environment variables and their current values |
 | `mate check` | Validate a usable MATE runtime environment |
+| `mate guard-run -- COMMAND` | Launch a child command with the guarded MUSA allocator |
 | `mate replay --dir PATH` | Replay one Level 10 dump or a directory of dumps |
 | `mate list-dumps [PATH]` | List dump directories under a root directory |
 
@@ -115,7 +118,7 @@ mate env
 ```
 
 This command is a read-only view of the current process environment. It is useful for checking whether shell exports are in place before launching a workload.
-For variable meanings, defaults, and timing details, see [Environment Variables](environment_variables.md).
+For variable meanings, defaults, and timing details, see {doc}`Environment Variables </environment_variables>`.
 
 ### JIT/AOT diagnostics
 
@@ -131,7 +134,7 @@ MATE_MUSA_ARCH_LIST=3.1 mate export-compile-commands
 
 `module-status` reports whether each module is backed by an AOT library, an existing runtime JIT `.so`, or no compiled library. `list-modules MODULE` prints JSON for a single module, including source files and expected AOT/JIT paths. `export-compile-commands` writes `compile_commands.json` by default for clangd/IDE tooling.
 
-Use `MATE_MUSA_ARCH_LIST=3.1` for offline diagnostics when no MUSA device is visible. See [Environment Variables](environment_variables.md) for details.
+Use `MATE_MUSA_ARCH_LIST=3.1` for offline diagnostics when no MUSA device is visible. See {doc}`Environment Variables </environment_variables>` for details.
 
 ### `clear-cache`
 
@@ -176,6 +179,7 @@ mate replay --dir dumps/ --device cpu
 mate replay --dir dumps/ --no-run
 mate replay --dir dumps/ --no-compare
 mate replay --dir dumps/ --verbose
+mate replay --dir dumps/ --guard-alloc --guard-mode tail
 ```
 
 Supported options:
@@ -187,6 +191,8 @@ Supported options:
 | `--run/--no-run` | Execute the resolved function or only reconstruct arguments |
 | `--compare/--no-compare` | Compare execution results with dumped outputs |
 | `-v, --verbose` | Print metadata and argument summaries for a single dump |
+| `--guard-alloc/--no-guard-alloc` | Install the guarded allocator before replay on MUSA |
+| `--guard-mode {tail,head}` | Select which side should use the unmapped guard page |
 
 Replay mode depends on the path passed to `--dir`:
 
@@ -218,7 +224,32 @@ Practical notes:
 
 - `--device cpu` is useful for validating dump loading and argument reconstruction, but execution only succeeds if the target API supports CPU tensors
 - Replaying `safetensors` dumps requires `safetensors` to be installed
-- Dumps produced with `MATE_DUMP_SAFETENSORS=1` lose original stride and non-contiguous layout information; see [Environment Variables](environment_variables.md) for dump format details
+- Dumps produced with `MATE_DUMP_SAFETENSORS=1` lose original stride and non-contiguous layout information; see {doc}`Environment Variables </environment_variables>` for dump format details
+- `--guard-alloc` only works with MUSA replay targets and must be enabled before replay starts reconstructing tensors
+
+### `guard-run`
+
+Launch a child command with the guarded allocator installed before the target process imports code that might allocate on MUSA:
+
+```bash
+mate guard-run -- python your_script.py
+mate guard-run --mode tail -- python your_script.py
+mate guard-run --mode head --log-allocations -- python reproduce_bug.py
+```
+
+Supported options:
+
+| Option | Meaning |
+| --- | --- |
+| `--mode {tail,head}` | Select which side of each allocation uses the unmapped guard page |
+| `--log-allocations` | Print guarded alloc/free events to stderr in the child process |
+
+Practical notes:
+
+- `tail` is the recommended starting point because it immediately faults on writes past the logical end of an allocation
+- `head` is useful when you suspect left-side underruns or negative indexing bugs
+- this command bootstraps the allocator through internal environment variables before the child imports `torch_musa`
+- detailed usage and pytest guidance live in [Guard Allocator Debugging](guard_allocator.md)
 
 ### `list-dumps`
 
@@ -273,7 +304,7 @@ Notes:
 ## Environment Variables
 
 Use `mate env` to inspect current values. For the complete list of variables,
-defaults, and detailed behavior, see [Environment Variables](environment_variables.md).
+defaults, and detailed behavior, see {doc}`Environment Variables </environment_variables>`.
 
 ## Usage Examples
 
@@ -295,6 +326,16 @@ python your_script.py
 mate list-dumps ./debug_dumps
 mate replay --dir ./debug_dumps/20260310_xxxx_call0001 --verbose
 ```
+
+### Run a debug session with the guarded allocator
+
+```bash
+mate guard-run --mode tail -- python reproduce_bug.py
+mate replay --dir ./debug_dumps/20260310_xxxx_call0001 --guard-alloc --guard-mode head
+MATE_PYTEST_GUARD_ALLOC=1 MATE_PYTEST_GUARD_MODE=tail pytest tests/test_gemm.py
+```
+
+This workflow is described in more detail in [Guard Allocator Debugging](guard_allocator.md).
 
 ### Limit dumps to selected APIs
 
@@ -329,6 +370,7 @@ Command exit behavior is not identical across all subcommands:
 - `mate show-config`: returns `0` on successful execution
 - `mate env`: returns `0` on successful execution
 - `mate check`: returns `1` only when hard errors are found
+- `mate guard-run`: returns the child process exit code, including signal-based termination
 - `mate replay`: returns `1` on replay failure, execution failure, mismatch, or invalid replay setup
 - `mate list-dumps`: informational command; missing directories or empty results are currently reported in output and do not force a non-zero exit code
 
@@ -341,6 +383,7 @@ Command exit behavior is not identical across all subcommands:
 - `compare_outputs=True but no output file found`: the dump is incomplete, often because the original process crashed after saving inputs
 - `AOT libraries not found`: MATE may still work in JIT mode, but startup behavior can differ from an AOT-enabled installation
 - Replay mismatches do not always mean argument reconstruction failed; they can also reflect runtime differences, device differences, or numerical drift
+- Guard allocator failures, pytest defaults, and graph-capture limitations are documented in [Guard Allocator Debugging](guard_allocator.md)
 
 ## Security Note
 

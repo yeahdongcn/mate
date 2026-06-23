@@ -46,13 +46,19 @@ struct PackGQAManager {
     return ptensor;
   }
 
-  template <class Params, class GEngine, class GLayout, class SEngine, class SLayout>
+  template <bool IsQv = false, class Params, class GEngine, class GLayout, class SEngine, class SLayout>
   MUTLASS_DEVICE static void load_Q(Params const                   &params,
                                     Tensor<GEngine, GLayout> const &mQ,  // ((qhead_per_khead, seqlen_q), headdim_q)
                                     Tensor<SEngine, SLayout>       &sQ,  // (TileM, HeadDim)
                                     int const                       thread_idx,
                                     int const                       m_block_idx) {
-    auto robust_desc_Q = params.desc_Q;
+    auto robust_desc_Q = [&]() {
+      if constexpr (IsQv) {
+        return params.desc_Qv;
+      } else {
+        return params.desc_Q;
+      }
+    }();
     // use lse load Q
     auto gmem_thr_copy_Q = GmemTiledCopyQ{}.get_thread_slice(thread_idx);
 

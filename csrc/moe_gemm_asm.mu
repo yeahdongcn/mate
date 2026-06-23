@@ -608,11 +608,10 @@ class MoeGemmAsmKernel {
     params.batch_stride_d = args.stride_batch_out;
     params.batch_stride_c = params.batch_stride_d;
 
-    params.k_part       = 0;
-    params.k_part_block = args.k;
-    params.ldkpart      = mutlass::ceil_div(args.n, config.block.tile_n) * config.block.tile_n;
-    params.kpart_batch_stride_c =
-        static_cast<size_t>(mutlass::ceil_div(args.m, config.block.tile_m)) * config.block.tile_m * params.ldkpart;
+    params.k_part               = 0;
+    params.k_part_block         = args.k;
+    params.ldkpart              = mutlass::ceil_div(args.n, config.block.tile_n) * config.block.tile_n;
+    params.kpart_batch_stride_c = mutlass::ceil_div(args.m, config.block.tile_m) * config.block.tile_m * params.ldkpart;
 
     params.fast_xytile_ori = fast_xytile.divisor;
     params.fast_xytile_mul = fast_xytile.multiplier;
@@ -928,10 +927,10 @@ void ragged_moe_gemm_8bit(const std::tuple<ffi::TensorView, ffi::TensorView>& in
   args.type_b = b.dtype();
   args.type_d = out.dtype();
 
-  args.m          = static_cast<int>(a.size(0));
-  args.n          = static_cast<int>(b.size(1));
-  args.k          = static_cast<int>(a.size(1));
-  args.num_expert = static_cast<int>(b.size(0));
+  args.m          = static_cast<int32_t>(a.size(0));
+  args.n          = static_cast<int32_t>(b.size(1));
+  args.k          = static_cast<int32_t>(a.size(1));
+  args.num_expert = static_cast<int32_t>(b.size(0));
 
   TVM_FFI_ICHECK_EQ(b.size(2), args.k);
   TVM_FFI_ICHECK_EQ(scale_a.size(0), args.m);
@@ -947,9 +946,9 @@ void ragged_moe_gemm_8bit(const std::tuple<ffi::TensorView, ffi::TensorView>& in
     return;
   }
 
-  args.quant_tile = static_cast<int>(std::get<2>(scale_granularity_mnk));
+  args.quant_tile = static_cast<int32_t>(std::get<2>(scale_granularity_mnk));
   TVM_FFI_ICHECK_EQ(args.quant_tile, 128) << "quant_tile must be 128";
-  args.alignment_m = static_cast<int>(alignment_m);
+  args.alignment_m = static_cast<int32_t>(alignment_m);
   TVM_FFI_ICHECK(args.alignment_m == 128 || args.alignment_m == 256) << "alignment_m must be 128 or 256";
   args.total_mp_count  = current_num_mps(a.device());
   args.target_mp_count = args.total_mp_count;
@@ -968,12 +967,12 @@ void ragged_moe_gemm_8bit(const std::tuple<ffi::TensorView, ffi::TensorView>& in
   args.major_scale_a = TensorMajor::K;
   args.major_scale_b = TensorMajor::K;
 
-  args.scale_a_m       = static_cast<int>(scale_a.size(0));
-  args.scale_a_k       = static_cast<int>(scale_a.size(1));
-  args.scale_a_nr_elem = static_cast<int>(scale_a.numel());
-  args.scale_b_n       = static_cast<int>(scale_b.size(1));
-  args.scale_b_k       = static_cast<int>(scale_b.size(2));
-  args.scale_b_nr_elem = static_cast<int>(scale_b.numel());
+  args.scale_a_m       = static_cast<int32_t>(scale_a.size(0));
+  args.scale_a_k       = static_cast<int32_t>(scale_a.size(1));
+  args.scale_a_nr_elem = static_cast<int32_t>(scale_a.numel());
+  args.scale_b_n       = static_cast<int32_t>(scale_b.size(1));
+  args.scale_b_k       = static_cast<int32_t>(scale_b.size(2));
+  args.scale_b_nr_elem = static_cast<int32_t>(scale_b.numel());
 
   args.p_a         = a.data_ptr();
   args.p_b         = b.data_ptr();
@@ -1040,11 +1039,11 @@ std::optional<std::tuple<int64_t, int64_t>> masked_moe_gemm_8bit(
   args.type_b = b.dtype();
   args.type_d = out.dtype();
 
-  const int max_m = static_cast<int>(a.size(1));
-  args.num_expert = static_cast<int>(a.size(0));
+  const int max_m = static_cast<int32_t>(a.size(1));
+  args.num_expert = static_cast<int32_t>(a.size(0));
   args.m          = max_m * args.num_expert;
-  args.n          = static_cast<int>(b.size(1));
-  args.k          = static_cast<int>(b.size(2));
+  args.n          = static_cast<int32_t>(b.size(1));
+  args.k          = static_cast<int32_t>(b.size(2));
 
   TVM_FFI_ICHECK_EQ(a.size(2), args.k);
   TVM_FFI_ICHECK_EQ(b.size(0), args.num_expert);
@@ -1063,10 +1062,10 @@ std::optional<std::tuple<int64_t, int64_t>> masked_moe_gemm_8bit(
     return std::nullopt;
   }
 
-  args.quant_tile = static_cast<int>(std::get<2>(scale_granularity_mnk));
+  args.quant_tile = static_cast<int32_t>(std::get<2>(scale_granularity_mnk));
   TVM_FFI_ICHECK_EQ(args.quant_tile, 128) << "quant_tile must be 128";
   args.alignment_m     = 0;
-  args.expected_m      = static_cast<int>(expect_tokens);
+  args.expected_m      = static_cast<int32_t>(expect_tokens);
   args.total_mp_count  = current_num_mps(a.device());
   args.target_mp_count = args.total_mp_count;
 
@@ -1094,12 +1093,14 @@ std::optional<std::tuple<int64_t, int64_t>> masked_moe_gemm_8bit(
     TVM_FFI_ICHECK_EQ(signal.value().size(0), args.num_expert * mutlass::ceil_div(max_m, tile_signal));
   }
 
-  args.scale_a_m = args.major_scale_a == TensorMajor::MN ? max_m : static_cast<int>(scale_a.size(0) * scale_a.size(1));
-  args.scale_a_k = static_cast<int>(scale_a.size(2));
-  args.scale_a_nr_elem = static_cast<int>(scale_a.numel());
-  args.scale_b_n       = static_cast<int>(scale_b.size(1));
-  args.scale_b_k       = static_cast<int>(scale_b.size(2));
-  args.scale_b_nr_elem = static_cast<int>(scale_b.numel());
+  args.scale_a_m       = args.major_scale_a == TensorMajor::MN
+                             ? max_m
+                             : static_cast<int32_t>(scale_a.size(0)) * static_cast<int32_t>(scale_a.size(1));
+  args.scale_a_k       = static_cast<int32_t>(scale_a.size(2));
+  args.scale_a_nr_elem = static_cast<int32_t>(scale_a.numel());
+  args.scale_b_n       = static_cast<int32_t>(scale_b.size(1));
+  args.scale_b_k       = static_cast<int32_t>(scale_b.size(2));
+  args.scale_b_nr_elem = static_cast<int32_t>(scale_b.numel());
 
   args.p_a         = a.data_ptr();
   args.p_b         = b.data_ptr();
@@ -1155,30 +1156,30 @@ void m_grouped_contig_gemm_8bit(const std::tuple<ffi::TensorView, ffi::TensorVie
   args.type_b = b.dtype();
   args.type_d = out.dtype();
 
-  args.num_expert = static_cast<int>(group_m_idx.size(0));
-  args.m          = static_cast<int>(a.size(0));
-  args.n          = major_mode_b[0] == 'K' ? static_cast<int>(b.size(-2)) : static_cast<int>(b.size(-1));
-  args.k          = static_cast<int>(a.size(1));
+  args.num_expert = static_cast<int32_t>(group_m_idx.size(0));
+  args.m          = static_cast<int32_t>(a.size(0));
+  args.n          = major_mode_b[0] == 'K' ? static_cast<int32_t>(b.size(-2)) : static_cast<int32_t>(b.size(-1));
+  args.k          = static_cast<int32_t>(a.size(1));
 
   if (gemm_common::gemm_early_return(args.m, args.n, args.k, out)) {
     return;
   }
 
-  args.quant_tile = static_cast<int>(std::get<2>(scale_granularity_mnk));
+  args.quant_tile = static_cast<int32_t>(std::get<2>(scale_granularity_mnk));
   TVM_FFI_ICHECK_EQ(args.quant_tile, 128) << "quant_tile must be 128";
   args.alignment_m     = 0;
   args.expected_m      = 0;
   args.total_mp_count  = current_num_mps(a.device());
-  args.target_mp_count = static_cast<int>(num_mp.value_or(args.total_mp_count));
+  args.target_mp_count = static_cast<int32_t>(num_mp.value_or(args.total_mp_count));
 
   args.stride_m_a       = args.k;
   args.stride_k_a       = args.m;
-  args.stride_batch_a   = args.m * args.k;
+  args.stride_batch_a   = static_cast<size_t>(args.m * args.k);
   args.stride_n_b       = args.k;
   args.stride_k_b       = args.n;
-  args.stride_batch_b   = args.n * args.k;
+  args.stride_batch_b   = static_cast<size_t>(args.n * args.k);
   args.stride_m_out     = args.n;
-  args.stride_batch_out = args.m * args.n;
+  args.stride_batch_out = static_cast<size_t>(args.m * args.n);
 
   args.major_a       = TensorMajor::K;
   args.major_b       = major_mode_b[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
@@ -1187,11 +1188,13 @@ void m_grouped_contig_gemm_8bit(const std::tuple<ffi::TensorView, ffi::TensorVie
   args.major_scale_a = TensorMajor::K;
   args.major_scale_b = major_mode_b[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
 
-  args.scale_a_m       = static_cast<int>(scale_a.size(0));
-  args.scale_a_k       = static_cast<int>(scale_a.size(-1));
+  args.scale_a_m       = static_cast<int32_t>(scale_a.size(0));
+  args.scale_a_k       = static_cast<int32_t>(scale_a.size(-1));
   args.scale_a_nr_elem = args.scale_a_m * args.scale_a_k;
-  args.scale_b_n = major_mode_b[0] == 'K' ? static_cast<int>(scale_b.size(-2)) : static_cast<int>(scale_b.size(-1));
-  args.scale_b_k = major_mode_b[0] == 'K' ? static_cast<int>(scale_b.size(-1)) : static_cast<int>(scale_b.size(-2));
+  args.scale_b_n =
+      major_mode_b[0] == 'K' ? static_cast<int32_t>(scale_b.size(-2)) : static_cast<int32_t>(scale_b.size(-1));
+  args.scale_b_k =
+      major_mode_b[0] == 'K' ? static_cast<int32_t>(scale_b.size(-1)) : static_cast<int32_t>(scale_b.size(-2));
   args.scale_b_nr_elem = args.scale_b_n * args.scale_b_k * args.num_expert;
 
   args.p_a         = a.data_ptr();
@@ -1247,30 +1250,30 @@ void k_grouped_contig_gemm_8bit(const std::tuple<ffi::TensorView, ffi::TensorVie
   args.type_b = b.dtype();
   args.type_d = out.dtype();
 
-  args.num_expert = static_cast<int>(group_k_idx.size(0));
-  args.m          = static_cast<int>(a.size(1));
-  args.n          = static_cast<int>(b.size(1));
-  args.k          = static_cast<int>(b.size(0));
+  args.num_expert = static_cast<int32_t>(group_k_idx.size(0));
+  args.m          = static_cast<int32_t>(a.size(1));
+  args.n          = static_cast<int32_t>(b.size(1));
+  args.k          = static_cast<int32_t>(b.size(0));
 
   if (args.k == 0) {
     return;
   }
 
-  args.quant_tile = static_cast<int>(std::get<2>(scale_granularity_mnk));
+  args.quant_tile = static_cast<int32_t>(std::get<2>(scale_granularity_mnk));
   TVM_FFI_ICHECK_EQ(args.quant_tile, 128) << "quant_tile must be 128";
   args.alignment_m     = 0;
   args.expected_m      = 0;
   args.total_mp_count  = current_num_mps(a.device());
-  args.target_mp_count = static_cast<int>(num_mp.value_or(args.total_mp_count));
+  args.target_mp_count = static_cast<int32_t>(num_mp.value_or(args.total_mp_count));
 
   args.stride_m_a       = a.stride(1);
   args.stride_k_a       = a.stride(0);
-  args.stride_batch_a   = args.m * args.k;
+  args.stride_batch_a   = static_cast<size_t>(args.m * args.k);
   args.stride_n_b       = b.stride(1);
   args.stride_k_b       = b.stride(0);
-  args.stride_batch_b   = args.n * args.k;
+  args.stride_batch_b   = static_cast<size_t>(args.n * args.k);
   args.stride_m_out     = args.n;
-  args.stride_batch_out = args.m * args.n;
+  args.stride_batch_out = static_cast<size_t>(args.m * args.n);
 
   args.major_a       = TensorMajor::MN;
   args.major_b       = TensorMajor::MN;
@@ -1279,12 +1282,12 @@ void k_grouped_contig_gemm_8bit(const std::tuple<ffi::TensorView, ffi::TensorVie
   args.major_scale_a = TensorMajor::MN;
   args.major_scale_b = TensorMajor::MN;
 
-  args.scale_a_m       = static_cast<int>(scale_a.size(1));
-  args.scale_a_k       = static_cast<int>(scale_a.size(0));
-  args.scale_a_nr_elem = static_cast<int>(scale_a.numel());
-  args.scale_b_n       = static_cast<int>(scale_b.size(1));
-  args.scale_b_k       = static_cast<int>(scale_b.size(0));
-  args.scale_b_nr_elem = static_cast<int>(scale_b.numel());
+  args.scale_a_m       = static_cast<int32_t>(scale_a.size(1));
+  args.scale_a_k       = static_cast<int32_t>(scale_a.size(0));
+  args.scale_a_nr_elem = static_cast<int32_t>(scale_a.numel());
+  args.scale_b_n       = static_cast<int32_t>(scale_b.size(1));
+  args.scale_b_k       = static_cast<int32_t>(scale_b.size(0));
+  args.scale_b_nr_elem = static_cast<int32_t>(scale_b.numel());
 
   args.p_a         = a.data_ptr();
   args.p_b         = b.data_ptr();
@@ -1332,10 +1335,10 @@ void ragged_moe_gemm_16bit(ffi::TensorView        a,
   args.type_a     = a.dtype();
   args.type_b     = b.dtype();
   args.type_d     = out.dtype();
-  args.m          = static_cast<int>(a.size(0));
-  args.n          = static_cast<int>(b.size(1));
-  args.k          = static_cast<int>(a.size(1));
-  args.num_expert = static_cast<int>(b.size(0));
+  args.m          = static_cast<int32_t>(a.size(0));
+  args.n          = static_cast<int32_t>(b.size(1));
+  args.k          = static_cast<int32_t>(a.size(1));
+  args.num_expert = static_cast<int32_t>(b.size(0));
 
   TVM_FFI_ICHECK_EQ(b.size(2), args.k);
   TVM_FFI_ICHECK_EQ(out.size(0), args.m);
@@ -1353,7 +1356,7 @@ void ragged_moe_gemm_16bit(ffi::TensorView        a,
     TVM_FFI_ICHECK_EQ(ragged_tokens_info.size(0), args.m);
   }
 
-  args.alignment_m = static_cast<int>(alignment_m);
+  args.alignment_m = static_cast<int32_t>(alignment_m);
   TVM_FFI_ICHECK(args.alignment_m == 128 || args.alignment_m == 256) << "alignment_m must be 128 or 256";
 
   args.major_a         = TensorMajor::K;
@@ -1427,11 +1430,11 @@ std::optional<std::tuple<int64_t, int64_t>> masked_moe_gemm_16bit(ffi::TensorVie
   args.type_b = b.dtype();
   args.type_d = out.dtype();
 
-  const int max_m = static_cast<int>(a.size(1));
-  args.num_expert = static_cast<int>(a.size(0));
+  const int max_m = static_cast<int32_t>(a.size(1));
+  args.num_expert = static_cast<int32_t>(a.size(0));
   args.m          = max_m * args.num_expert;
-  args.n          = static_cast<int>(b.size(1));
-  args.k          = static_cast<int>(b.size(2));
+  args.n          = static_cast<int32_t>(b.size(1));
+  args.k          = static_cast<int32_t>(b.size(2));
 
   TVM_FFI_ICHECK_EQ(a.size(2), args.k);
   TVM_FFI_ICHECK_EQ(b.size(0), args.num_expert);
@@ -1449,7 +1452,7 @@ std::optional<std::tuple<int64_t, int64_t>> masked_moe_gemm_16bit(ffi::TensorVie
   }
 
   args.alignment_m     = 0;
-  args.expected_m      = static_cast<int>(expect_tokens);
+  args.expected_m      = static_cast<int32_t>(expect_tokens);
   args.total_mp_count  = current_num_mps(a.device());
   args.target_mp_count = args.total_mp_count;
 
@@ -1512,10 +1515,10 @@ void m_grouped_contig_gemm_16bit(ffi::TensorView        a,
   args.type_a     = a.dtype();
   args.type_b     = b.dtype();
   args.type_d     = out.dtype();
-  args.num_expert = static_cast<int>(group_m_idx.size(0));
-  args.m          = static_cast<int>(a.size(0));
-  args.n          = major_mode_b[0] == 'K' ? static_cast<int>(b.size(-2)) : static_cast<int>(b.size(-1));
-  args.k          = static_cast<int>(a.size(1));
+  args.num_expert = static_cast<int32_t>(group_m_idx.size(0));
+  args.m          = static_cast<int32_t>(a.size(0));
+  args.n          = major_mode_b[0] == 'K' ? static_cast<int32_t>(b.size(-2)) : static_cast<int32_t>(b.size(-1));
+  args.k          = static_cast<int32_t>(a.size(1));
 
   if (gemm_common::gemm_early_return(args.m, args.n, args.k, out)) {
     return;
@@ -1525,16 +1528,16 @@ void m_grouped_contig_gemm_16bit(ffi::TensorView        a,
   args.alignment_m     = 0;
   args.expected_m      = 0;
   args.total_mp_count  = current_num_mps(a.device());
-  args.target_mp_count = static_cast<int>(num_mp.value_or(args.total_mp_count));
+  args.target_mp_count = static_cast<int32_t>(num_mp.value_or(args.total_mp_count));
 
   args.stride_m_a       = args.k;
   args.stride_k_a       = args.m;
-  args.stride_batch_a   = args.m * args.k;
+  args.stride_batch_a   = static_cast<size_t>(args.m * args.k);
   args.stride_n_b       = args.k;
   args.stride_k_b       = args.n;
-  args.stride_batch_b   = args.n * args.k;
+  args.stride_batch_b   = static_cast<size_t>(args.n * args.k);
   args.stride_m_out     = args.n;
-  args.stride_batch_out = args.m * args.n;
+  args.stride_batch_out = static_cast<size_t>(args.m * args.n);
 
   args.major_a       = TensorMajor::K;
   args.major_b       = major_mode_b[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
@@ -1584,10 +1587,10 @@ void k_grouped_contig_gemm_16bit(ffi::TensorView        a,
   args.type_a     = a.dtype();
   args.type_b     = b.dtype();
   args.type_d     = out.dtype();
-  args.num_expert = static_cast<int>(group_k_idx.size(0));
-  args.m          = static_cast<int>(a.size(1));
-  args.n          = static_cast<int>(b.size(1));
-  args.k          = static_cast<int>(b.size(0));
+  args.num_expert = static_cast<int32_t>(group_k_idx.size(0));
+  args.m          = static_cast<int32_t>(a.size(1));
+  args.n          = static_cast<int32_t>(b.size(1));
+  args.k          = static_cast<int32_t>(b.size(0));
 
   if (args.k == 0) {
     return;
@@ -1597,16 +1600,16 @@ void k_grouped_contig_gemm_16bit(ffi::TensorView        a,
   args.alignment_m     = 0;
   args.expected_m      = 0;
   args.total_mp_count  = current_num_mps(a.device());
-  args.target_mp_count = static_cast<int>(num_mp.value_or(args.total_mp_count));
+  args.target_mp_count = static_cast<int32_t>(num_mp.value_or(args.total_mp_count));
 
   args.stride_m_a       = a.stride(1);
   args.stride_k_a       = a.stride(0);
-  args.stride_batch_a   = args.m * args.k;
+  args.stride_batch_a   = static_cast<size_t>(args.m * args.k);
   args.stride_n_b       = b.stride(1);
   args.stride_k_b       = b.stride(0);
-  args.stride_batch_b   = args.n * args.k;
+  args.stride_batch_b   = static_cast<size_t>(args.n * args.k);
   args.stride_m_out     = args.n;
-  args.stride_batch_out = args.m * args.n;
+  args.stride_batch_out = static_cast<size_t>(args.m * args.n);
 
   args.major_a       = TensorMajor::MN;
   args.major_b       = TensorMajor::MN;
@@ -1668,29 +1671,29 @@ void groupwise_gemm_8bit_fp8output(const std::tuple<ffi::TensorView, ffi::Tensor
 
   args.batch      = 1;
   args.num_expert = 1;
-  args.m          = major_mode_a[0] == 'K' ? static_cast<int>(a.size(-2)) : static_cast<int>(a.size(-1));
-  args.n          = major_mode_b[0] == 'K' ? static_cast<int>(b.size(-2)) : static_cast<int>(b.size(-1));
-  args.k          = major_mode_a[0] == 'K' ? static_cast<int>(a.size(-1)) : static_cast<int>(a.size(-2));
+  args.m          = major_mode_a[0] == 'K' ? static_cast<int32_t>(a.size(-2)) : static_cast<int32_t>(a.size(-1));
+  args.n          = major_mode_b[0] == 'K' ? static_cast<int32_t>(b.size(-2)) : static_cast<int32_t>(b.size(-1));
+  args.k          = major_mode_a[0] == 'K' ? static_cast<int32_t>(a.size(-1)) : static_cast<int32_t>(a.size(-2));
 
   if (gemm_common::gemm_early_return(args.m, args.n, args.k, out)) {
     return;
   }
 
-  args.quant_tile = static_cast<int>(std::get<2>(scale_granularity_mnk));
+  args.quant_tile = static_cast<int32_t>(std::get<2>(scale_granularity_mnk));
   TVM_FFI_ICHECK_EQ(args.quant_tile, 128) << "quant_tile must be 128";
   args.alignment_m     = 0;
   args.expected_m      = 0;
   args.total_mp_count  = current_num_mps(a.device());
-  args.target_mp_count = static_cast<int>(num_mp.value_or(args.total_mp_count));
+  args.target_mp_count = static_cast<int32_t>(num_mp.value_or(args.total_mp_count));
 
   args.stride_m_a       = args.k;
   args.stride_k_a       = args.m;
-  args.stride_batch_a   = args.m * args.k;
+  args.stride_batch_a   = static_cast<size_t>(args.m * args.k);
   args.stride_n_b       = args.k;
   args.stride_k_b       = args.n;
-  args.stride_batch_b   = args.n * args.k;
+  args.stride_batch_b   = static_cast<size_t>(args.n * args.k);
   args.stride_m_out     = args.n;
-  args.stride_batch_out = args.m * args.n;
+  args.stride_batch_out = static_cast<size_t>(args.m * args.n);
 
   args.major_a       = major_mode_a[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
   args.major_b       = major_mode_b[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
@@ -1699,11 +1702,15 @@ void groupwise_gemm_8bit_fp8output(const std::tuple<ffi::TensorView, ffi::Tensor
   args.major_scale_a = major_mode_a[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
   args.major_scale_b = major_mode_b[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
 
-  args.scale_a_m = major_mode_a[0] == 'K' ? static_cast<int>(scale_a.size(-2)) : static_cast<int>(scale_a.size(-1));
-  args.scale_a_k = major_mode_a[0] == 'K' ? static_cast<int>(scale_a.size(-1)) : static_cast<int>(scale_a.size(-2));
+  args.scale_a_m =
+      major_mode_a[0] == 'K' ? static_cast<int32_t>(scale_a.size(-2)) : static_cast<int32_t>(scale_a.size(-1));
+  args.scale_a_k =
+      major_mode_a[0] == 'K' ? static_cast<int32_t>(scale_a.size(-1)) : static_cast<int32_t>(scale_a.size(-2));
   args.scale_a_nr_elem = args.scale_a_m * args.scale_a_k * args.batch;
-  args.scale_b_n = major_mode_b[0] == 'K' ? static_cast<int>(scale_b.size(-2)) : static_cast<int>(scale_b.size(-1));
-  args.scale_b_k = major_mode_b[0] == 'K' ? static_cast<int>(scale_b.size(-1)) : static_cast<int>(scale_b.size(-2));
+  args.scale_b_n =
+      major_mode_b[0] == 'K' ? static_cast<int32_t>(scale_b.size(-2)) : static_cast<int32_t>(scale_b.size(-1));
+  args.scale_b_k =
+      major_mode_b[0] == 'K' ? static_cast<int32_t>(scale_b.size(-1)) : static_cast<int32_t>(scale_b.size(-2));
   args.scale_b_nr_elem = args.scale_b_n * args.scale_b_k * args.batch;
 
   args.p_a         = a.data_ptr();

@@ -2,6 +2,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from mate.mha_interface import (
+    flash_attn_combine as mate_flash_attn_combine,
     flash_attn_varlen_func as mate_flash_attn_varlen_func,
     flash_attn_with_kvcache as mate_flash_attn_with_kvcache,
     get_scheduler_metadata as mate_get_scheduler_metadata,
@@ -25,6 +26,20 @@ def _resolve_block_table(
     block_table: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     return page_table if page_table is not None else block_table
+
+
+def flash_attn_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+):
+    return mate_flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out=out,
+        out_dtype=out_dtype,
+    )
 
 
 def flash_attn_func(

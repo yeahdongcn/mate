@@ -7,7 +7,7 @@ import torch
 
 from ... import env as jit_env
 from ...core import JitSpec, gen_jit_spec
-from ...utils import EXPORT_FUNC, TVM_HEADER
+from ...utils import EXPORT_FUNC, TVM_HEADER, dtype_torch2mutlass_map
 from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
 from .fmha_utils import (
     FMHA_EXTRA_CUDA_CFLAGS,
@@ -15,6 +15,7 @@ from .fmha_utils import (
     fmha_extra_include_paths,
     get_fmha_template,
     _resolve_mask,
+    round_multiple,
 )
 from ....execution_context import raise_complete_if_dry_run
 
@@ -24,6 +25,13 @@ def _fmha_get_metadata_encode(config: Mapping[str, object]) -> str:
     head_ratio = config["head_ratio"]
     num_warps = config["num_warps"]
     name_list.append(f"{head_ratio}x{num_warps}")
+    name_list.append(
+        "fp8"
+        if config["element"] in ("mutlass::float_e4m3_t",)
+        else "bf16"
+        if config["element"] in ("mutlass::bfloat16_t",)
+        else "fp16"
+    )
 
     if config["has_seqused_q"]:
         mode_q = "padded_q"
@@ -184,8 +192,17 @@ specs_attn = [
         name="head_ratio",
         domain=[1, 2, 4, 5, 8, 12, 16],
     ),
+    ParamSpec(
+        name="element",
+        domain=["mutlass::half_t", "mutlass::bfloat16_t"],
+    ),
 ]
 specs_metadata = [
+    ParamSpec(
+        name="element_size",
+        compute=lambda cfg: torch.bfloat16.itemsize,
+        sweep=False,
+    ),
     ParamSpec(
         name="sort",
         domain=[True],
@@ -256,6 +273,8 @@ def _fmha_get_metadata(
     num_heads_kv: int,
     headdim: int,
     headdim_v: Optional[int],
+    qkv_dtype: torch.dtype = torch.bfloat16,
+    has_qv: bool = False,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
@@ -344,14 +363,11 @@ def _fmha_get_metadata(
         attention_chunk=attention_chunk,
     )
     qhead_per_kvhead = num_heads_q // num_heads_kv
+    kernel_packgqa = packgqa
+    element_size = qkv_dtype.itemsize
 
-    metadata = torch.empty((batch_size * 4), dtype=torch.int32, device="musa")
-    (
-        num_splits_dynamic,
-        batch_table,
-        num_m_blocks,
-        num_nheads_in_l2,
-    ) = (metadata[batch_size * i : batch_size * (i + 1)] for i in range(4))
+    batch_rounded = round_multiple(batch_size, 4)
+    metadata = torch.empty((batch_rounded * 4), dtype=torch.int32, device="musa")
 
     (
         tile_m,
@@ -368,10 +384,13 @@ def _fmha_get_metadata(
         qhead_per_kvhead,
         headdim,
         headdim_v,
-        packgqa,
+        element_size,
+        kernel_packgqa,
+        has_qv,
+        qkv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2],
     )
 
-    packgqa = enable_packgqa if packgqa is None else packgqa
+    packgqa = enable_packgqa if kernel_packgqa is None else kernel_packgqa
     # num_warps = 1 << (math.ceil(batch_size / 31) - 1).bit_length()
     num_warps = min(math.ceil(batch_size / 31), 32)
     constexpr_dict = {
@@ -385,8 +404,10 @@ def _fmha_get_metadata(
         "is_local": is_local,
         "is_packgqa": packgqa,
         "head_ratio": qhead_per_kvhead,
+        "element_size": element_size,
         "sort": True,
         "num_warps": num_warps,
+        "element": dtype_torch2mutlass_map[qkv_dtype],
     }
 
     dispatch_name, mod = _fmha_metadata_module(constexpr_dict)
@@ -412,10 +433,7 @@ def _fmha_get_metadata(
         window_size_left,
         window_size_right,
         leftpad_k,
-        num_splits_dynamic,
-        batch_table,
-        num_m_blocks,
-        num_nheads_in_l2,
+        metadata,
         num_splits,
         tile_m,
         tile_n,

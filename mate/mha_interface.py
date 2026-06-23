@@ -5,8 +5,11 @@ from typing import List, Optional, Union, Tuple
 from mate.api_logging import mate_api
 from .jit.flash_attention_ops import get_flash_attention_ops_module
 from .jit.mla_ops import get_mla_ops_module
-from .jit.attention.fmha import _fmha_get_metadata as jit_fmha_get_metadata  # noqa: F401
+from .jit.attention.fmha import (
+    _fmha_get_metadata as jit_fmha_get_metadata,
+)  # noqa: F401
 from .jit.attention.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
+from .jit.attention.fmha.fmha_combine import _flash_attn_combine
 from .execution_context import raise_complete_if_dry_run
 
 
@@ -523,58 +526,85 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
-
-        # dnn bwd need (b,h max_q) lse but fwd lse is (h, total_q) currently!
-        def lse_varlen_to_padded(lse_flat, cu_seqlen_q, max_q, pad_value=0.0):
-            # lse_flat: [H, total_Q]
-            # lse_padded: [H, b, max_q]
-            H, total_Q = lse_flat.shape
-            # b = cu_seqlen_q.shape[0] - 1
-            device = lse_flat.device
-            seq_ids = torch.arange(max_q, device=device).unsqueeze(0)
-            offsets = cu_seqlen_q[:-1].unsqueeze(1)
-            indices = seq_ids + offsets
-            seqlens = cu_seqlen_q[1:] - cu_seqlen_q[:-1]
-            valid_mask = seq_ids < seqlens.unsqueeze(1)
-            indices = torch.clamp(indices, 0, total_Q - 1)
-            lse_gathered = lse_flat[:, indices]
-            lse_padded = torch.where(
-                valid_mask.unsqueeze(0),
-                lse_gathered,
-                torch.tensor(pad_value, device=device, dtype=lse_flat.dtype),
+        headdim = q.shape[-1]
+        if headdim == 256:
+            from .flash_attention.tilelang.flash_attention_varlen_bwd import (
+                flashattn_varlen_bwd_interface,
             )
-            return lse_padded.permute(1, 0, 2).contiguous()
 
-        softmax_lse = lse_varlen_to_padded(softmax_lse, cu_seqlens_q, ctx.max_seqlen_q)
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        head_size_og = dout.size(2)
-        dout_padded = dout
-        if head_size_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        _flash_attn_varlen_backward(
-            dout_padded,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            ctx.max_seqlen_q,
-            ctx.max_seqlen_k,
-            dropout_p=0.0,
-            softmax_scale=ctx.softmax_scale,
-            causal=ctx.causal,
-            window_size_left=ctx.window_size[0],
-            window_size_right=ctx.window_size[1],
-            softcap=ctx.softcap,
-            alibi_slopes=None,
-            deterministic=ctx.deterministic,
-            rng_state=None,
-        )
+            dq, dk, dv = flashattn_varlen_bwd_interface(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                softmax_lse,
+                ctx.max_seqlen_q,
+                ctx.max_seqlen_k,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                is_causal=ctx.causal,
+                smscale=ctx.softmax_scale,
+                dtype=None,
+                block_M=64,
+                block_N=64,
+                threads=640,
+                is_bhsd=False,
+            )
+        else:
+            # dnn bwd need (b,h max_q) lse but fwd lse is (h, total_q) currently!
+            def lse_varlen_to_padded(lse_flat, cu_seqlen_q, max_q, pad_value=0.0):
+                # lse_flat: [H, total_Q]
+                # lse_padded: [H, b, max_q]
+                H, total_Q = lse_flat.shape
+                # b = cu_seqlen_q.shape[0] - 1
+                device = lse_flat.device
+                seq_ids = torch.arange(max_q, device=device).unsqueeze(0)
+                offsets = cu_seqlen_q[:-1].unsqueeze(1)
+                indices = seq_ids + offsets
+                seqlens = cu_seqlen_q[1:] - cu_seqlen_q[:-1]
+                valid_mask = seq_ids < seqlens.unsqueeze(1)
+                indices = torch.clamp(indices, 0, total_Q - 1)
+                lse_gathered = lse_flat[:, indices]
+                lse_padded = torch.where(
+                    valid_mask.unsqueeze(0),
+                    lse_gathered,
+                    torch.tensor(pad_value, device=device, dtype=lse_flat.dtype),
+                )
+                return lse_padded.permute(1, 0, 2).contiguous()
+
+            softmax_lse = lse_varlen_to_padded(
+                softmax_lse, cu_seqlens_q, ctx.max_seqlen_q
+            )
+            dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+            head_size_og = dout.size(2)
+            dout_padded = dout
+            if head_size_og % 8 != 0:
+                dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+            _flash_attn_varlen_backward(
+                dout_padded,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                ctx.max_seqlen_q,
+                ctx.max_seqlen_k,
+                dropout_p=0.0,
+                softmax_scale=ctx.softmax_scale,
+                causal=ctx.causal,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
+                softcap=ctx.softcap,
+                alibi_slopes=None,
+                deterministic=ctx.deterministic,
+                rng_state=None,
+            )
         # dq = dq[..., : dout.shape[-1]]
         # dk = dk[..., : dout.shape[-1]]
         # dv = dv[..., : dout.shape[-1]]
@@ -756,6 +786,16 @@ def flash_attn_varlen_func(
 
 
 @mate_api
+def flash_attn_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+):
+    return _flash_attn_combine(out_partial, lse_partial, out, out_dtype)
+
+
+@mate_api
 def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -918,7 +958,7 @@ def flash_attn_with_kvcache(
 
     is_mla_decode = qv is not None and qv.shape[-1] == 512 and q.shape[-1] == 64
 
-    if is_mla_decode:
+    if is_mla_decode and isinstance(scheduler_metadata, tuple):
         mla_qv = qv
         mla_q = q
         use_flash_mla_asm = mla_qv.shape[-2] == 128
@@ -1014,6 +1054,7 @@ def get_scheduler_metadata(
     has_softcap=False,
     num_splits=0,  # Can be tuned for speed
     pack_gqa=None,  # Can be tuned for speed
+    has_qv=False,
     mp_margin=0,  # Can be tuned if some MPs are used for communication):
 ):
     if window_size is None:
@@ -1031,6 +1072,7 @@ def get_scheduler_metadata(
         num_heads_kv=num_heads_kv,
         headdim=headdim,
         headdim_v=headdim_v,
+        qkv_dtype=qkv_dtype,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         seqused_q=seqused_q,
@@ -1042,6 +1084,7 @@ def get_scheduler_metadata(
         leftpad_k=cache_leftpad,
         num_splits=num_splits,
         packgqa=pack_gqa,
+        has_qv=has_qv,
         mp_margin=mp_margin,
         cu_seqlens_k_new=cu_seqlens_k_new,
     )

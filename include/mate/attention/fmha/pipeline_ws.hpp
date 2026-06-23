@@ -76,7 +76,7 @@ class Mp31PipelineTmeAsyncWarpsepcialized {
       // Init full barriers
       MUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < Stages; ++i) {
-        FullBarrier::init(barrier_base_ + i, params_.num_producers, 0);
+        FullBarrier::init(barrier_base_ + i, params_.num_producers + params_.num_consumers, 0);
       }
 
       // Init empty barriers
@@ -146,6 +146,7 @@ class Mp31PipelineTmeAsyncWarpsepcialized {
   MUTLASS_DEVICE
   void consumer_wait(uint32_t stage, uint32_t phase) {
     uint32_t full_barrier_id = barrier_base_ + stage;
+    FullBarrier::arrive(full_barrier_id);
     FullBarrier::wait(full_barrier_id, phase);
   }
 
@@ -189,7 +190,7 @@ class Mp31PipelineAsyncWarpsepcialized {
       // Init full barriers
       MUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < Stages; ++i) {
-        FullBarrier::init(barrier_base_ + i, params_.producer_arv_count, 0);
+        FullBarrier::init(barrier_base_ + i, params_.producer_arv_count + params_.consumer_arv_count, 0);
       }
 
       // Init empty barriers
@@ -256,6 +257,7 @@ class Mp31PipelineAsyncWarpsepcialized {
   MUTLASS_DEVICE
   void consumer_wait(uint32_t stage, uint32_t phase) {
     uint32_t full_barrier_id = barrier_base_ + stage;
+    FullBarrier::arrive(full_barrier_id);
     FullBarrier::wait(full_barrier_id, phase);
   }
 

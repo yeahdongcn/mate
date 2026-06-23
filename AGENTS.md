@@ -90,6 +90,7 @@ When working with MATE's dependencies and tools, refer to these official documen
 - Always read relevant files before modifying code
 - For non-trivial tasks, create a plan first
 - Validate changes by running tests
+- After completing a task, always run `pre-commit run -a` to format/check code and fix any reported issues before handing off
 - Prefer minimal, localized changes
 - When running as `root` in the container, restore edited tracked files to the
   workspace owner/group and keep them user/group writable before handing off.

@@ -6,6 +6,7 @@ Usage:
     mate --help
     mate show-config
     mate replay --dir mate_dumps/
+    mate guard-run -- python your_script.py
 
 Requirements:
     pip install click>=8.0.0
@@ -16,6 +17,7 @@ import sys
 import json
 import re
 import importlib
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +105,14 @@ ENV_VARS = {
     "MATE_WORKSPACE_BASE": "Base directory for the MATE cache workspace",
     "MATE_DISABLE_JIT": "Disable runtime JIT and require matching AOT modules",
     "MATE_JIT_VERBOSE": "Show verbose ninja output for runtime JIT builds",
+    "MATE_DEEPGEMM_MK_ALIGNMENT": "DeepGEMM contiguous grouped GEMM M alignment (128 or 256)",
+    "MATE_PYTEST_GUARD_ALLOC": "Enable guard allocator by default for pytest runs (0/1)",
+    "MATE_PYTEST_GUARD_MODE": "Default pytest guard allocator mode (tail or head)",
+    "MATE_PYTEST_GUARD_LOG_ALLOCATIONS": "Log guarded alloc/free events during pytest runs (0/1)",
+    "MATE_GUARD_ALLOCATOR_AUTO_INSTALL": "Internal bootstrap flag for guard-run",
+    "MATE_GUARD_ALLOCATOR_MODE": "Guard allocator mode (tail or head)",
+    "MATE_GUARD_ALLOCATOR_SYNC_ON_FREE": "Synchronize device before guarded frees (0/1)",
+    "MATE_GUARD_ALLOCATOR_LOG_ALLOCATIONS": "Log guarded alloc/free events to stderr (0/1)",
     "MATE_EXTRA_CFLAGS": "Extra host compiler flags for JIT builds",
     "MATE_EXTRA_MUSAFLAGS": "Extra mcc flags for JIT builds",
     "MATE_EXTRA_LDFLAGS": "Extra linker flags for JIT builds",
@@ -439,6 +449,12 @@ def _get_jit_status_info(register_modules: bool = False):
         }
 
 
+def _install_guard_allocator_for_replay(mode: str) -> None:
+    from mate.memory_debug import GuardAllocatorConfig, install_guard_allocator
+
+    install_guard_allocator(GuardAllocatorConfig(mode=mode))
+
+
 def get_system_info():
     """Gather system information."""
     tvm_ffi_status = _get_tvm_ffi_status()
@@ -580,6 +596,7 @@ def cli(ctx):
     Examples:
         mate show-config              # Display configuration
         mate replay --dir dumps/      # Replay API calls
+        mate guard-run -- python app.py
         mate env                      # Show environment variables
     """
     if ctx.invoked_subcommand is None:
@@ -845,7 +862,27 @@ def clear_cache_cmd():
     "--compare/--no-compare", default=True, help="Compare outputs with expected values"
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-def replay_cmd(dump_dir: str, device: str, run: bool, compare: bool, verbose: bool):
+@click.option(
+    "--guard-alloc/--no-guard-alloc",
+    default=False,
+    help="Install the MATE guard allocator before replaying MUSA tensors",
+)
+@click.option(
+    "--guard-mode",
+    type=click.Choice(["tail", "head"]),
+    default="tail",
+    show_default=True,
+    help="Which side of the allocation should use the unmapped guard page",
+)
+def replay_cmd(
+    dump_dir: str,
+    device: str,
+    run: bool,
+    compare: bool,
+    verbose: bool,
+    guard_alloc: bool,
+    guard_mode: str,
+):
     """Replay API calls from Level 10 dump directory.
 
     Examples:
@@ -853,6 +890,13 @@ def replay_cmd(dump_dir: str, device: str, run: bool, compare: bool, verbose: bo
         mate replay --dir mate_dumps/ --verbose
         mate replay --dir dumps/ --device cpu --no-run
     """
+    if guard_alloc:
+        if not device.startswith("musa"):
+            raise click.ClickException(
+                "--guard-alloc only supports replay targets on MUSA devices"
+            )
+        _install_guard_allocator_for_replay(guard_mode)
+
     replay_from_dump, replay_sequence = _get_replay_functions()
 
     if replay_from_dump is None:
@@ -961,6 +1005,49 @@ def replay_cmd(dump_dir: str, device: str, run: bool, compare: bool, verbose: bo
         except Exception as e:
             click.secho(f"❌ Replay failed: {e}", fg="red")
             sys.exit(1)
+
+
+@cli.command("guard-run")
+@click.option(
+    "--mode",
+    type=click.Choice(["tail", "head"]),
+    default="tail",
+    show_default=True,
+    help="Which side of the allocation should use the unmapped guard page",
+)
+@click.option(
+    "--log-allocations",
+    is_flag=True,
+    help="Print guarded alloc/free events to stderr in the child process",
+)
+@click.argument("command", nargs=-1, type=click.UNPROCESSED)
+def guard_run_cmd(mode: str, log_allocations: bool, command: tuple[str, ...]):
+    """Run a child command with the MATE guard allocator installed at startup."""
+    if not command:
+        raise click.UsageError("guard-run requires a command after '--'")
+
+    from mate.memory_debug import GuardAllocatorConfig, run_guarded_command
+
+    exit_code = run_guarded_command(
+        list(command),
+        GuardAllocatorConfig(mode=mode, log_allocations=log_allocations),
+    )
+    _exit_with_subprocess_status(exit_code)
+
+
+def _exit_with_subprocess_status(returncode: int) -> None:
+    if returncode >= 0:
+        raise SystemExit(returncode)
+
+    signum = -returncode
+    try:
+        signal.signal(signum, signal.SIG_DFL)
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    # Mirror signal termination instead of converting it to a shell exit code.
+    os.kill(os.getpid(), signum)
+    raise SystemExit(128 + signum)
 
 
 @cli.command("list-dumps")

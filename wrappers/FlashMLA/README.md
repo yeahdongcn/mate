@@ -1,29 +1,31 @@
-# flash_mla
+# FlashMLA Compatibility Wrapper (flash_mla)
 
-`flash_mla` is a compatibility wrapper package that preserves the official `flash_mla` package name and import path on top of MATE MLA operators on MUSA.
+`flash_mla` is a compatibility wrapper package that preserves the official
+`flash_mla` package name and import path while running on MUSA through MATE
+Multi-head Latent Attention (MLA) operators.
 
 ## Overview
 
-This wrapper is intended for projects that already target the FlashMLA Python API and want to run MLA dense/sparse decode and sparse prefill on MUSA through MATE with smaller integration changes.
+This wrapper is designed for projects that already target the FlashMLA Python
+API. It lets you run MLA dense decode, sparse decode, and sparse prefill
+workloads on MUSA with minimal integration changes.
+
+The current compatibility scope includes `FlashMLASchedMeta`,
+`get_mla_metadata`, `flash_mla_with_kvcache`, and `flash_mla_sparse_fwd`.
+
+## Package and import
 
 - Package name: `flash_mla`
 - Import path: `flash_mla`
 - Runtime backend: MATE MLA operators on MUSA
 
-The package currently exposes the minimal FlashMLA-compatible surface:
-
-- `FlashMLASchedMeta`
-- `get_mla_metadata`
-- `flash_mla_with_kvcache`
-- `flash_mla_sparse_fwd`
-
 ## Requirements
 
-Before using this wrapper, make sure the following are already available:
+Before using this wrapper, make sure the following are available:
 
-- MATE is installed and importable
-- TorchMUSA and the MUSA runtime environment are available
-- The target workload is expected to run on MUSA devices
+- MATE is installed and importable.
+- TorchMUSA is installed and the MUSA runtime environment is configured.
+- The target workload is configured to run on MUSA devices.
 
 ## Build
 

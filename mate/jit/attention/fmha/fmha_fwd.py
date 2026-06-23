@@ -16,6 +16,7 @@ from .fmha_utils import (
     fmha_extra_include_paths,
     get_fmha_template,
     _resolve_mask,
+    round_multiple,
 )
 from .fmha_combine import _fmha_fwd_combine
 from ...utils import (
@@ -60,9 +61,57 @@ def config_selector(cfg):
     return cfg["config_level"]
 
 
+@functools.cache
+def _dtype_bits(dtype: torch.dtype) -> int:
+    return dtype.itemsize * 8
+
+
+@functools.cache
+def _paged_kv_tme_page_size(dtype: torch.dtype) -> int:
+    return 128 if _dtype_bits(dtype) == 8 else 64
+
+
+@functools.cache
+def _select_lsu_load_kv(
+    *,
+    paged_kv: bool,
+    page_size: int,
+    has_leftpad_k: bool,
+    has_qv: bool,
+    dtype: torch.dtype,
+) -> tuple[bool, bool]:
+    tme_page_size = _paged_kv_tme_page_size(dtype)
+    use_lsu_load_k = (
+        (not paged_kv) or (paged_kv and page_size != tme_page_size) or has_leftpad_k
+    )
+    use_lsu_load_v = (
+        (paged_kv and page_size != tme_page_size)
+        or has_leftpad_k
+        or (has_qv and not paged_kv)
+    )
+    return use_lsu_load_k, use_lsu_load_v
+
+
+def _dtype_from_config(cfg: Mapping[str, object]) -> torch.dtype:
+    dtype = cfg["dtype"]
+    assert isinstance(dtype, torch.dtype)
+    return dtype
+
+
+def _select_lsu_load_kv_for_config(cfg: Mapping[str, object]) -> tuple[bool, bool]:
+    dtype = _dtype_from_config(cfg)
+    return _select_lsu_load_kv(
+        paged_kv=bool(cfg["paged_kv"]),
+        page_size=_paged_kv_tme_page_size(dtype),
+        has_leftpad_k=bool(cfg["has_leftpad_k"]),
+        has_qv=bool(cfg["has_qv"]),
+        dtype=dtype,
+    )
+
+
 CONFIG_TABLE: Dict[int, Dict[str, Any]] = {
     1: {
-        "element": [dtype_torch2mutlass_map[dtype] for dtype in [torch.bfloat16]],
+        "dtype": [torch.bfloat16],
         "headdim": [(128, 128), (256, 256)],
         "head_ratio": [1, 4, 5, 8, 12, 16],
         "mode_q": ["ragged"],
@@ -75,7 +124,7 @@ CONFIG_TABLE: Dict[int, Dict[str, Any]] = {
         "has_softcap": [False],
     },
     2: {
-        "element": [dtype_torch2mutlass_map[dtype] for dtype in [torch.bfloat16]],
+        "dtype": [torch.bfloat16],
         "headdim": [(128, 128), (192, 128), (256, 256)],
         "head_ratio": [1, 4, 5, 8, 12, 16],
         "mode_q": ["ragged"],
@@ -146,11 +195,26 @@ mode_k = [
         depends_on=("has_seqused_k",),
     ),
     ParamSpec(
-        name="force_lsu_kv",
-        domain=[False, True],
-        default=False,
-        meaningful_if=lambda cfg: bool(cfg["paged_kv"]),
-        depends_on=("paged_kv",),
+        name="use_lsu_load_k",
+        compute=lambda cfg: _select_lsu_load_kv_for_config(cfg)[0],
+        depends_on=(
+            "dtype",
+            "paged_kv",
+            "has_leftpad_k",
+            "has_qv",
+        ),
+        sweep=False,
+    ),
+    ParamSpec(
+        name="use_lsu_load_v",
+        compute=lambda cfg: _select_lsu_load_kv_for_config(cfg)[1],
+        depends_on=(
+            "dtype",
+            "paged_kv",
+            "has_leftpad_k",
+            "has_qv",
+        ),
+        sweep=False,
     ),
     ParamSpec(
         name="is_append_kv",  # AppendKV not in AOT
@@ -245,14 +309,26 @@ score_mode = [
 ]
 specs_attn = [
     ParamSpec(
+        name="has_qv",
+        domain=[False],
+        default=False,
+    ),
+    ParamSpec(
         name="is_packgqa",
         domain=domain_by_case(config_selector, CONFIG_TABLE, "is_packgqa"),
         depends_on=("config_level",),
     ),
     ParamSpec(
-        name="element",
-        domain=domain_by_case(config_selector, CONFIG_TABLE, "element"),
+        name="dtype",
+        domain=domain_by_case(config_selector, CONFIG_TABLE, "dtype"),
         depends_on=("config_level",),
+        export=False,
+    ),
+    ParamSpec(
+        name="element",
+        compute=lambda cfg: dtype_torch2mutlass_map[_dtype_from_config(cfg)],
+        depends_on=("dtype",),
+        sweep=False,
     ),
     ParamSpec(
         name="head_ratio",
@@ -478,13 +554,13 @@ def _fmha_fwd(
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
 ):
     # Feature gates.
-    assert q_v is None, "qv parameter is not supported yet"
     assert not ((k_new is None) ^ (v_new is None)), (
         "k_new and v_new must be provided together"
     )
 
     # Canonicalize tensor layout before deriving runtime metadata.
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    q_v = maybe_contiguous(q_v)
     if k_new is not None:
         k_new, v_new = [maybe_contiguous(t) for t in (k_new, v_new)]
 
@@ -524,6 +600,7 @@ def _fmha_fwd(
             q,
             k,
             v,
+            q_v,
             cu_seqlens_q,
             cu_seqlens_k,
             cu_seqlens_k_new,
@@ -537,13 +614,18 @@ def _fmha_fwd(
             rotary_sin,
             leftpad_k,
             kv_batch_idx,
+            q_descale,
+            k_descale,
+            v_descale,
         )
     ), "inputs must be on MUSA device"
 
-    assert q.dtype in [torch.float16, torch.bfloat16], (
-        "inputs must be float16 or bfloat16"
+    assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn], (
+        "inputs must be float16, bfloat16, or float8_e4m3fn"
     )
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    if q_v is not None:
+        assert q_v.dtype == q.dtype, "q_v must have the same dtype as q, k and v"
     if k_new is not None:
         assert k_new.dtype == q.dtype == v_new.dtype, (
             "k_new and v_new must have the same dtype as q, k and v"
@@ -619,6 +701,17 @@ def _fmha_fwd(
             "cu_seqlens_q must have shape (batch_size + 1,)"
         )
 
+    if q_v is not None:
+        assert q_v.stride(-1) == 1, "q_v must have contiguous last dimension"
+        expected_qv_shape = (
+            (batch_size, seqlen_q, num_head, head_dim_v)
+            if cu_seqlens_q is None
+            else (total_q, num_head, head_dim_v)
+        )
+        assert q_v.shape == expected_qv_shape, (
+            f"q_v must have shape {expected_qv_shape}, got {tuple(q_v.shape)}"
+        )
+
     assert seqused_q is None or seqused_q.shape == (batch_size,), (
         "seqused_q must have shape (batch_size,)"
     )
@@ -681,6 +774,22 @@ def _fmha_fwd(
             )
             assert seqlens_rotary.shape == (batch_size,)
 
+    if q_v is not None:
+        assert head_dim_v <= 512, "q_v is only supported for value head dim <= 512"
+        assert head_dim % 8 == 0, "q/k head dim should be a multiple of 8"
+        assert head_dim_v % 8 == 0, "value head dim should be a multiple of 8"
+        # assert q.dtype in (torch.float16, torch.bfloat16), (
+        #     "q_v is only supported for fp16 and bf16 data type"
+        # )
+    # FP8
+    if q.dtype == torch.float8_e4m3fn:
+        if q_descale is not None:
+            assert q_descale.shape == (batch_size, num_head_kv)
+        if k_descale is not None:
+            assert k_descale.shape == (batch_size, num_head_kv)
+        if v_descale is not None:
+            assert v_descale.shape == (batch_size, num_head_kv)
+
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
 
     # Derive execution policy.
@@ -690,7 +799,9 @@ def _fmha_fwd(
         scheduler_metadata = None
 
     if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(head_dim)
+        softmax_scale = 1.0 / math.sqrt(
+            head_dim + (head_dim_v if q_v is not None else 0)
+        )
 
     qhead_per_kvhead = num_head // num_head_kv
     if attention_chunk > 0:
@@ -715,6 +826,7 @@ def _fmha_fwd(
         window_size_right=window_size_right,
         attention_chunk=attention_chunk,
     )
+    kernel_pack_gqa = pack_gqa
 
     # CP sanity checks
     assert cp_world_size > 0, (
@@ -730,7 +842,7 @@ def _fmha_fwd(
         "Local attention (sliding window) is not currently supported with context parallelism (cp_world_size > 1)."
     )
 
-    out_torch_dtype = q.dtype
+    out_torch_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
     q_batch_seqlen_shape = (
         (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     )
@@ -760,23 +872,12 @@ def _fmha_fwd(
         assert lse.dtype == torch.float32
         assert lse.device == q.device
 
+    batch_rounded = round_multiple(batch_size, 4)
     # Metadata
     # If not provided, fallback to SingleTileScheduler.
     if scheduler_metadata is not None:
-        assert scheduler_metadata.shape[0] >= batch_size * 4, (
+        assert scheduler_metadata.shape[0] >= batch_rounded * 4, (
             "metadata buffer is too small"
-        )
-        (
-            num_splits_dynamic,
-            batch_table,
-            num_m_blocks,
-            num_nheads_in_l2,
-        ) = (
-            scheduler_metadata[batch_size * i : batch_size * (i + 1)] for i in range(4)
-        )
-    else:
-        num_splits_dynamic, batch_table, num_m_blocks, num_nheads_in_l2 = (
-            None for _ in range(4)
         )
 
     (
@@ -794,9 +895,22 @@ def _fmha_fwd(
         qhead_per_kvhead,
         head_dim,
         head_dim_v,
-        pack_gqa,
+        q.element_size(),
+        kernel_pack_gqa,
+        q_v is not None,
+        q.dtype in [torch.float8_e4m3fn, torch.float8_e5m2],
     )
+    # print(
+    #     f"{tile_m=}, {tile_n=}, {stages_k=}, {stages_v=}, {headdim_rounded=}, {headdim_v_rounded=}, {consumers_qk=}, {consumers_pv=}, {enable_packgqa=}"
+    # )
 
+    use_lsu_load_k, use_lsu_load_v = _select_lsu_load_kv(
+        paged_kv=page_table is not None,
+        page_size=page_size,
+        has_leftpad_k=leftpad_k is not None,
+        has_qv=q_v is not None,
+        dtype=q.dtype,
+    )
     constexpr_dict = {
         "has_cu_seqlens_q": cu_seqlens_q is not None,
         "has_cu_seqlens_k": cu_seqlens_k is not None,
@@ -805,6 +919,9 @@ def _fmha_fwd(
         "has_cu_seqlens_k_new": cu_seqlens_k_new is not None,
         "has_kv_batch_idx": kv_batch_idx is not None,
         "has_leftpad_k": leftpad_k is not None,
+        "has_q_descale": q_descale is not None,
+        "has_k_descale": k_descale is not None,
+        "has_v_descale": v_descale is not None,
         "paged_kv": page_table is not None,
         "has_softcap": softcap != 0.0,
         "is_append_kv": k_new is not None,
@@ -814,8 +931,8 @@ def _fmha_fwd(
         "is_packgqa": enable_packgqa,
         "head_ratio": qhead_per_kvhead,
         "element": dtype_torch2mutlass_map[q.dtype],
-        "force_lsu_kv": (page_table is not None and page_size != 64)
-        or leftpad_k is not None,
+        "use_lsu_load_k": use_lsu_load_k,
+        "use_lsu_load_v": use_lsu_load_v,
         "tile_m": tile_m,
         "tile_n": tile_n,
         "stages_k": stages_k,
@@ -831,6 +948,7 @@ def _fmha_fwd(
         "is_rotary_interleaved": is_rotary_interleaved and rotary_cos is not None,
         "has_seqlens_rotary": seqlens_rotary is not None,
         "has_attention_chunk": attention_chunk > 0,
+        "has_qv": q_v is not None,
     }
     # print(f"tile_m: {tile_m}, tile_n: {tile_n}")
 
@@ -872,9 +990,7 @@ def _fmha_fwd(
         # is_rotary_interleaved,  # Not used
         mp_margin,
         num_splits,
-        num_splits_dynamic,
-        batch_table,
-        num_m_blocks,
+        scheduler_metadata,
         learnable_sink,
         out,
         lse,

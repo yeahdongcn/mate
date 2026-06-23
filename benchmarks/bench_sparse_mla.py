@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -23,10 +24,12 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FLASHMLA_ROOT = REPO_ROOT / "wrappers" / "FlashMLA"
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(FLASHMLA_ROOT))
 sys.path.insert(0, str(FLASHMLA_ROOT / "tests"))
 
 import flash_mla  # noqa: E402
+from mate.mate_runtime import resolve_num_mps  # noqa: E402
 from sparse_mla_test_utils import FP8KVCacheLayout, quantize_k_cache  # noqa: E402
 
 
@@ -60,6 +63,8 @@ class PrefillCase:
     extra_topk: int = 0
     direct_tilelang: bool = False
     index_pattern: str = "strided"
+    is_persistence: bool = True
+    persistent_blocks: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -510,18 +515,19 @@ def _make_model1_prefill_graph_runner(
     assert extra_indices_arg is not None
 
     kernel_kwargs = {
-        "extra_topk": extra_topk,
+        "has_extra": extra_topk > 0,
         "kv_group": kv_group,
         "sm_scale": case.d_qk**-0.5,
         "is_causal": True,
         "threads": 640,
         "has_attn_sink": attn_sink is not None,
+        "is_persistence": case.is_persistence,
+        "persistent_blocks": case.persistent_blocks,
     }
     kernel = _compile_with_explicit_outputs(
         sparse_attention_fwd_kernel_model1,
         heads,
         dim,
-        topk,
         **kernel_kwargs,
     )
     out = torch.empty((seq_len, heads, dim), dtype=q.dtype, device=q.device)
@@ -603,6 +609,10 @@ def _run_prefill_case(
 
     if case.direct_tilelang:
         if case.d_qk == 512:
+            if extra_kv is not None:
+                raise AssertionError(
+                    "MODEL1 direct prefill no longer has an extra-KV ABI"
+                )
             from mate.sparse_mla.tilelang.sparse_mla_model1_fwd_pipelined import (
                 sparse_mla_fwd_interface_model1,
             )
@@ -612,13 +622,12 @@ def _run_prefill_case(
                     q=q,
                     kv=kv,
                     indices=indices,
-                    extra_kv=extra_kv,
-                    extra_indices=extra_indices,
                     topk_length=topk_length,
-                    extra_topk_length=extra_topk_length,
                     sm_scale=case.d_qk**-0.5,
                     attn_sink=attn_sink,
                     d_v=DV,
+                    is_persistence=case.is_persistence,
+                    persistent_blocks=case.persistent_blocks,
                 )
         elif case.d_qk == 576:
             if extra_kv is not None:
@@ -686,6 +695,8 @@ def _run_prefill_case(
         graph_fn=run_graph,
     )
     label = "prefill-direct" if case.direct_tilelang else "prefill"
+    if case.d_qk == 512 and case.is_persistence:
+        label += f"-persist{case.persistent_blocks}"
     print(
         f"{label} {case.name}: e2e={e2e_us:.1f} us, "
         f"{_kernel_path_name(used_graph)}={kernel_path_us:.1f} us, "
@@ -1178,128 +1189,22 @@ def _run_decode_case(
 def _prefill_cases(
     quick: bool, case_set: str, include_large: bool
 ) -> Iterable[PrefillCase]:
-    if case_set == "tilelang":
-        yield PrefillCase(
-            "v32_temp_aligned",
-            576,
-            128,
-            896,
-            4096,
-            2048,
-            attn_sink=False,
-            topk_length=False,
-            direct_tilelang=True,
-            index_pattern="temp_causal",
-        )
-        if include_large:
-            yield PrefillCase(
-                "model1_tilelang_perf",
-                512,
-                128,
-                896 if quick else 4096,
-                8192,
-                2048,
-                attn_sink=False,
-                topk_length=False,
-                extra_seq_len_kv=8192,
-                extra_topk=2048,
-                direct_tilelang=True,
-            )
-        else:
-            yield PrefillCase(
-                "model1_wrapper_no_extra",
-                512,
-                128,
-                4096,
-                8192,
-                1024,
-                attn_sink=False,
-                topk_length=False,
-            )
-        return
-
-    skvs = [8192] if quick else [8192, 32768, 65536]
-    templates = [(576, 128, 2048), (512, 64, 512), (512, 128, 1024)]
+    skvs = [8192]
+    templates = [(512, 64, 512), (512, 64, 2048)]
     for d_qk, heads, topk in templates:
         for skv in skvs:
             yield PrefillCase(
-                f"d{d_qk}_h{heads}_skv{skv}", d_qk, heads, 4096, skv, topk
+                f"d{d_qk}_h{heads}_skv{skv}_topk{topk}", d_qk, heads, 4096, skv, topk
             )
 
 
 def _decode_cases(
     quick: bool, case_set: str, include_large: bool
 ) -> Iterable[DecodeCase]:
-    if case_set == "tilelang":
-        yield DecodeCase(
-            "v32_temp_aligned",
-            576,
-            128,
-            1,
-            896,
-            8192,
-            2048,
-            64,
-            attn_sink=False,
-            topk_length=False,
-            extra_topk_length=False,
-            direct_tilelang=True,
-            temp_metadata=True,
-        )
-        yield DecodeCase("model1_small_b4_s1", 512, 64, 4, 1, 512, 64, 64)
-        yield DecodeCase(
-            "model1_b1_s896_h64_topk2048",
-            512,
-            64,
-            1,
-            960,
-            8192,
-            2048,
-            64,
-            attn_sink=False,
-            topk_length=False,
-            extra_topk_length=False,
-        )
-        if include_large:
-            yield DecodeCase(
-                "model1_scheduled_large_compare",
-                512,
-                128,
-                1,
-                896 if quick else 2048,
-                8192,
-                2048,
-                64,
-                8192,
-                2048,
-                64,
-                attn_sink=False,
-                topk_length=False,
-                extra_topk_length=False,
-            )
-        return
-    yield DecodeCase(
-        "model1_b1_s896_h64_topk2048",
-        512,
-        64,
-        1,
-        960,
-        8192,
-        2048,
-        64,
-        attn_sink=False,
-        topk_length=False,
-        extra_topk_length=False,
-    )
-    batches = [2] if quick else [2, 64, 74, 128]
+    batches = [128]
     for bsz in batches:
-        yield DecodeCase(f"v32_b{bsz}", 576, 128, bsz, 2, 32768, 2048, 64)
-        yield DecodeCase(
-            f"model1_h64_b{bsz}", 512, 64, bsz, 2, 16384, 128, 256, 16384, 512, 64
-        )
-        yield DecodeCase(
-            f"model1_h128_b{bsz}", 512, 128, bsz, 2, 16384, 128, 256, 16384, 1024, 64
-        )
+        yield DecodeCase(f"v32_b{bsz}", 512, 64, bsz, 1, 8192, 2048, 64)
+        yield DecodeCase(f"v32_b{bsz}", 512, 64, bsz, 1, 8192, 512, 64)
 
 
 def main() -> None:
@@ -1336,21 +1241,48 @@ def main() -> None:
         default=4,
         help="Function calls captured inside one graph replay",
     )
+    parser.add_argument(
+        "--model1-prefill-persistent-blocks",
+        type=int,
+        default=(
+            int(os.environ["MATE_MODEL1_PREFILL_PERSISTENT_BLOCKS"])
+            if "MATE_MODEL1_PREFILL_PERSISTENT_BLOCKS" in os.environ
+            else None
+        ),
+        help="Override physical CTA count for MODEL1 persistent prefill paths",
+    )
+    parser.add_argument(
+        "--no-model1-prefill-persistence",
+        action="store_true",
+        help="Disable MODEL1 persistent prefill in benchmark direct/graph paths",
+    )
     args = parser.parse_args()
 
     device = _device()
     torch.set_default_device(device)
     torch.set_float32_matmul_precision("high")
     use_graph = not args.no_graph
+    model1_prefill_persistent_blocks = resolve_num_mps(
+        device, args.model1_prefill_persistent_blocks
+    )
     print(
         f"device={device}, repeat={args.repeat}, quick={args.quick}, "
-        f"case_set={args.case_set}, graph={use_graph}, graph_iters={args.graph_iters}"
+        f"case_set={args.case_set}, graph={use_graph}, graph_iters={args.graph_iters}, "
+        f"model1_prefill_persistence={not args.no_model1_prefill_persistence}, "
+        f"model1_prefill_persistent_blocks={model1_prefill_persistent_blocks}"
     )
 
     if args.mode in ("prefill", "both"):
         for prefill_case in _prefill_cases(
             args.quick, args.case_set, args.include_large
         ):
+            if prefill_case.d_qk == 512:
+                prefill_case = dataclasses.replace(
+                    prefill_case,
+                    direct_tilelang=True,
+                    is_persistence=not args.no_model1_prefill_persistence,
+                    persistent_blocks=model1_prefill_persistent_blocks,
+                )
             _run_prefill_case(
                 prefill_case,
                 args.repeat,

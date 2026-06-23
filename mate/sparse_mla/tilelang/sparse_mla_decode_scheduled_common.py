@@ -278,6 +278,8 @@ def make_scheduled_decode_stage_value_shared(
     *,
     block_i,
     continuity,
+    ldg_ty_count=32,
+    rows_per_thread=2,
 ):
     """Build the shared register -> swizzled V tile staging macro."""
 
@@ -294,12 +296,12 @@ def make_scheduled_decode_stage_value_shared(
             allow_reannotation=True,
             allow_buffer_region=True,
         )
-        for r in T.unroll(2):
+        for r in T.unroll(rows_per_thread):
             for u in T.unroll(2):
                 for v in T.vectorized(8):
+                    row = ldg_ty + r * ldg_ty_count
                     v_shared[
-                        ((ldg_ty + r * 32) % 8) * score_swizzle
-                        + (ldg_ty + r * 32) // 8,
+                        (row % 8) * score_swizzle + row // 8,
                         64 * u + ldg_tx * 8 + v,
                     ] = kv_reg[r * 32 + (u + u_start) * 8 + v]
 
@@ -362,6 +364,7 @@ def make_scheduled_decode_finalize_left(
     *,
     h_per_block,
     out_width,
+    num_heads,
     accum_dtype,
     sm_scale,
     has_attn_sink,
@@ -372,6 +375,8 @@ def make_scheduled_decode_finalize_left(
     wait_before_final,
     l0_start,
     l1_start,
+    out_dtype="bfloat16",
+    guard_invalid_heads=False,
 ):
     """Build the shared left-half split writeback macro."""
 
@@ -432,7 +437,9 @@ def make_scheduled_decode_finalize_left(
             if sink_only_unsplit:
                 if is_unsplit:
                     for h_i in T.Parallel(h_per_block):
-                        if sink_invalid_zero:
+                        if guard_invalid_heads and h0 + h_i >= num_heads:
+                            sink_scale_shared[h_i] = 0.0
+                        elif sink_invalid_zero:
                             sink_scale_shared[h_i] = T.if_then_else(
                                 m_i[h_i] != -(2**30),
                                 1
@@ -460,17 +467,21 @@ def make_scheduled_decode_finalize_left(
                             )
             else:
                 for h_i in T.Parallel(h_per_block):
-                    sink_scale_shared[h_i] = T.if_then_else(
-                        sumexp[h_i] == T.infinity(accum_dtype),
-                        1.0,
-                        1.0
-                        / (
+                    if guard_invalid_heads and h0 + h_i >= num_heads:
+                        sink_scale_shared[h_i] = 1.0
+                    else:
+                        sink_scale_shared[h_i] = T.if_then_else(
+                            sumexp[h_i] == T.infinity(accum_dtype),
+                            1.0,
                             1.0
-                            + T.exp2(
-                                attn_sink[h0 + h_i] * 1.4426950408889634 - sumexp[h_i]
-                            )
-                        ),
-                    )
+                            / (
+                                1.0
+                                + T.exp2(
+                                    attn_sink[h0 + h_i] * 1.4426950408889634
+                                    - sumexp[h_i]
+                                )
+                            ),
+                        )
 
         if wait_before_final:
             T.lma_wait()
@@ -485,30 +496,68 @@ def make_scheduled_decode_finalize_left(
                 for h_i, d_i in T.Parallel(h_per_block, out_width):
                     acc_o_l_0[h_i, d_i] *= sink_scale_shared[h_i]
                     acc_o_l_1[h_i, d_i] *= sink_scale_shared[h_i]
-            T.copy(acc_o_l_0, output[b_i, s_i, h0:h1, l0_start : l0_start + out_width])
-            T.copy(acc_o_l_1, output[b_i, s_i, h0:h1, l1_start : l1_start + out_width])
-            for h_i in T.Parallel(h_per_block):
-                lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
+            if guard_invalid_heads:
+                for h_i, d_i in T.Parallel(h_per_block, out_width):
+                    if h0 + h_i < num_heads:
+                        output[b_i, s_i, h0 + h_i, l0_start + d_i] = T.Cast(
+                            out_dtype, acc_o_l_0[h_i, d_i]
+                        )
+                        output[b_i, s_i, h0 + h_i, l1_start + d_i] = T.Cast(
+                            out_dtype, acc_o_l_1[h_i, d_i]
+                        )
+                for h_i in T.Parallel(h_per_block):
+                    if h0 + h_i < num_heads:
+                        lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
+            else:
+                T.copy(
+                    acc_o_l_0,
+                    output[b_i, s_i, h0:h1, l0_start : l0_start + out_width],
+                )
+                T.copy(
+                    acc_o_l_1,
+                    output[b_i, s_i, h0:h1, l1_start : l1_start + out_width],
+                )
+                for h_i in T.Parallel(h_per_block):
+                    lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
         else:
-            T.copy(
-                acc_o_l_0,
-                output_partial[
-                    n_split_idx + num_splits[b_i],
-                    s_i,
-                    h0:h1,
-                    l0_start : l0_start + out_width,
-                ],
-            )
-            T.copy(
-                acc_o_l_1,
-                output_partial[
-                    n_split_idx + num_splits[b_i],
-                    s_i,
-                    h0:h1,
-                    l1_start : l1_start + out_width,
-                ],
-            )
-            T.copy(sumexp, glse[n_split_idx + num_splits[b_i], s_i, h0:h1])
+            if guard_invalid_heads:
+                for h_i, d_i in T.Parallel(h_per_block, out_width):
+                    if h0 + h_i < num_heads:
+                        output_partial[
+                            n_split_idx + num_splits[b_i],
+                            s_i,
+                            h0 + h_i,
+                            l0_start + d_i,
+                        ] = acc_o_l_0[h_i, d_i]
+                        output_partial[
+                            n_split_idx + num_splits[b_i],
+                            s_i,
+                            h0 + h_i,
+                            l1_start + d_i,
+                        ] = acc_o_l_1[h_i, d_i]
+                for h_i in T.Parallel(h_per_block):
+                    if h0 + h_i < num_heads:
+                        glse[n_split_idx + num_splits[b_i], s_i, h0 + h_i] = sumexp[h_i]
+            else:
+                T.copy(
+                    acc_o_l_0,
+                    output_partial[
+                        n_split_idx + num_splits[b_i],
+                        s_i,
+                        h0:h1,
+                        l0_start : l0_start + out_width,
+                    ],
+                )
+                T.copy(
+                    acc_o_l_1,
+                    output_partial[
+                        n_split_idx + num_splits[b_i],
+                        s_i,
+                        h0:h1,
+                        l1_start : l1_start + out_width,
+                    ],
+                )
+                T.copy(sumexp, glse[n_split_idx + num_splits[b_i], s_i, h0:h1])
 
     return finalize_left
 
@@ -517,10 +566,13 @@ def make_scheduled_decode_finalize_right(
     *,
     h_per_block,
     out_width,
+    num_heads,
     has_attn_sink,
     wait_after_scale,
     r0_start,
     r1_start,
+    out_dtype="bfloat16",
+    guard_invalid_heads=False,
 ):
     """Build the shared right-half split writeback macro."""
 
@@ -554,27 +606,59 @@ def make_scheduled_decode_finalize_right(
                 for h_i, d_i in T.Parallel(h_per_block, out_width):
                     acc_o_r_0[h_i, d_i] *= sink_scale_shared[h_i]
                     acc_o_r_1[h_i, d_i] *= sink_scale_shared[h_i]
-            T.copy(acc_o_r_0, output[b_i, s_i, h0:h1, r0_start : r0_start + out_width])
-            T.copy(acc_o_r_1, output[b_i, s_i, h0:h1, r1_start : r1_start + out_width])
+            if guard_invalid_heads:
+                for h_i, d_i in T.Parallel(h_per_block, out_width):
+                    if h0 + h_i < num_heads:
+                        output[b_i, s_i, h0 + h_i, r0_start + d_i] = T.Cast(
+                            out_dtype, acc_o_r_0[h_i, d_i]
+                        )
+                        output[b_i, s_i, h0 + h_i, r1_start + d_i] = T.Cast(
+                            out_dtype, acc_o_r_1[h_i, d_i]
+                        )
+            else:
+                T.copy(
+                    acc_o_r_0,
+                    output[b_i, s_i, h0:h1, r0_start : r0_start + out_width],
+                )
+                T.copy(
+                    acc_o_r_1,
+                    output[b_i, s_i, h0:h1, r1_start : r1_start + out_width],
+                )
         else:
-            T.copy(
-                acc_o_r_0,
-                output_partial[
-                    n_split_idx + num_splits[b_i],
-                    s_i,
-                    h0:h1,
-                    r0_start : r0_start + out_width,
-                ],
-            )
-            T.copy(
-                acc_o_r_1,
-                output_partial[
-                    n_split_idx + num_splits[b_i],
-                    s_i,
-                    h0:h1,
-                    r1_start : r1_start + out_width,
-                ],
-            )
+            if guard_invalid_heads:
+                for h_i, d_i in T.Parallel(h_per_block, out_width):
+                    if h0 + h_i < num_heads:
+                        output_partial[
+                            n_split_idx + num_splits[b_i],
+                            s_i,
+                            h0 + h_i,
+                            r0_start + d_i,
+                        ] = acc_o_r_0[h_i, d_i]
+                        output_partial[
+                            n_split_idx + num_splits[b_i],
+                            s_i,
+                            h0 + h_i,
+                            r1_start + d_i,
+                        ] = acc_o_r_1[h_i, d_i]
+            else:
+                T.copy(
+                    acc_o_r_0,
+                    output_partial[
+                        n_split_idx + num_splits[b_i],
+                        s_i,
+                        h0:h1,
+                        r0_start : r0_start + out_width,
+                    ],
+                )
+                T.copy(
+                    acc_o_r_1,
+                    output_partial[
+                        n_split_idx + num_splits[b_i],
+                        s_i,
+                        h0:h1,
+                        r1_start : r1_start + out_width,
+                    ],
+                )
 
     return finalize_right
 

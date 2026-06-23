@@ -36,59 +36,59 @@ struct SageAttenQuantizedASMArgs {
   int32_t num_mp{};
 
   // shape (bshd layout)
-  int32_t batch{};
-  int32_t nr_heads{};
-  int32_t seqlen_q{};
-  int32_t headdim_qk{};
+  int64_t batch{};
+  int64_t nr_heads{};
+  int64_t seqlen_q{};
+  int64_t headdim_qk{};
 
-  int32_t seqlen_kv{};
-  int32_t nr_heads_kv{};
+  int64_t seqlen_kv{};
+  int64_t nr_heads_kv{};
 
-  int32_t headdim_v{};
+  int64_t headdim_v{};
 
   // stride
-  int32_t batch_stride_q{};
-  int32_t head_stride_q{};
-  int32_t seq_stride_q{};
+  int64_t batch_stride_q{};
+  int64_t head_stride_q{};
+  int64_t seq_stride_q{};
 
-  int32_t batch_stride_k{};
-  int32_t head_stride_k{};
-  int32_t seq_stride_k{};
+  int64_t batch_stride_k{};
+  int64_t head_stride_k{};
+  int64_t seq_stride_k{};
 
-  int32_t batch_stride_v{};
-  int32_t head_stride_v{};
-  int32_t seq_stride_v{};
+  int64_t batch_stride_v{};
+  int64_t head_stride_v{};
+  int64_t seq_stride_v{};
 
   // scale strides
-  int32_t batch_stride_q_scale{};
-  int32_t head_stride_q_scale{};
-  int32_t seq_stride_q_scale{};  // For per-block quantization
+  int64_t batch_stride_q_scale{};
+  int64_t head_stride_q_scale{};
+  int64_t seq_stride_q_scale{};  // For per-block quantization
 
-  int32_t batch_stride_k_scale{};
-  int32_t head_stride_k_scale{};
-  int32_t seq_stride_k_scale{};  // For per-block/per-thread quantization
+  int64_t batch_stride_k_scale{};
+  int64_t head_stride_k_scale{};
+  int64_t seq_stride_k_scale{};  // For per-block/per-thread quantization
 
-  int32_t batch_stride_v_scale{};
-  int32_t seq_stride_v_scale{};
-  int32_t head_stride_v_scale{};
+  int64_t batch_stride_v_scale{};
+  int64_t seq_stride_v_scale{};
+  int64_t head_stride_v_scale{};
 
   // output strides
-  int32_t batch_stride_out{};
-  int32_t head_stride_out{};
-  int32_t seq_stride_out{};
+  int64_t batch_stride_out{};
+  int64_t head_stride_out{};
+  int64_t seq_stride_out{};
 
   // for kvcache (paged attention)
-  int32_t num_blocks_stride_k_cache{};
-  int32_t page_block_size_stride_k_cache{};
-  int32_t nheads_k_stride_k_cache{};
-  int32_t batch_stride_block_table{};
-  int32_t page_block_size{};
-  int32_t num_blocks{};
+  int64_t num_blocks_stride_k_cache{};
+  int64_t page_block_size_stride_k_cache{};
+  int64_t nheads_k_stride_k_cache{};
+  int64_t batch_stride_block_table{};
+  int64_t page_block_size{};
+  int64_t num_blocks{};
 
-  int32_t nr_k{};
-  int32_t nr_q_scale{};
-  int32_t nr_k_scale{};
-  int32_t nr_v_scale{};
+  size_t nr_k{};
+  size_t nr_q_scale{};
+  size_t nr_k_scale{};
+  size_t nr_v_scale{};
 
   double softmax_scale{};
 
@@ -98,12 +98,12 @@ struct SageAttenQuantizedASMArgs {
   void* p_v{};
 
   // kvcache pointers
-  void*   p_k_cache{};
-  void*   p_v_cache{};
-  void*   p_page_table{};
-  int32_t nr_page_table{};
-  void*   p_cache_seqlens{};
-  int32_t nr_cache_seqlens{};
+  void*  p_k_cache{};
+  void*  p_v_cache{};
+  void*  p_page_table{};
+  size_t nr_page_table{};
+  void*  p_cache_seqlens{};
+  size_t nr_cache_seqlens{};
 
   // scale pointers
   void* p_q_scale{};
@@ -145,7 +145,7 @@ struct SageAttenQuantizedASMDispatcher {
     Config config;
 
     // Reuse the 128-dim kernel bucket for all supported head dims up to 128.
-    const int headdim_qk = args.headdim_qk <= 128 ? 128 : args.headdim_qk;
+    const int headdim_qk = args.headdim_qk <= 128 ? 128 : static_cast<int32_t>(args.headdim_qk);
 
     if (headdim_qk == 128) {
       config.nr_thr    = 512;
@@ -357,57 +357,57 @@ class SageAttentionQuantizedAsmKernel {
     params.robust_k_scale = mute::make_robust_desc(static_cast<float*>(args.p_k_scale), args.nr_k_scale).reg;
     params.robust_v_scale = mute::make_robust_desc(static_cast<float*>(args.p_v_scale), args.nr_v_scale).reg;
 
-    params.q_scale_batch_stride = args.batch_stride_q_scale;
-    params.q_scale_seq_stride   = args.seq_stride_q_scale;
-    params.q_scale_head_stride  = args.head_stride_q_scale;
-    params.k_scale_batch_stride = args.batch_stride_k_scale;
-    params.k_scale_seq_stride   = args.seq_stride_k_scale;
-    params.k_scale_head_stride  = args.head_stride_k_scale;
-    params.v_scale_batch_stride = args.batch_stride_v_scale;
-    params.v_scale_seq_stride   = args.seq_stride_v_scale;
-    params.v_scale_head_stride  = args.head_stride_v_scale;
+    params.q_scale_batch_stride = static_cast<int32_t>(args.batch_stride_q_scale);
+    params.q_scale_seq_stride   = static_cast<int32_t>(args.seq_stride_q_scale);
+    params.q_scale_head_stride  = static_cast<int32_t>(args.head_stride_q_scale);
+    params.k_scale_batch_stride = static_cast<int32_t>(args.batch_stride_k_scale);
+    params.k_scale_seq_stride   = static_cast<int32_t>(args.seq_stride_k_scale);
+    params.k_scale_head_stride  = static_cast<int32_t>(args.head_stride_k_scale);
+    params.v_scale_batch_stride = static_cast<int32_t>(args.batch_stride_v_scale);
+    params.v_scale_seq_stride   = static_cast<int32_t>(args.seq_stride_v_scale);
+    params.v_scale_head_stride  = static_cast<int32_t>(args.head_stride_v_scale);
 
     const double log2e = std::log2(std::exp(1.0));
     params.scale       = args.softmax_scale;
     params.rln2_scale  = args.softmax_scale * log2e;
     params.nr_ln2      = 1.0 / log2e;
 
-    params.batch     = args.batch;
-    params.nheads    = args.nr_heads;
-    params.kv_heads  = args.nr_heads_kv;
-    params.seqlen_q  = args.seqlen_q;
-    params.seqlen_kv = args.seqlen_kv;
-    params.headdim_v = args.headdim_v;
+    params.batch     = static_cast<int32_t>(args.batch);
+    params.nheads    = static_cast<int32_t>(args.nr_heads);
+    params.kv_heads  = static_cast<int32_t>(args.nr_heads_kv);
+    params.seqlen_q  = static_cast<int32_t>(args.seqlen_q);
+    params.seqlen_kv = static_cast<int32_t>(args.seqlen_kv);
+    params.headdim_v = static_cast<int32_t>(args.headdim_v);
 
-    int  head_group       = args.nr_heads / args.nr_heads_kv;
+    int  head_group       = static_cast<int32_t>(args.nr_heads / args.nr_heads_kv);
     auto fast_head_group  = mutlass::FastDivmod(head_group);
     params.head_group_ori = fast_head_group.divisor;
     params.head_group_mul = fast_head_group.multiplier;
     params.head_group_sft = fast_head_group.shift_right;
 
+    params.batch_stride_k = static_cast<int32_t>(args.batch_stride_k);
+    params.head_stride_k  = static_cast<int32_t>(args.head_stride_k);
+    params.seq_stride_k   = static_cast<int32_t>(args.seq_stride_k);
+
     const int qk_element_size =
         args.is_qk_int8 ? static_cast<int>(sizeof(int8_t)) : static_cast<int>(sizeof(mutlass::float_e4m3_t));
-    params.ldg_key_stride = args.seq_stride_k * config.tile_n * qk_element_size;
-
-    params.batch_stride_k = args.batch_stride_k;
-    params.head_stride_k  = args.head_stride_k;
-    params.seq_stride_k   = args.seq_stride_k;
+    params.ldg_key_stride = params.seq_stride_k * config.tile_n * qk_element_size;
 
     params.batch_stride_mask = 0;
     params.head_stride_mask  = 0;
     params.seq_stride_mask   = 0;
 
-    params.batch_stride_out = args.batch_stride_out;
-    params.head_stride_out  = args.head_stride_out;
-    params.seq_stride_out   = args.seq_stride_out;
+    params.batch_stride_out = static_cast<int32_t>(args.batch_stride_out);
+    params.head_stride_out  = static_cast<int32_t>(args.head_stride_out);
+    params.seq_stride_out   = static_cast<int32_t>(args.seq_stride_out);
 
     params.tile_size_q         = config.tile_m * config.tile_k * qk_element_size;
     params.tile_size_k         = config.tile_n * config.tile_k * qk_element_size;
     params.tile_size_v         = config.tile_hdim * config.tile_k * sizeof(mutlass::float_e4m3_t);
     params.tile_size_key_scale = (args.quant_mode == 6 ? config.tile_n / 16 : config.tile_n) * sizeof(float);
 
-    int seq_q_tile_num = mutlass::ceil_div(args.seqlen_q, config.tile_m);
-    params.tile_num    = seq_q_tile_num * args.batch * args.nr_heads;
+    int seq_q_tile_num = mutlass::ceil_div(params.seqlen_q, config.tile_m);
+    params.tile_num    = seq_q_tile_num * params.batch * params.nheads;
 
     // Match the non-persistent dense flash-attention wrapper in ComputeAsmKern.
     int block_num                = 1;
@@ -418,7 +418,7 @@ class SageAttentionQuantizedAsmKernel {
     params.double_block_num_mul  = fast_double_block_num.multiplier;
     params.double_block_num_sft  = fast_double_block_num.shift_right;
 
-    auto fast_seqq_mul_heads  = mutlass::FastDivmod(args.nr_heads * seq_q_tile_num);
+    auto fast_seqq_mul_heads  = mutlass::FastDivmod(params.nheads * seq_q_tile_num);
     params.seqq_mul_heads_div = fast_seqq_mul_heads.divisor;
     params.seqq_mul_heads_mul = fast_seqq_mul_heads.multiplier;
     params.seqq_mul_heads_sft = fast_seqq_mul_heads.shift_right;
@@ -443,7 +443,7 @@ class SageAttentionQuantizedAsmKernel {
     params.tile_v_dim2 = 1;
     params.tile_v_dim3 = 1;
 
-    params.tile_out_dim0 = args.headdim_v;
+    params.tile_out_dim0 = static_cast<int32_t>(args.headdim_v);
     params.tile_out_dim1 = 4;
     params.tile_out_dim2 = 1;
     params.tile_out_dim3 = 1;
@@ -727,34 +727,34 @@ class SageAttentionQuantizedWithKVCacheAsmKernel {
     params.robust_k_scale = mute::make_robust_desc(static_cast<float*>(args.p_k_scale), args.nr_k_scale).reg;
     params.robust_v_scale = mute::make_robust_desc(static_cast<float*>(args.p_v_scale), args.nr_v_scale).reg;
 
-    params.q_scale_batch_stride = args.batch_stride_q_scale;
-    params.q_scale_seq_stride   = args.seq_stride_q_scale;
-    params.q_scale_head_stride  = args.head_stride_q_scale;
-    params.k_scale_block_stride = args.batch_stride_k_scale;
-    params.k_scale_page_stride  = args.seq_stride_k_scale;
-    params.k_scale_head_stride  = args.head_stride_k_scale;
-    params.v_scale_batch_stride = args.batch_stride_v_scale;
-    params.v_scale_head_stride  = args.head_stride_v_scale;
+    params.q_scale_batch_stride = static_cast<int32_t>(args.batch_stride_q_scale);
+    params.q_scale_seq_stride   = static_cast<int32_t>(args.seq_stride_q_scale);
+    params.q_scale_head_stride  = static_cast<int32_t>(args.head_stride_q_scale);
+    params.k_scale_block_stride = static_cast<int32_t>(args.batch_stride_k_scale);
+    params.k_scale_page_stride  = static_cast<int32_t>(args.seq_stride_k_scale);
+    params.k_scale_head_stride  = static_cast<int32_t>(args.head_stride_k_scale);
+    params.v_scale_batch_stride = static_cast<int32_t>(args.batch_stride_v_scale);
+    params.v_scale_head_stride  = static_cast<int32_t>(args.head_stride_v_scale);
 
-    params.batch_stride_block_table = args.batch_stride_block_table;
+    params.batch_stride_block_table = static_cast<int32_t>(args.batch_stride_block_table);
 
-    params.num_blocks_stride_k_cache      = args.num_blocks_stride_k_cache;
-    params.page_block_size_stride_k_cache = args.page_block_size_stride_k_cache;
-    params.nheads_k_stride_k_cache        = args.nheads_k_stride_k_cache;
+    params.num_blocks_stride_k_cache      = static_cast<int32_t>(args.num_blocks_stride_k_cache);
+    params.page_block_size_stride_k_cache = static_cast<int32_t>(args.page_block_size_stride_k_cache);
+    params.nheads_k_stride_k_cache        = static_cast<int32_t>(args.nheads_k_stride_k_cache);
 
     const double log2e = std::log2(std::exp(1.0));
     params.scale       = args.softmax_scale;
     params.rln2_scale  = args.softmax_scale * log2e;
     params.nr_ln2      = 1.0 / log2e;
 
-    params.batch     = args.batch;
-    params.nheads    = args.nr_heads;
-    params.kv_heads  = args.nr_heads_kv;
-    params.seqlen_q  = args.seqlen_q;
-    params.seqlen_kv = args.seqlen_kv;
-    params.headdim_v = args.headdim_v;
+    params.batch     = static_cast<int32_t>(args.batch);
+    params.nheads    = static_cast<int32_t>(args.nr_heads);
+    params.kv_heads  = static_cast<int32_t>(args.nr_heads_kv);
+    params.seqlen_q  = static_cast<int32_t>(args.seqlen_q);
+    params.seqlen_kv = static_cast<int32_t>(args.seqlen_kv);
+    params.headdim_v = static_cast<int32_t>(args.headdim_v);
 
-    int  head_group       = args.nr_heads / args.nr_heads_kv;
+    int  head_group       = static_cast<int32_t>(args.nr_heads / args.nr_heads_kv);
     auto fast_head_group  = mutlass::FastDivmod(head_group);
     params.head_group_ori = fast_head_group.divisor;
     params.head_group_mul = fast_head_group.multiplier;
@@ -764,17 +764,17 @@ class SageAttentionQuantizedWithKVCacheAsmKernel {
     params.head_stride_mask  = 0;
     params.seq_stride_mask   = 0;
 
-    params.batch_stride_out = args.batch_stride_out;
-    params.head_stride_out  = args.head_stride_out;
-    params.seq_stride_out   = args.seq_stride_out;
+    params.batch_stride_out = static_cast<int32_t>(args.batch_stride_out);
+    params.head_stride_out  = static_cast<int32_t>(args.head_stride_out);
+    params.seq_stride_out   = static_cast<int32_t>(args.seq_stride_out);
 
     params.tile_size_q         = config.tile_m * config.tile_k * sizeof(mutlass::float_e4m3_t);
     params.tile_size_k         = config.tile_n * config.tile_k * sizeof(mutlass::float_e4m3_t);
     params.tile_size_v         = config.tile_hdim * config.tile_k * sizeof(mutlass::float_e4m3_t);
     params.tile_size_key_scale = (args.quant_mode == 6 ? config.tile_n / 16 : config.tile_n) * sizeof(float);
 
-    int seq_q_tile_num = mutlass::ceil_div(args.seqlen_q, config.tile_m);
-    params.tile_num    = seq_q_tile_num * args.batch * args.nr_heads;
+    int seq_q_tile_num = mutlass::ceil_div(params.seqlen_q, config.tile_m);
+    params.tile_num    = seq_q_tile_num * params.batch * params.nheads;
 
     // Match the non-persistent dense flash-attention wrapper in ComputeAsmKern.
     int block_num                = 1;
@@ -785,7 +785,7 @@ class SageAttentionQuantizedWithKVCacheAsmKernel {
     params.double_block_num_mul  = fast_double_block_num.multiplier;
     params.double_block_num_sft  = fast_double_block_num.shift_right;
 
-    auto fast_seqq_mul_heads  = mutlass::FastDivmod(args.nr_heads * seq_q_tile_num);
+    auto fast_seqq_mul_heads  = mutlass::FastDivmod(params.nheads * seq_q_tile_num);
     params.seqq_mul_heads_div = fast_seqq_mul_heads.divisor;
     params.seqq_mul_heads_mul = fast_seqq_mul_heads.multiplier;
     params.seqq_mul_heads_sft = fast_seqq_mul_heads.shift_right;
@@ -810,7 +810,7 @@ class SageAttentionQuantizedWithKVCacheAsmKernel {
     params.tile_v_dim2 = config.tile_k;
     params.tile_v_dim3 = 1;
 
-    params.tile_out_dim0 = args.headdim_v;
+    params.tile_out_dim0 = static_cast<int32_t>(args.headdim_v);
     params.tile_out_dim1 = 1;
     params.tile_out_dim2 = 4;
     params.tile_out_dim3 = 1;
@@ -920,7 +920,7 @@ void sage_attn_quantized_asm(ffi::TensorView                out,
   args.is_kv_cache   = false;
   args.is_qk_int8    = qk_int8_path;
   args.fp8_output    = fp8_output;
-  args.quant_mode    = quant_mode;
+  args.quant_mode    = static_cast<int32_t>(quant_mode);
   args.q_data_type   = q_dtype;
   args.k_data_type   = k_dtype;
   args.v_data_type   = v_dtype;
@@ -945,11 +945,11 @@ void sage_attn_quantized_asm(ffi::TensorView                out,
   TVM_FFI_ICHECK_GT(args.headdim_v, 0) << "headdim_v must be positive";
   TVM_FFI_ICHECK_LE(args.headdim_v, 128) << "headdim_v must be <= 128";
 
-  int q_seq_scale_num = mutlass::ceil_div(args.seqlen_q, 128);
-  int k_seq_scale_num = mutlass::ceil_div(args.seqlen_kv, 128);
-  int v_seq_scale_num = 1;
+  int64_t q_seq_scale_num = mutlass::ceil_div(args.seqlen_q, int64_t{128});
+  int64_t k_seq_scale_num = mutlass::ceil_div(args.seqlen_kv, int64_t{128});
+  int64_t v_seq_scale_num = 1;
   if (quant_mode == 6) {
-    k_seq_scale_num = mutlass::ceil_div(args.seqlen_kv, 128) * 128 / 16;
+    k_seq_scale_num = mutlass::ceil_div(args.seqlen_kv, int64_t{128}) * int64_t{128} / 16;
   } else if (quant_mode == 1) {
     q_seq_scale_num = args.seqlen_q;
     k_seq_scale_num = args.seqlen_kv;
@@ -958,7 +958,7 @@ void sage_attn_quantized_asm(ffi::TensorView                out,
     q_seq_scale_num = 1;
     k_seq_scale_num = 1;
   } else if (quant_mode == 7) {
-    v_seq_scale_num = mutlass::ceil_div(args.seqlen_kv, 128);
+    v_seq_scale_num = mutlass::ceil_div(args.seqlen_kv, int64_t{128});
   } else if (quant_mode != 2) {
     TVM_FFI_ICHECK(false) << "Unsupported dense SageAttention quant_mode: " << quant_mode;
   }
@@ -1009,10 +1009,10 @@ void sage_attn_quantized_asm(ffi::TensorView                out,
   args.seq_stride_out       = out.stride(1);
   args.head_stride_out      = out.stride(2);
 
-  args.nr_k          = static_cast<int32_t>(k.numel());
-  args.nr_q_scale    = static_cast<int32_t>(q_scale.numel());
-  args.nr_k_scale    = static_cast<int32_t>(k_scale.numel());
-  args.nr_v_scale    = static_cast<int32_t>(v_scale.numel());
+  args.nr_k          = k.numel();
+  args.nr_q_scale    = q_scale.numel();
+  args.nr_k_scale    = k_scale.numel();
+  args.nr_v_scale    = v_scale.numel();
   args.softmax_scale = softmax_scale;
 
   args.p_q            = q.data_ptr();
@@ -1084,7 +1084,7 @@ void sage_attn_quantized_with_kvcache_asm(ffi::TensorView                out,
   args.is_kv_cache   = true;
   args.is_qk_int8    = false;
   args.fp8_output    = fp8_output;
-  args.quant_mode    = quant_mode;
+  args.quant_mode    = static_cast<int32_t>(quant_mode);
   args.q_data_type   = q.dtype();
   args.k_data_type   = k_cache.dtype();
   args.v_data_type   = v_cache.dtype();
@@ -1123,10 +1123,10 @@ void sage_attn_quantized_with_kvcache_asm(ffi::TensorView                out,
   TVM_FFI_ICHECK_LE(args.headdim_v, 128) << "headdim_v must be <= 128";
   TVM_FFI_ICHECK(args.page_block_size == 128 || args.page_block_size == 64) << "page_block_size must be 64 or 128";
 
-  int q_seq_scale_num    = mutlass::ceil_div(args.seqlen_q, 128);
-  int k_scale_per_block  = mutlass::ceil_div(args.page_block_size, 128);
-  int k_scale_per_thread = mutlass::ceil_div(args.page_block_size, 16);
-  int k_seq_scale_num    = args.num_blocks * k_scale_per_block;
+  int64_t q_seq_scale_num    = mutlass::ceil_div(args.seqlen_q, int64_t{128});
+  int64_t k_scale_per_block  = mutlass::ceil_div(args.page_block_size, int64_t{128});
+  int64_t k_scale_per_thread = mutlass::ceil_div(args.page_block_size, int64_t{16});
+  int64_t k_seq_scale_num    = args.num_blocks * k_scale_per_block;
   if (quant_mode == 6) {
     k_seq_scale_num = args.num_blocks * k_scale_per_thread;
   } else if (quant_mode == 1) {
@@ -1183,10 +1183,10 @@ void sage_attn_quantized_with_kvcache_asm(ffi::TensorView                out,
   args.seq_stride_v_scale             = v_scale.size(1) == 1 ? 0 : v_scale.stride(1);
   args.head_stride_v_scale            = v_scale.size(2) == 1 ? 0 : v_scale.stride(2);
 
-  args.nr_k          = static_cast<int32_t>(k_cache.numel());
-  args.nr_q_scale    = static_cast<int32_t>(q_scale.numel());
-  args.nr_k_scale    = static_cast<int32_t>(k_scale.numel());
-  args.nr_v_scale    = static_cast<int32_t>(v_scale.numel());
+  args.nr_k          = k_cache.numel();
+  args.nr_q_scale    = q_scale.numel();
+  args.nr_k_scale    = k_scale.numel();
+  args.nr_v_scale    = v_scale.numel();
   args.softmax_scale = softmax_scale;
 
   args.p_q              = q.data_ptr();
@@ -1194,8 +1194,8 @@ void sage_attn_quantized_with_kvcache_asm(ffi::TensorView                out,
   args.p_v_cache        = v_cache.data_ptr();
   args.p_page_table     = page_table.data_ptr();
   args.p_cache_seqlens  = cache_seqlens.data_ptr();
-  args.nr_page_table    = static_cast<int32_t>(page_table.numel());
-  args.nr_cache_seqlens = static_cast<int32_t>(cache_seqlens.numel());
+  args.nr_page_table    = page_table.numel();
+  args.nr_cache_seqlens = cache_seqlens.numel();
   args.p_q_scale        = q_scale.data_ptr();
   args.p_k_scale        = k_scale.data_ptr();
   args.p_v_scale        = v_scale.data_ptr();

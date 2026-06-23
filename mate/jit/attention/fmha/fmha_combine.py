@@ -23,6 +23,8 @@ def _fmha_fwd_combine_encode(config: Mapping[str, object]) -> str:
         name_list.append("f16")
     elif config["element"] == "mutlass::bfloat16_t":
         name_list.append("bf16")
+    elif config["element"] == "float":
+        name_list.append("f32")
     else:
         raise ValueError(f"Unsupported element type: {config['element']}")
 
@@ -33,6 +35,8 @@ def _fmha_fwd_combine_encode(config: Mapping[str, object]) -> str:
     elif config["has_seqused_q"]:
         mode = "padded_q"
         name_list.append(mode)
+    if config["has_metadata"]:
+        name_list.append("metadata")
     return "_".join(name_list)
 
 
@@ -66,8 +70,10 @@ def _get_fwd_combine_kernel_config(tile_n: int, num_split: int):
         max_splits = 64
     elif num_split <= 128:
         max_splits = 128
+    elif num_split <= 256:
+        max_splits = 256
     else:
-        raise ValueError("num_split exceeds max supported splits 128")
+        raise ValueError("num_split exceeds max supported splits 256")
 
     return tile_m, max_splits
 
@@ -113,6 +119,10 @@ specs.append(
 )
 specs_select = [
     ParamSpec(
+        name="has_metadata",
+        domain=[False, True],
+    ),
+    ParamSpec(
         name="tile_n",
         domain=[64],
     ),
@@ -122,7 +132,7 @@ specs_select = [
     ),
     ParamSpec(
         name="max_splits",
-        domain=[16, 32, 64, 128],
+        domain=[16, 32, 64, 128, 256],
     ),
 ]
 specs.extend(mode_q)
@@ -173,27 +183,23 @@ def _fmha_fwd_combine(
     # Exit in dry run because combine is AOT.
     raise_complete_if_dry_run()
 
-    if metadata is None:
+    if metadata is None and num_split <= 1:
         return
 
-    if cu_seqlens_q is None:
-        batch_size = out_accum.shape[0]
-    else:
-        assert max_seqlen_q is not None
-        batch_size = cu_seqlens_q.shape[0] - 1
+    if metadata is not None:
+        if cu_seqlens_q is None:
+            batch_size = out_accum.shape[0]
+        else:
+            assert max_seqlen_q is not None
+            batch_size = cu_seqlens_q.shape[0] - 1
 
-    assert metadata.shape[0] >= batch_size * 4, "metadata buffer is too small"
-    (
-        num_splits_dynamic,
-        batch_table,
-        num_m_blocks,
-        num_nheads_in_l2,
-    ) = (metadata[batch_size * i : batch_size * (i + 1)] for i in range(4))
+        assert metadata.shape[0] >= batch_size * 4, "metadata buffer is too small"
 
     tile_m, max_splits = _get_fwd_combine_kernel_config(tile_n, num_split=num_split)
     constexpr_dict = {
         "has_cu_seqlens_q": cu_seqlens_q is not None,
         "has_seqused_q": seqused_q is not None,
+        "has_metadata": metadata is not None,
         "element": dtype_torch2mutlass_map[out.dtype],
         "tile_m": tile_m,
         "tile_n": tile_n,
@@ -210,7 +216,102 @@ def _fmha_fwd_combine(
         lse,
         out_accum,
         lse_accum,
-        num_splits_dynamic,
-        batch_table,
+        metadata,
         num_split,
     )
+
+
+def _flash_attn_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    raise_complete_if_dry_run()
+
+    if out_partial.dim() != 5:
+        raise ValueError("out_partial must be a 5D tensor")
+    if lse_partial.dim() != 4:
+        raise ValueError("lse_partial must be a 4D tensor")
+    if out_partial.dtype != torch.float32:
+        raise ValueError("out_partial must be float32")
+    if lse_partial.dtype != torch.float32:
+        raise ValueError("lse_partial must be float32")
+    if out_partial.device != lse_partial.device:
+        raise ValueError("out_partial and lse_partial must be on the same device")
+    if out_partial.stride(-1) != 1:
+        raise ValueError("out_partial must have contiguous last dimension")
+    if lse_partial.stride(-2) != 1:
+        raise ValueError("lse_partial must be contiguous in the seqlen dimension")
+
+    num_splits, batch_size, seqlen_q, num_head, headdim_v = out_partial.shape
+    if num_splits <= 0:
+        raise ValueError("out_partial must have at least one split")
+    if lse_partial.shape != (num_splits, batch_size, seqlen_q, num_head):
+        raise ValueError("lse_partial has unexpected shape")
+
+    out_dtype = out_dtype or out_partial.dtype
+    if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("out_dtype must be float32, float16, or bfloat16")
+
+    if out is None:
+        out = torch.empty(
+            (batch_size, seqlen_q, num_head, headdim_v),
+            device=out_partial.device,
+            dtype=out_dtype,
+        )
+    else:
+        if out.shape != (batch_size, seqlen_q, num_head, headdim_v):
+            raise ValueError("out has unexpected shape")
+        if out.dtype != out_dtype:
+            raise ValueError("out dtype must match out_dtype")
+        if out.device != out_partial.device:
+            raise ValueError("out must be on the same device as out_partial")
+        if out.stride(-1) != 1:
+            raise ValueError("out must have contiguous last dimension")
+
+    lse_storage = torch.empty(
+        (batch_size, num_head, seqlen_q),
+        device=out_partial.device,
+        dtype=torch.float32,
+    )
+    lse = lse_storage.transpose(1, 2)
+
+    if num_splits == 1:
+        out.copy_(out_partial[0].to(dtype=out.dtype))
+        lse.copy_(lse_partial[0])
+        return out, lse
+    if batch_size == 0 or seqlen_q == 0:
+        return out, lse
+
+    out_partial_for_kernel = out_partial.transpose(2, 3)
+    lse_partial_for_kernel = lse_partial.transpose(2, 3)
+    out_for_kernel = out
+    padded_headdim_v = ((headdim_v + 3) // 4) * 4
+    if padded_headdim_v != headdim_v:
+        padded_out_partial = torch.empty(
+            (num_splits, batch_size, num_head, seqlen_q, padded_headdim_v),
+            device=out_partial.device,
+            dtype=out_partial.dtype,
+        )
+        padded_out_partial[..., :headdim_v].copy_(out_partial_for_kernel)
+        padded_out_partial[..., headdim_v:].zero_()
+        out_partial_for_kernel = padded_out_partial
+        out_for_kernel = torch.empty(
+            (batch_size, seqlen_q, num_head, padded_headdim_v),
+            device=out_partial.device,
+            dtype=out.dtype,
+        )
+
+    _fmha_fwd_combine(
+        out_for_kernel,
+        lse,
+        out_partial_for_kernel,
+        lse_partial_for_kernel,
+        64,
+        num_split=num_splits,
+        metadata=None,
+    )
+    if out_for_kernel is not out:
+        out.copy_(out_for_kernel[..., :headdim_v])
+    return out, lse

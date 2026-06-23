@@ -382,21 +382,26 @@ struct Rotary {
       TensortRrR const &tRrSin,  // (TileN, HeadDim/2) split according to GmemThrCopyRotary
       TensorKPtr const &tPrKPtr,
       int const         n_block,
+      int const         max_k,
       DescK const       desc_K) {
     TiledCopyQK tiled_copy_k;
     auto        gmem_thr_copy_q = tiled_copy_k.get_thread_slice(thread_idx);
-    Tensor      tKsK            = gmem_thr_copy_q.partition_S(sK);
-    Tensor      tKgK            = gmem_thr_copy_q.partition_S(gK);
-    Tensor      tKcK = gmem_thr_copy_q.partition_S(mute::make_identity_tensor(Shape<Int<TileMN>, Int<HeadDim>>{}));
+    // Tensor      sK_copy         = mute::tiled_divide(sK, Shape<_1, Int<GmemElemsPerLoad>>{});
+    // Tensor      gK_copy         = mute::tiled_divide(gK, Shape<_1, Int<GmemElemsPerLoad>>{});
+    Tensor tKsK = gmem_thr_copy_q.partition_S(sK);
+    Tensor tKgK = gmem_thr_copy_q.partition_S(gK);
+    Tensor tKcK = gmem_thr_copy_q.partition_S(mute::make_identity_tensor(Shape<Int<TileMN>, Int<HeadDim>>{}));
 
-    MUTE_STATIC_ASSERT_V(rank(tKsK) == _3{});
+    MUTE_STATIC_ASSERT_V(rank(tKcK) == _3{});
     MUTE_STATIC_ASSERT_V(rank(tRrCos) == _3{});
     MUTE_STATIC_ASSERT_V(rank(tRrSin) == _3{});
-    MUTE_STATIC_ASSERT_V(size<1>(tKsK) == size<1>(tRrCos));
-    MUTE_STATIC_ASSERT_V(size<2>(tKsK) == size<2>(tRrCos));
-    MUTE_STATIC_ASSERT_V(size<1>(tKsK) == size<1>(tRrSin));
-    MUTE_STATIC_ASSERT_V(size<2>(tKsK) == size<2>(tRrSin));
+    MUTE_STATIC_ASSERT_V(size<1>(tKcK) == size<1>(tRrCos));
+    MUTE_STATIC_ASSERT_V(size<2>(tKcK) == size<2>(tRrCos));
+    MUTE_STATIC_ASSERT_V(size<1>(tKcK) == size<1>(tRrSin));
+    MUTE_STATIC_ASSERT_V(size<2>(tKcK) == size<2>(tRrSin));
     MUTE_STATIC_ASSERT_V(size<0>(tRrCos) == size<0>(tRrSin));
+    // static_assert(decltype(size<1>(sK_copy))::value == TileMN);
+    // static_assert(decltype(size<0>(sK_copy))::value == decltype(size<0>(tRrCos))::value * 2);
     static_assert(decltype(size<0>(tKsK))::value == decltype(size<0>(tRrCos))::value * 2);
     static_assert(decltype(size<0>(tRrCos))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
     if constexpr (PagedKVNonTMA) {
@@ -425,14 +430,20 @@ struct Rotary {
         Tensor rK   = make_fragment_like(tKsK(_, m, k));
         bool   pred = should_write && tKpK(k);
         mute::copy(tiled_copy_k, tKsK(_, m, k), rK);
+        // int const col_idx = get<1>(tKcK(_0{}, _0{}, k)) / GmemElemsPerLoad;
+        // Tensor    rK      = make_fragment_like(sK_copy(_, row, col_idx));
+        // bool      pred    = should_write && get<1>(tKcK(_0{}, _0{}, k)) < max_k;
+        // mute::copy(tiled_copy_k, sK_copy(_, row, col_idx), rK);
         if (tRpR(k)) {
           apply_rotary_interleaved<Fragment>(rK, tRrCos(_, m, k), tRrSin(_, m, k));
         }
         if constexpr (!PagedKVNonTMA) {
           mute::copy(gmem_tiled_copy_r2g.with(desc_K).with(pred), rK, tKgK(_, m, k));
+          // mute::copy(gmem_tiled_copy_r2g.with(desc_K).with(pred), rK, gK_copy(_, row, col_idx));
         } else {
           int const ki = get<1>(tKcK(_0{}, _0{}, k)) / GmemElemsPerLoad;
           mute::copy(gmem_tiled_copy_r2g.with(desc_K).with(pred), rK, mK_cur_copy(_, ki));
+          // mute::copy(gmem_tiled_copy_r2g.with(desc_K).with(pred), rK, mK_cur_copy(_, col_idx));
         }
       }
     }

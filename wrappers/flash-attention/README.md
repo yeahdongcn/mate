@@ -1,25 +1,33 @@
-# flash-attention
+# FlashAttention-3 Compatibility Wrapper (flash_attn_3)
 
-`flash_attn_3` is a compatibility wrapper package that follows the official FlashAttention-3 packaging layout on top of MATE attention operators on MUSA.
+`flash_attn_3` is a compatibility wrapper package that preserves the official
+FlashAttention-3 package surface while running on MUSA through MATE attention
+operators.
 
 ## Overview
 
-This wrapper is intended for projects that already target FlashAttention-3 style Python APIs and want to run on MUSA through MATE with smaller integration changes. The current compatibility target is the `flash_attn_3` interface surface.
+This wrapper is designed for projects that already target FlashAttention-3
+style Python APIs. It helps run existing integrations on MUSA through MATE
+with minimal code changes. The current compatibility target is the
+`flash_attn_3` interface surface.
+
+## Package and import
 
 - Package name: `flash_attn_3`
 - Public import path: `flash_attn_interface`
 - Internal package path: `flash_attn_3`
 - Runtime backend: MATE attention operators on MUSA
 
-For the current compatibility scope and known limitations, see [../../docs/flash_attention.md](../../docs/flash_attention.md).
+For the current compatibility scope and known limitations, see
+`docs/source/wrappers/flash_attention_forward_compatibility.md`.
 
 ## Requirements
 
-Before using this wrapper, make sure the following are already available:
+Before using this wrapper, make sure the following are available:
 
-- MATE is installed and importable
-- TorchMUSA and the MUSA runtime environment are available
-- The target workload is expected to run on MUSA devices
+- MATE is installed and importable.
+- TorchMUSA is installed and the MUSA runtime environment is configured.
+- The target workload is configured to run on MUSA devices.
 
 ## Build
 
@@ -166,5 +174,6 @@ pytest tests/test_flash_attn.py tests/test_interface_unit.py
 
 - This wrapper follows the FlashAttention-3 style Python package layout, and the current compatibility target is `flash_attn_3`
 - The `flash_attn` top-level package is intentionally not shipped, so Transformers FA2 / FA4 package checks keep failing
-- Actual feature coverage is documented in [../../docs/flash_attention.md](../../docs/flash_attention.md)
+- Actual feature coverage is documented in
+  `docs/source/wrappers/flash_attention_forward_compatibility.md`
 - For the authoritative operator behavior, refer to the corresponding MATE APIs under `mate.mha_interface`

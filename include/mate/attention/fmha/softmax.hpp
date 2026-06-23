@@ -7,7 +7,7 @@
 
 namespace mate::attention::fmha {
 
-template <int Rows, bool HasLearnableSink>
+template <int Rows, bool HasLearnableSink, int MaxOffset = 0>
 struct Softmax {
   using Element = float;
   using TensorT = decltype(make_tensor<Element>(Shape<Int<Rows>>{}));
@@ -90,10 +90,10 @@ struct Softmax {
       Element scale_max = row_max(i) * sm_scale_log2;
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
-        acc_qk_mn(i, j + 0) = acc_qk_mn(i, j + 0) * sm_scale_log2 - scale_max;
-        acc_qk_mn(i, j + 1) = acc_qk_mn(i, j + 1) * sm_scale_log2 - scale_max;
-        acc_qk_mn(i, j + 2) = acc_qk_mn(i, j + 2) * sm_scale_log2 - scale_max;
-        acc_qk_mn(i, j + 3) = acc_qk_mn(i, j + 3) * sm_scale_log2 - scale_max;
+        acc_qk_mn(i, j + 0) = acc_qk_mn(i, j + 0) * sm_scale_log2 - scale_max + MaxOffset;
+        acc_qk_mn(i, j + 1) = acc_qk_mn(i, j + 1) * sm_scale_log2 - scale_max + MaxOffset;
+        acc_qk_mn(i, j + 2) = acc_qk_mn(i, j + 2) * sm_scale_log2 - scale_max + MaxOffset;
+        acc_qk_mn(i, j + 3) = acc_qk_mn(i, j + 3) * sm_scale_log2 - scale_max + MaxOffset;
 
         float4 v4f32_src =
             make_float4(acc_qk_mn(i, j + 0), acc_qk_mn(i, j + 1), acc_qk_mn(i, j + 2), acc_qk_mn(i, j + 3));
@@ -125,7 +125,8 @@ struct Softmax {
       }
       float2 v2_row_sum_cur;
       mute::add(v2_row_sum_cur, make_float2(row_sum_cur.x, row_sum_cur.y), make_float2(row_sum_cur.z, row_sum_cur.w));
-      row_sum(i) = IsFirst ? (v2_row_sum_cur.x + v2_row_sum_cur.y) : (row_sum(i) + v2_row_sum_cur.x + v2_row_sum_cur.y);
+      Element row_sum_block = v2_row_sum_cur.x + v2_row_sum_cur.y;
+      row_sum(i)            = IsFirst ? row_sum_block : (row_sum(i) + row_sum_block);
     }
 
     return correction_scales;
@@ -148,7 +149,10 @@ struct Softmax {
   }
 
   template <class AccPV, class TiledMmaPV, class SinkVal>
-  MUTLASS_DEVICE auto tail(AccPV& acc_pv, TiledMmaPV const& tiled_mma_pv, SinkVal const& sink_vals) {
+  MUTLASS_DEVICE auto tail(AccPV&            acc_pv,
+                           TiledMmaPV const& tiled_mma_pv,
+                           SinkVal const&    sink_vals,
+                           float             final_scale = 1.f) {
     static_assert(size(SinkVal{}) == Rows);
 
     Tensor acc_pv_mn = make_tensor(acc_pv.data(), layout_acc_mn(tiled_mma_pv, acc_pv.layout()));
@@ -178,20 +182,25 @@ struct Softmax {
       Element sum = row_sum(i);
 
       if constexpr (HasLearnableSink) {
-        sum += exp2f(sink_vals(i) * M_LOG2Ef32 - row_max(i) * sm_scale_log2);
+        sum += exp2f(sink_vals(i) * M_LOG2Ef32 - row_max(i) * sm_scale_log2 + MaxOffset);
       }
 
-      Element inv_sum = (sum == 0.f || sum != sum) ? 0.f : __frcp_rn(sum);
+      Element inv_sum      = (sum == 0.f || sum != sum) ? 0.f : __frcp_rn(sum);
+      Element output_scale = inv_sum * final_scale;
 
-      lse(i) =
-          (sum == 0.f || sum != sum) ? -std::numeric_limits<float>::infinity() : row_max(i) * sm_scale + __logf(sum);
+      Element sum_lse = sum;
+      if constexpr (MaxOffset > 0) {
+        sum_lse *= 1.f / float(1 << MaxOffset);
+      }
+      lse(i) = (sum == 0.f || sum != sum) ? -std::numeric_limits<float>::infinity()
+                                          : row_max(i) * sm_scale + __logf(sum_lse);
 
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<1>(acc_pv_mn); j += 4) {
-        acc_pv_mn(i, j + 0) *= inv_sum;
-        acc_pv_mn(i, j + 1) *= inv_sum;
-        acc_pv_mn(i, j + 2) *= inv_sum;
-        acc_pv_mn(i, j + 3) *= inv_sum;
+        acc_pv_mn(i, j + 0) *= output_scale;
+        acc_pv_mn(i, j + 1) *= output_scale;
+        acc_pv_mn(i, j + 2) *= output_scale;
+        acc_pv_mn(i, j + 3) *= output_scale;
       }
     }
     return lse;

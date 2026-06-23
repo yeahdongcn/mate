@@ -1,6 +1,18 @@
-# GDN Support Matrix
+# MATE Gated Delta Network (GDN) Support Matrix
 
-This page summarizes the current GDN support surface in MATE.
+This document provides a comprehensive overview of the Gated Delta Network
+(GDN) features, data types, and execution backends currently supported in
+MATE. Use this matrix to verify configuration compatibility for production
+deployment and optimization.
+
+## Overview
+
+MATE provides optimized kernels for Gated Delta Networks (GDN). MATE splits
+GDN execution into two primary phases:
+
+- Prefill: high-throughput processing of prompt contexts.
+- Decode: low-latency generation, including standard single-token streaming
+  and multi-token prediction (MTP).
 
 ## Decode
 

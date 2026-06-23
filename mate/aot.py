@@ -7,9 +7,12 @@ import tvm_ffi.cpp  # noqa: F401
 
 from mate.jit import build_jit_specs, copy_built_kernels, env as jit_env
 from mate.jit.attention.fmha import gen_fmha_aot
-from mate.jit.deep_gemm_attention import gen_deep_gemm_attention_aot
+from mate.jit.gemm.deep_gemm.gemm import gen_deep_gemm_gemm_aot
 from mate.jit.gemm.deep_gemm.hyperconnection import gen_hyperconnection_aot
+from mate.jit.gemm.deep_gemm.mqa_logits import gen_mqa_logits_aot
+from mate.jit.gemm.deep_gemm.paged_mqa_logits import gen_paged_mqa_logits_aot
 from mate.jit.gemm_ops import gen_gemm_ops_aot
+from mate.jit.guard_allocator import gen_guard_allocator_aot
 from mate.jit.mla_ops import gen_mla_ops_aot
 from mate.jit.moe_fused_gate import gen_moe_fused_gate_aot
 from mate.jit.sage_attention import gen_sage_attention_aot
@@ -93,13 +96,16 @@ def gen_all_modules(config: dict[str, object] | None = None):
     add_moe = bool(final_config["add_moe"])
 
     specs = []
+    specs.extend(gen_guard_allocator_aot())
     if attention_aot_level > 0:
         specs.extend(gen_fmha_aot(attention_aot_level))
         specs.extend(gen_mla_ops_aot())
         specs.extend(gen_sage_attention_aot())
     if add_gemm:
         specs.extend(gen_gemm_ops_aot())
-        specs.extend(gen_deep_gemm_attention_aot())
+        specs.extend(gen_deep_gemm_gemm_aot())
+        specs.extend(gen_mqa_logits_aot())
+        specs.extend(gen_paged_mqa_logits_aot())
         specs.extend(gen_hyperconnection_aot())
     if add_moe:
         specs.extend(gen_moe_fused_gate_aot())
@@ -179,7 +185,7 @@ def main() -> None:
         type=parse_bool,
         default=True,
         help="Whether to include the GEMM family in the AOT build "
-        "(gemm ops and deep_gemm attention).",
+        "(gemm ops, deep_gemm_gemm, and deep_gemm attention).",
     )
     parser.add_argument(
         "--add-moe",

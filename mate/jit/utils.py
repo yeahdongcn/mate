@@ -20,6 +20,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC({{func_name}}, {{func_name}});
 dtype_torch2mutlass_map = {
     torch.float16: "mutlass::half_t",
     torch.bfloat16: "mutlass::bfloat16_t",
+    torch.float32: "float",
+    torch.float8_e4m3fn: "mutlass::float_e4m3_t",
+    torch.float8_e5m2: "mutlass::float_e5m2_t",
 }
 
 

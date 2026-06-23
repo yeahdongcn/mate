@@ -7,6 +7,7 @@ import torch
 
 from mate.flashmla import (
     flash_mla_sparse_fwd as mate_flash_mla_sparse_fwd,
+    flash_mla_sparse_fwd_pack8 as mate_flash_mla_sparse_fwd_pack8,
     flash_mla_with_kvcache as mate_flash_mla_with_kvcache,
     get_mla_metadata as mate_get_mla_metadata,
 )
@@ -33,6 +34,10 @@ class FlashMLASchedMeta:
     config: Optional[Config] = None
     tile_scheduler_metadata: Optional[torch.Tensor] = None
     num_splits: Optional[torch.Tensor] = None
+    metadata_topk: Optional[int] = None
+    metadata_extra_topk: Optional[int] = None
+    metadata_has_topk_length: bool = False
+    metadata_has_extra_topk_length: bool = False
 
 
 def get_mla_metadata(*args, **kwargs) -> Tuple[FlashMLASchedMeta, None]:
@@ -41,6 +46,18 @@ def get_mla_metadata(*args, **kwargs) -> Tuple[FlashMLASchedMeta, None]:
         tile_scheduler_metadata, num_splits = mate_get_mla_metadata(*args, **kwargs)
         sched_meta.tile_scheduler_metadata = tile_scheduler_metadata
         sched_meta.num_splits = num_splits
+        sched_meta.metadata_topk = kwargs.get(
+            "topk", args[5] if len(args) > 5 else None
+        )
+        sched_meta.metadata_extra_topk = kwargs.get(
+            "extra_topk", args[6] if len(args) > 6 else None
+        )
+        topk_length = kwargs.get("topk_length", args[9] if len(args) > 9 else None)
+        extra_topk_length = kwargs.get(
+            "extra_topk_length", args[10] if len(args) > 10 else None
+        )
+        sched_meta.metadata_has_topk_length = topk_length is not None
+        sched_meta.metadata_has_extra_topk_length = extra_topk_length is not None
     return sched_meta, None
 
 
@@ -165,7 +182,16 @@ def flash_mla_with_kvcache(
         extra_indices_in_kvcache,
     )
 
-    if sched_meta.tile_scheduler_metadata is None or sched_meta.num_splits is None:
+    metadata_needs_refresh = (
+        sched_meta.tile_scheduler_metadata is None
+        or sched_meta.num_splits is None
+        or sched_meta.metadata_topk != topk
+        or sched_meta.metadata_extra_topk != extra_topk
+        or sched_meta.metadata_has_topk_length != (topk_length is not None)
+        or sched_meta.metadata_has_extra_topk_length != (extra_topk_length is not None)
+    )
+
+    if metadata_needs_refresh:
         num_q_tokens_per_head_k = q.shape[1] * q.shape[2] // k_cache.shape[2]
         new_tile_scheduler_metadata, new_num_splits = mate_get_mla_metadata(
             cache_seqlens=cache_seqlens,
@@ -176,6 +202,7 @@ def flash_mla_with_kvcache(
             topk=topk,
             extra_topk=extra_topk,
             q=q,
+            bs=q.shape[0],
             topk_length=topk_length.contiguous() if topk_length is not None else None,
             extra_topk_length=extra_topk_length.contiguous()
             if extra_topk_length is not None
@@ -183,6 +210,10 @@ def flash_mla_with_kvcache(
         )
         sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
         sched_meta.num_splits = new_num_splits
+        sched_meta.metadata_topk = topk
+        sched_meta.metadata_extra_topk = extra_topk
+        sched_meta.metadata_has_topk_length = topk_length is not None
+        sched_meta.metadata_has_extra_topk_length = extra_topk_length is not None
 
     return mate_flash_mla_with_kvcache(
         q=q,
@@ -221,4 +252,34 @@ def flash_mla_sparse_fwd(
         d_v=d_v,
         attn_sink=attn_sink,
         topk_length=topk_length,
+    )
+
+
+def flash_mla_sparse_fwd_pack8(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: Optional[torch.Tensor] = None,
+    sm_scale: Optional[float] = None,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    row_masks: Optional[torch.Tensor] = None,
+    causal_window: int = 0,
+    compressed_kv_len: int = 0,
+    compress_ratio: int = 1,
+    pack_metadata: Optional[object] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return mate_flash_mla_sparse_fwd_pack8(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        row_masks=row_masks,
+        causal_window=causal_window,
+        compressed_kv_len=compressed_kv_len,
+        compress_ratio=compress_ratio,
+        pack_metadata=pack_metadata,
     )

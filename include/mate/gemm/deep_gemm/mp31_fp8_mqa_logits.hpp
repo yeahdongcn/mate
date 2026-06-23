@@ -2,6 +2,7 @@
 
 #include <mutlass/mutlass.h>
 
+#include <mute/arch/simd_mp31.hpp>
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
 
@@ -11,6 +12,98 @@
 namespace mate::deep_gemm {
 
 using namespace mute;
+
+using f4 = float __attribute__((ext_vector_type(4)));
+
+MUTLASS_DEVICE f4 bst4_relu(f4 v) {
+#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
+  return __musa_max_f_bst4_sv(0.0f, v);
+#else
+  return f4{
+      v[0] > 0.0f ? v[0] : 0.0f,
+      v[1] > 0.0f ? v[1] : 0.0f,
+      v[2] > 0.0f ? v[2] : 0.0f,
+      v[3] > 0.0f ? v[3] : 0.0f,
+  };
+#endif
+}
+
+MUTLASS_DEVICE f4 bst4_mul_vv(f4 a, f4 b) {
+#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
+  return __musa_mul_f_bst4_vv(a, b);
+#else
+  return f4{a[0] * b[0], a[1] * b[1], a[2] * b[2], a[3] * b[3]};
+#endif
+}
+
+MUTLASS_DEVICE f4 bst4_mul_sv(float s, f4 v) {
+#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
+  return __musa_mul_f_bst4_sv(s, v);
+#else
+  return f4{s * v[0], s * v[1], s * v[2], s * v[3]};
+#endif
+}
+
+MUTLASS_DEVICE f4 bst4_fma_vvv(f4 a, f4 b, f4 c) {
+#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
+  return __musa_fma_f_bst4_vvv(a, b, c);
+#else
+  return f4{
+      a[0] * b[0] + c[0],
+      a[1] * b[1] + c[1],
+      a[2] * b[2] + c[2],
+      a[3] * b[3] + c[3],
+  };
+#endif
+}
+
+MUTLASS_DEVICE f4 bst4_fma_svv(float w, f4 v, f4 acc) {
+#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
+  return __musa_fma_f_bst4_svv(w, v, acc);
+#else
+  return f4{
+      w * v[0] + acc[0],
+      w * v[1] + acc[1],
+      w * v[2] + acc[2],
+      w * v[3] + acc[3],
+  };
+#endif
+}
+
+MUTLASS_DEVICE float hsum4(f4 v) {
+  return v[0] + v[1] + v[2] + v[3];
+}
+
+MUTLASS_DEVICE f4 bst4_add_vv(f4 a, f4 b) {
+#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
+  return __musa_fma_f_bst4_svv(1.0f, b, a);
+#else
+  return f4{a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]};
+#endif
+}
+
+MUTLASS_DEVICE f4 shfl_xor_f4(f4 v, int lane_mask) {
+#if defined(__MUSA_ARCH__)
+  return f4{
+      __shfl_xor_sync(0xffffffffu, v[0], lane_mask),
+      __shfl_xor_sync(0xffffffffu, v[1], lane_mask),
+      __shfl_xor_sync(0xffffffffu, v[2], lane_mask),
+      __shfl_xor_sync(0xffffffffu, v[3], lane_mask),
+  };
+#else
+  return v;
+#endif
+}
+
+template <int kRT>
+MUTLASS_DEVICE f4 warp_group_reduce_sum_f4(f4 v) {
+  MUTE_UNROLL
+  for (int off = 1; off < kRT; off <<= 1) {
+    f4 t = shfl_xor_f4(v, off);
+    v    = bst4_add_vv(v, t);
+  }
+  return v;
+}
 
 struct MqaLogitsTask {
   uint32_t q_group_idx;
@@ -300,98 +393,6 @@ struct Mp31Fp8NonPagedMqaLogits {
         .stride_logits = args.stride_logits,
         .max_seq_kv    = max_seq_kv,
     };
-  }
-
-  using f4 = float __attribute__((ext_vector_type(4)));
-
-  MUTLASS_DEVICE f4 bst4_relu(f4 v) {
-#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
-    return __musa_max_f_bst4_sv(0.0f, v);
-#else
-    return f4{
-        v[0] > 0.0f ? v[0] : 0.0f,
-        v[1] > 0.0f ? v[1] : 0.0f,
-        v[2] > 0.0f ? v[2] : 0.0f,
-        v[3] > 0.0f ? v[3] : 0.0f,
-    };
-#endif
-  }
-
-  MUTLASS_DEVICE f4 bst4_mul_vv(f4 a, f4 b) {
-#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
-    return __musa_mul_f_bst4_vv(a, b);
-#else
-    return f4{a[0] * b[0], a[1] * b[1], a[2] * b[2], a[3] * b[3]};
-#endif
-  }
-
-  MUTLASS_DEVICE f4 bst4_mul_sv(float s, f4 v) {
-#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
-    return __musa_mul_f_bst4_sv(s, v);
-#else
-    return f4{s * v[0], s * v[1], s * v[2], s * v[3]};
-#endif
-  }
-
-  MUTLASS_DEVICE f4 bst4_fma_vvv(f4 a, f4 b, f4 c) {
-#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
-    return __musa_fma_f_bst4_vvv(a, b, c);
-#else
-    return f4{
-        a[0] * b[0] + c[0],
-        a[1] * b[1] + c[1],
-        a[2] * b[2] + c[2],
-        a[3] * b[3] + c[3],
-    };
-#endif
-  }
-
-  MUTLASS_DEVICE f4 bst4_fma_svv(float w, f4 v, f4 acc) {
-#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
-    return __musa_fma_f_bst4_svv(w, v, acc);
-#else
-    return f4{
-        w * v[0] + acc[0],
-        w * v[1] + acc[1],
-        w * v[2] + acc[2],
-        w * v[3] + acc[3],
-    };
-#endif
-  }
-
-  MUTLASS_DEVICE float hsum4(f4 v) {
-    return v[0] + v[1] + v[2] + v[3];
-  }
-
-  MUTLASS_DEVICE f4 bst4_add_vv(f4 a, f4 b) {
-#if defined(MUTE_ARCH_SIMD_MATH_ENABLED)
-    return __musa_fma_f_bst4_svv(1.0f, b, a);
-#else
-    return f4{a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]};
-#endif
-  }
-
-  MUTLASS_DEVICE f4 shfl_xor_f4(f4 v, int lane_mask) {
-#if defined(__MUSA_ARCH__)
-    return f4{
-        __shfl_xor_sync(0xffffffffu, v[0], lane_mask),
-        __shfl_xor_sync(0xffffffffu, v[1], lane_mask),
-        __shfl_xor_sync(0xffffffffu, v[2], lane_mask),
-        __shfl_xor_sync(0xffffffffu, v[3], lane_mask),
-    };
-#else
-    return v;
-#endif
-  }
-
-  template <int kRT>
-  MUTLASS_DEVICE f4 warp_group_reduce_sum_f4(f4 v) {
-    MUTE_UNROLL
-    for (int off = 1; off < kRT; off <<= 1) {
-      f4 t = shfl_xor_f4(v, off);
-      v    = bst4_add_vv(v, t);
-    }
-    return v;
   }
 
   MUTLASS_DEVICE void operator()(Params const& params, char* smem) {
@@ -691,7 +692,6 @@ struct Mp31Fp8NonPagedMqaLogits {
             MUTE_UNROLL
             for (int ni = 0; ni < kBlockQ; ++ni) {
               const int q_row = q_block_base + ni;
-              if (q_row >= params.total_seq_q) continue;
 
               f4        accv     = f4{0.f, 0.f, 0.f, 0.f};
               const int col_base = ni * J;

@@ -1,32 +1,31 @@
-# sageattention
+# SageAttention Compatibility Wrapper (sageattention)
 
-`sageattention` is a compatibility wrapper package that preserves the
-SageAttention Python package surface on top of MATE's dense quantized attention
-operators on MUSA.
+`sageattention` is a compatibility wrapper that preserves the standard
+SageAttention Python API surface, running on top of MATE's dense quantized
+attention operators on MUSA.
 
 ## Overview
 
-This wrapper is intended for projects that already target SageAttention-style
-Python APIs and want to run on MUSA through MATE with smaller integration
-changes.
+This wrapper is designed for projects that already target
+SageAttention-style Python APIs, allowing you to run on MUSA through MATE
+with minimal integration effort.
+
+The current compatibility scope includes `sageattn` and
+`sageattn_qk_int8_pv_fp8_cuda_sm90`.
+
+## Package and import
 
 - Package name: `sageattention`
 - Import path: `sageattention`
 - Runtime backend: MATE dense quantized attention operators on MUSA
 
-The wrapper currently exposes the supported public SageAttention-compatible
-entries:
-
-- `sageattn`
-- `sageattn_qk_int8_pv_fp8_cuda_sm90`
-
 ## Requirements
 
-Before using this wrapper, make sure the following are already available:
+Before using this wrapper, make sure the following are available:
 
-- MATE is installed and importable
-- TorchMUSA and the MUSA runtime environment are available
-- The target workload is expected to run on MUSA devices
+- MATE is installed and importable.
+- TorchMUSA and the MUSA runtime environment are available.
+- The target workload is configured to execute on MUSA devices.
 
 ## Build
 

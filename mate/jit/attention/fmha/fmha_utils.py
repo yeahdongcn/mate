@@ -141,24 +141,68 @@ def _get_tile_m(m: int, head_ratio: int, enable_packgqa: bool = None):
     return tile_m, enable_packgqa
 
 
+def _get_qv_stages_by_smem(
+    tile_m: int, tile_n: int, headdim: int, headdim_v: int, element_size: int
+):
+    smem_limit = 192 * 1024
+
+    def estimate(stages: int):
+        smem_q = tile_m * headdim
+        smem_qv = tile_m * headdim_v
+        smem_k = tile_n * headdim * stages
+        smem_v_for_qv = tile_n * headdim_v * stages
+        smem_p = tile_m * tile_n
+        smem_v_for_pv = tile_n * headdim_v * stages
+        return (
+            smem_q + smem_qv + smem_k + smem_v_for_qv + smem_p + smem_v_for_pv
+        ) * element_size
+
+    return (2, 2) if estimate(2) <= smem_limit else (1, 1)
+
+
+def round_multiple(x, m):
+    return (x + m - 1) // m * m
+
+
 @lru_cache
 def _get_fwd_kernel_config(
     m: int,
     head_ratio: int,
     headdim: int,
     headdim_v: int,
+    element_size: int,
     enable_packgqa: bool = None,
+    has_qv: bool = False,
+    is_fp8: bool = False,
 ):
     headdim, headdim_v = _roundup_headdim(headdim, headdim_v)
 
     candidate_tile_m, enable_packgqa = _get_tile_m(m, head_ratio, enable_packgqa)
+    if candidate_tile_m == 192 and headdim % 128 != 0:
+        candidate_tile_m = 128
 
     decode_mode = enable_packgqa
-    if headdim == 64 and headdim_v == 64:
+    if has_qv:
+        tile_m = 32
+        tile_n = 128 if is_fp8 else 64
+        stages_k, stages_v = _get_qv_stages_by_smem(
+            tile_m, tile_n, headdim, headdim_v, element_size
+        )
+    elif headdim == 64 and headdim_v == 64:
         tile_m = candidate_tile_m
         tile_n = 64
         stages_k = 2
         stages_v = 2
+    elif headdim == 64 and headdim_v == 256:
+        tile_m = 192 if not decode_mode else 32
+        tile_n = 64
+        stages_k = 1 if not decode_mode else 2
+        stages_v = 1 if not decode_mode else 2
+    elif headdim == 64 and headdim_v == 512:
+        tile_m = 32
+        tile_n = 64
+        stages_k = 1
+        stages_v = 1
     elif headdim == 128 and headdim_v == 128:
         tile_m = candidate_tile_m
         tile_n = 64
@@ -191,6 +235,31 @@ def _get_fwd_kernel_config(
         stages_v = 1
     else:
         assert False, f"Add config for headdim {headdim}-{headdim_v}"
+
+    if is_fp8 and not has_qv:
+        match (headdim, headdim_v):
+            case (64, 64) | (128, 128) | (192, 128) | (192, 192):
+                tile_m = 256
+                tile_n = 128
+                stages_k = 2
+                stages_v = 2
+            case (256, 256):
+                tile_m = 192
+                tile_n = 128
+                stages_k = 1
+                stages_v = 1
+            case (384, 384):
+                tile_m = 128
+                tile_n = 128
+                stages_k = 1
+                stages_v = 1
+            case (512, 512):
+                tile_m = 32
+                tile_n = 128
+                stages_k = 1
+                stages_v = 1
+            case _:
+                assert has_qv, f"Add FP8 config for headdim {headdim}-{headdim_v}"
 
     consumers_qk = ceil_div(tile_m, 64)
     consumers_pv = consumers_qk

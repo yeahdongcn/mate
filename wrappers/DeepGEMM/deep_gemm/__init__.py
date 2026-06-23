@@ -5,6 +5,7 @@ from .interface import (
     bf16_m_grouped_gemm_nt_masked,
     bf16_gemm_nt,
     # legacy aliases
+    fp8_einsum,
     fp8_m_grouped_gemm_nt_masked,
     fp8_gemm_nt,
     fp8_mqa_logits,
@@ -15,6 +16,7 @@ from .interface import (
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_masked,
 )
+from . import testing as testing
 from . import utils as utils
 from .utils import (
     get_col_major_tma_aligned_tensor as get_col_major_tma_aligned_tensor,
@@ -70,6 +72,8 @@ __version__ = _load_version()
 __all__ = [
     "__git_version__",
     "__version__",
+    "testing",
+    "utils",
     # GEMM
     "bf16_gemm_nt",
     "m_grouped_bf16_gemm_nt_contiguous",
@@ -77,6 +81,7 @@ __all__ = [
     "m_grouped_fp8_gemm_nt_contiguous",
     "m_grouped_fp8_gemm_nt_masked",
     "fp8_gemm_nt",
+    "fp8_einsum",
     # MQA
     "get_paged_mqa_logits_metadata",
     "fp8_paged_mqa_logits",

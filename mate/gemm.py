@@ -1,10 +1,18 @@
 import functools
+from typing import Literal, Optional, Tuple, cast
+
 import torch
+
 from mate.api_logging import mate_api
 from mate._backend import resolve_backend
+from mate.jit.gemm.deep_gemm.gemm import (
+    GEMM_TYPE_M_GROUPED_CONTIGUOUS,
+    GEMM_TYPE_M_GROUPED_MASKED,
+    get_deep_gemm_gemm_module,
+)
 from mate.jit.gemm_ops import get_gemm_ops_module
+from mate.mate_runtime import resolve_num_mps
 from mate.utils import ceil_div
-from typing import Tuple, Optional, Literal
 
 
 @functools.cache
@@ -25,6 +33,7 @@ def ragged_m_moe_gemm_16bit(
     major_b_mode: Optional[Literal["N", "K"]] = "K",
     num_mp: Optional[int] = None,
     alignment_m: Optional[int] = None,
+    backend: Optional[Literal["auto", "mubin", "mutlass"]] = "auto",
 ):
     """
     Perform 16-bit GEMM operation for MoE (Mixture of Experts) with ragged tensor inputs.
@@ -73,26 +82,63 @@ def ragged_m_moe_gemm_16bit(
     if alignment_m is None:
         alignment_m = 128
 
+    backend = cast(
+        Literal["auto", "mubin", "mutlass"],
+        resolve_backend(backend, supported=("mubin", "mutlass"), default="auto"),
+    )
+
     if gemm_mode == "per_token":
-        _get_module().get_function("ragged_moe_gemm_16bit")(
-            input_a,
-            input_b,
-            ragged_tokens_info,
-            out,
-            False,
-            None,
-            alignment_m,
-        )
+        if backend == "mutlass":
+            dispatch_name, mod = get_deep_gemm_gemm_module(
+                kind="bf16",
+                gemm_type=GEMM_TYPE_M_GROUPED_CONTIGUOUS,
+                config_m=input_a.shape[0],
+                alignment_m=alignment_m,
+            )
+            mod.get_function(dispatch_name)(
+                input_a,
+                input_b,
+                out,
+                ragged_tokens_info,
+                0,
+                resolve_num_mps(input_a.device, num_mp),
+            )
+        else:
+            _get_module().get_function("ragged_moe_gemm_16bit")(
+                input_a,
+                input_b,
+                ragged_tokens_info,
+                out,
+                False,
+                None,
+                alignment_m,
+            )
     elif gemm_mode == "per_expert":
-        _get_module().get_function("m_grouped_contig_gemm_16bit")(
-            input_a,
-            input_b,
-            ragged_tokens_info,
-            out,
-            major_a_mode,
-            major_b_mode,
-            num_mp,
-        )
+        if backend == "mutlass":
+            dispatch_name, mod = get_deep_gemm_gemm_module(
+                kind="bf16",
+                gemm_type=GEMM_TYPE_M_GROUPED_CONTIGUOUS,
+                config_m=input_a.shape[0],
+                alignment_m=alignment_m,
+            )
+            mod.get_function(dispatch_name)(
+                input_a,
+                input_b,
+                out,
+                ragged_tokens_info,
+                0,
+                resolve_num_mps(input_a.device, num_mp),
+            )
+        else:
+            _get_module().get_function("m_grouped_contig_gemm_16bit")(
+                input_a,
+                input_b,
+                ragged_tokens_info,
+                out,
+                major_a_mode,
+                major_b_mode,
+                num_mp,
+            )
     else:
         assert False, "Not supported gemm mode."
 
@@ -108,6 +154,7 @@ def masked_moe_gemm_16bit(
     expect_tokens: Optional[int] = None,
     enable_overlap: bool = False,
     signal: Optional[torch.Tensor] = None,
+    backend: Optional[Literal["auto", "mubin", "mutlass"]] = "auto",
 ):
     """
     Perform 16-bit GEMM operation for MoE (Mixture of Experts) with masked tensor inputs.
@@ -151,6 +198,11 @@ def masked_moe_gemm_16bit(
     if expect_tokens is None:
         expect_tokens = 0
 
+    backend = cast(
+        Literal["auto", "mubin", "mutlass"],
+        resolve_backend(backend, supported=("mubin", "mutlass"), default="auto"),
+    )
+
     if not enable_overlap:
         signal = None
 
@@ -165,6 +217,26 @@ def masked_moe_gemm_16bit(
             dtype=torch.int32,
             device=a.device,
         )
+
+    if backend == "mutlass":
+        if enable_overlap:
+            raise NotImplementedError(
+                'backend="mutlass" does not support enable_overlap'
+            )
+        dispatch_name, mod = get_deep_gemm_gemm_module(
+            kind="bf16",
+            gemm_type=GEMM_TYPE_M_GROUPED_MASKED,
+            config_m=expect_tokens,
+        )
+        mod.get_function(dispatch_name)(
+            a,
+            b,
+            out,
+            masked_tokens_info,
+            int(expect_tokens),
+            resolve_num_mps(a.device),
+        )
+        return out
 
     res = _get_module().get_function("masked_moe_gemm_16bit")(
         a,
@@ -192,6 +264,7 @@ def ragged_m_moe_gemm_8bit(
     scale_granularity_mnk: Optional[Tuple[int, int, int]] = None,
     num_mp: Optional[int] = None,
     alignment_m: Optional[int] = None,
+    backend: Optional[Literal["auto", "mubin", "mutlass"]] = "auto",
 ):
     """
     Perform 8-bit GEMM operation for MoE (Mixture of Experts) with ragged tensor inputs.
@@ -252,26 +325,71 @@ def ragged_m_moe_gemm_8bit(
     if alignment_m is None:
         alignment_m = 128
 
+    backend = cast(
+        Literal["auto", "mubin", "mutlass"],
+        resolve_backend(backend, supported=("mubin", "mutlass"), default="auto"),
+    )
+
     if gemm_mode == "per_token":
-        _get_module().get_function("ragged_moe_gemm_8bit")(
-            input_a,
-            input_b,
-            ragged_tokens_info,
-            scale_granularity_mnk,
-            out,
-            alignment_m,
-        )
+        if backend == "mutlass":
+            a_fp8, scale_a = input_a
+            b_fp8, scale_b = input_b
+            dispatch_name, mod = get_deep_gemm_gemm_module(
+                kind="fp8",
+                gemm_type=GEMM_TYPE_M_GROUPED_CONTIGUOUS,
+                config_m=a_fp8.shape[0],
+                alignment_m=alignment_m,
+            )
+            mod.get_function(dispatch_name)(
+                a_fp8,
+                scale_a,
+                b_fp8,
+                scale_b,
+                out,
+                ragged_tokens_info,
+                0,
+                resolve_num_mps(a_fp8.device, num_mp),
+            )
+        else:
+            _get_module().get_function("ragged_moe_gemm_8bit")(
+                input_a,
+                input_b,
+                ragged_tokens_info,
+                scale_granularity_mnk,
+                out,
+                alignment_m,
+            )
     elif gemm_mode == "per_expert":
-        _get_module().get_function("m_grouped_contig_gemm_8bit")(
-            input_a,
-            input_b,
-            ragged_tokens_info,
-            scale_granularity_mnk,
-            out,
-            major_a_mode,
-            major_b_mode,
-            num_mp,
-        )
+        if backend == "mutlass":
+            a_fp8, scale_a = input_a
+            b_fp8, scale_b = input_b
+            dispatch_name, mod = get_deep_gemm_gemm_module(
+                kind="fp8",
+                gemm_type=GEMM_TYPE_M_GROUPED_CONTIGUOUS,
+                config_m=a_fp8.shape[0],
+                alignment_m=alignment_m,
+            )
+            mod.get_function(dispatch_name)(
+                a_fp8,
+                scale_a,
+                b_fp8,
+                scale_b,
+                out,
+                ragged_tokens_info,
+                0,
+                resolve_num_mps(a_fp8.device, num_mp),
+            )
+        else:
+            _get_module().get_function("m_grouped_contig_gemm_8bit")(
+                input_a,
+                input_b,
+                ragged_tokens_info,
+                scale_granularity_mnk,
+                out,
+                major_a_mode,
+                major_b_mode,
+                num_mp,
+            )
     else:
         assert False, "Not supported gemm mode"
 
@@ -288,6 +406,7 @@ def masked_moe_gemm_8bit(
     expect_tokens: Optional[int] = None,
     enable_overlap: bool = False,
     signal: Optional[torch.Tensor] = None,
+    backend: Optional[Literal["auto", "mubin", "mutlass"]] = "auto",
 ):
     """
     Perform 8-bit GEMM operation for MoE (Mixture of Experts) with masked tensor inputs.
@@ -337,6 +456,11 @@ def masked_moe_gemm_8bit(
     if scale_granularity_mnk is None:
         scale_granularity_mnk = (1, 128, 128)
 
+    backend = cast(
+        Literal["auto", "mubin", "mutlass"],
+        resolve_backend(backend, supported=("mubin", "mutlass"), default="auto"),
+    )
+
     if expect_tokens is None:
         expect_tokens = 0
 
@@ -355,6 +479,30 @@ def masked_moe_gemm_8bit(
             dtype=torch.int32,
             device=a.device,
         )
+
+    if backend == "mutlass":
+        if enable_overlap:
+            raise NotImplementedError(
+                'backend="mutlass" does not support enable_overlap'
+            )
+        a_fp8, scale_a = input_a
+        b_fp8, scale_b = input_b
+        dispatch_name, mod = get_deep_gemm_gemm_module(
+            kind="fp8",
+            gemm_type=GEMM_TYPE_M_GROUPED_MASKED,
+            config_m=expect_tokens,
+        )
+        mod.get_function(dispatch_name)(
+            a_fp8,
+            scale_a,
+            b_fp8,
+            scale_b,
+            out,
+            masked_tokens_info,
+            int(expect_tokens),
+            resolve_num_mps(a_fp8.device),
+        )
+        return out
 
     res = _get_module().get_function("masked_moe_gemm_8bit")(
         input_a,
@@ -529,6 +677,9 @@ def bmm_fp8(
     backend: str = "auto",
     scale_granularity_mnk: Optional[Tuple[int, int, int]] = None,
     output_scale: Optional[torch.Tensor] = None,
+    c: Optional[torch.Tensor] = None,
+    major_a_mode: Literal["K", "M"] = "K",
+    major_b_mode: Literal["N", "K"] = "K",
 ):
     """
     Perform batched matrix multiplication with FP8 quantized tensors.
@@ -539,11 +690,15 @@ def bmm_fp8(
     Parameters
     ----------
     a : Tensor
-        Input tensor A with shape ``(batch, m, k)`` in FP8 format (e4m3/e5m2).
-        The **`k`** dimension must be contiguous.
+        Input tensor A in FP8 format (e4m3/e5m2). Shape is
+        ``(batch, m, k)`` when ``major_a_mode="K"`` and
+        ``(batch, k, m)`` when ``major_a_mode="M"``. The declared major
+        matrix dimension must have stride 1.
     b : Tensor
-        Input tensor B with shape ``(batch, k, n)`` in FP8 format (e4m3/e5m2).
-        The **`k`** dimension must be contiguous.
+        Input tensor B in FP8 format (e4m3/e5m2). Shape is
+        ``(batch, n, k)`` by default with ``major_b_mode="K"`` and
+        ``(batch, k, n)`` when ``major_b_mode="N"``. The declared
+        major matrix dimension must have stride 1.
     a_scale : Tensor
         Scaling factors for tensor A with shape depending on scale_granularity.
         Should be of fp32 type.
@@ -551,7 +706,8 @@ def bmm_fp8(
         Scaling factors for tensor B with shape depending on scale_granularity.
         Should be of fp32 type.
     out_dtype : torch.dtype
-        Data type for the output tensor. Only torch.bfloat16 and torch.float16 are supported.
+        Data type for the output tensor. torch.bfloat16, torch.float16 and
+        torch.float32 are supported.
     out : Optional[Tensor]
         Pre-allocated output tensor with shape ``(batch, m, n)``.
         Default is None.
@@ -562,8 +718,18 @@ def bmm_fp8(
         Default is "auto".
     scale_granularity_mnk : Optional[Tuple[int, int, int]]
         Granularity of scaling for batch, m, and n dimensions respectively.
-        Only ``(-1, -1, -1)`` and ``(1, -1, -1)`` are supported.
+        ``(-1, -1, -1)``, ``(1, -1, -1)``, ``(1, 128, 128)`` and
+        ``(1, 1, 128)`` are supported.
         If None, defaults to ``(-1, -1, -1)``.
+    c : Optional[Tensor]
+        Optional FP32 accumulation tensor with shape ``(batch, m, n)``.
+    major_a_mode : str
+        ``"K"`` treats A as ``(batch, m, k)``; ``"M"`` treats A as
+        ``(batch, k, m)`` and asks MatMulLt to transpose A.
+    major_b_mode : str
+        ``"K"`` treats B as ``(batch, n, k)`` and asks MatMulLt to
+        transpose B. ``"N"`` treats B as ``(batch, k, n)``.
+        Default is ``"K"``.
 
     Returns
     -------
@@ -577,18 +743,74 @@ def bmm_fp8(
     if scale_granularity_mnk is None:
         scale_granularity_mnk = (-1, -1, -1)
 
-    if out is None:
-        batch = a.size(0)
-        m = a.size(1)
-        n = b.size(2)
+    if major_a_mode not in ("K", "M"):
+        raise ValueError("major_a_mode must be either 'K' or 'M'")
+    if major_b_mode not in ("N", "K"):
+        raise ValueError("major_b_mode must be either 'N' or 'K'")
 
-        if out_dtype not in [torch.bfloat16, torch.float16]:
-            raise ValueError("Only bf16 and fp16 are supported for out_type!")
+    batch = a.size(0)
+    if major_a_mode == "K":
+        m = a.size(1)
+        k = a.size(2)
+    else:
+        k = a.size(1)
+        m = a.size(2)
+
+    if major_b_mode == "N":
+        b_k = b.size(1)
+        n = b.size(2)
+    else:
+        n = b.size(1)
+        b_k = b.size(2)
+
+    if b.size(0) != batch or b_k != k:
+        raise ValueError(
+            "bmm_fp8 expects A as [batch,m,k] or [batch,k,m] according to "
+            "major_a_mode, and B as [batch,k,n] or [batch,n,k] according to "
+            "major_b_mode"
+        )
+
+    if out is None:
+        if out_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
+            raise ValueError("Only bf16, fp16 and fp32 are supported for out_type!")
 
         out = torch.empty((batch, m, n), dtype=out_dtype, device=a.device)
+    else:
+        if tuple(out.shape) != (batch, m, n):
+            raise ValueError(
+                f"out must have shape {(batch, m, n)}, got {tuple(out.shape)}"
+            )
+        if out.device != a.device:
+            raise ValueError(f"out must be on device {a.device}, got {out.device}")
+        if out.dtype not in [torch.bfloat16, torch.float16, torch.float32]:
+            raise ValueError("Only bf16, fp16 and fp32 are supported for out_type!")
+
+    if c is not None:
+        if tuple(c.shape) != (batch, m, n):
+            raise ValueError(f"c must have shape {(batch, m, n)}, got {tuple(c.shape)}")
+        if c.device != a.device:
+            raise ValueError(f"c must be on device {a.device}, got {c.device}")
+        if c.dtype != out.dtype:
+            raise ValueError("c must have the same dtype as out")
+        if out.dtype != torch.float32:
+            raise ValueError("bmm_fp8 with c only supports fp32 output")
+
+    if c is not None and k == 0:
+        if out.data_ptr() != c.data_ptr():
+            out.copy_(c)
+        return out
 
     _get_module().get_function("bmm_fp8")(
-        a, b, a_scale, b_scale, out, scale_granularity_mnk, backend
+        a,
+        b,
+        a_scale,
+        b_scale,
+        out,
+        scale_granularity_mnk,
+        backend,
+        c,
+        major_a_mode,
+        major_b_mode,
     )
     return out
 

@@ -1,24 +1,30 @@
-# deep_gemm
+# DeepGEMM Compatibility Wrapper (deep-gemm)
 
-`deep-gemm` is a compatibility wrapper package that preserves the `deep_gemm` import path on top of MATE GEMM operators on MUSA.
+`deep-gemm` is a compatibility wrapper package that preserves the
+`deep_gemm` import path while running on MUSA through MATE GEMM operators.
 
 ## Overview
 
-This wrapper is intended for projects that already target DeepGEMM-style Python APIs and want to run on MUSA through MATE with smaller integration changes.
+This wrapper is designed for projects that already target DeepGEMM-style
+Python APIs. It helps run existing integrations on MUSA through MATE with
+minimal code changes.
+
+The current compatibility scope includes grouped GEMM, dense BF16 / FP8 GEMM,
+FP8 einsum, HyperConnection prenorm GEMM, and MQA (multi-query attention)
+logits APIs.
+
+## Package and import
 
 - Package name: `deep-gemm`
 - Import path: `deep_gemm`
 - Runtime backend: MATE GEMM and logits operators on MUSA
-
-The package currently covers grouped GEMM, dense BF16/FP8 GEMM, HyperConnection prenorm GEMM, and MQA logits APIs.
-
 ## Requirements
 
-Before using this wrapper, make sure the following are already available:
+Before using this wrapper, make sure the following are available:
 
-- MATE is installed and importable
-- TorchMUSA and the MUSA runtime environment are available
-- The target workload is expected to run on MUSA devices
+- MATE is installed and importable.
+- TorchMUSA is installed and the MUSA runtime environment is configured.
+- The target workload is configured to run on MUSA devices.
 
 ## Build
 
@@ -75,6 +81,7 @@ from deep_gemm import (
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_masked,
     fp8_gemm_nt,
+    fp8_einsum,
     tf32_hc_prenorm_gemm,
     get_paged_mqa_logits_metadata,
     fp8_paged_mqa_logits,
@@ -99,6 +106,7 @@ Grouped GEMM:
 Dense FP8 GEMM:
 
 - `fp8_gemm_nt`
+- `fp8_einsum`
 
 HyperConnection prenorm GEMM:
 
@@ -112,11 +120,34 @@ MQA logits APIs:
 
 Utility helpers re-exported from `deep_gemm.utils`:
 
+- `bench`, `bench_kineto`, `calc_diff`
 - `get_num_sms`, `set_num_sms`
 - `get_tc_util`, `set_tc_util`
 - `get_mk_alignment_for_contiguous_layout`
 - `get_col_major_tma_aligned_tensor`
 - `get_mn_major_tma_aligned_tensor`
+
+Testing helpers are implemented in `mate.testing.deep_gemm` and are also
+available from the upstream-style path:
+
+- `deep_gemm.testing.bench`
+- `deep_gemm.testing.bench_kineto`
+- `deep_gemm.testing.calc_diff`
+
+## Contiguous Grouped GEMM Alignment
+
+`get_mk_alignment_for_contiguous_layout()` returns the M-axis padding alignment
+used by DeepGEMM-compatible contiguous grouped GEMM wrappers. It defaults to
+`128` and can be overridden with:
+
+```bash
+export MATE_DEEPGEMM_MK_ALIGNMENT=256
+```
+
+Only `128` and `256` are supported. Use the returned value when padding each
+expert segment and building `m_indices` for
+`m_grouped_{fp8,bf16}_gemm_nt_contiguous`. Set the environment variable before
+starting Python; the helper reads and caches the value on first use.
 
 ## Quick Start
 

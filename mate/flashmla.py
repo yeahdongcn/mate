@@ -10,6 +10,9 @@ from .sparse_mla.flashmla_sparse import (
     flashmla_sparse_decode,
     flashmla_sparse_prefill,
 )
+from .sparse_mla.tilelang.sparse_mla_model1_fwd_pack import (
+    sparse_mla_fwd_interface_model1_pack,
+)
 from .execution_context import raise_complete_if_dry_run
 
 
@@ -167,6 +170,46 @@ def flash_mla_sparse_fwd(
         d_v=d_v,
         attn_sink=attn_sink,
         topk_length=topk_length,
+    )
+
+
+@mate_api
+def flash_mla_sparse_fwd_pack8(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: Optional[torch.Tensor] = None,
+    sm_scale: Optional[float] = None,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    row_masks: Optional[torch.Tensor] = None,
+    causal_window: int = 0,
+    compressed_kv_len: int = 0,
+    compress_ratio: int = 1,
+    pack_metadata: Optional[object] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Experimental MODEL1 H=8 pack_s=8 bf16 sparse-prefill entrypoint.
+
+    This API is intentionally separate from the generic sparse prefill wrapper so
+    callers can opt into the H8 pack experiment without changing generic sparse
+    prefill semantics.
+    """
+    assert d_v == 512, "pack8 sparse prefill only supports d_v == 512"
+    return sparse_mla_fwd_interface_model1_pack(
+        q=q,
+        kv=kv,
+        indices=indices,
+        topk_length=topk_length,
+        row_masks=row_masks,
+        sm_scale=sm_scale,
+        attn_sink=attn_sink,
+        d_v=d_v,
+        return_max_logits=True,
+        causal_window=causal_window,
+        compressed_kv_len=compressed_kv_len,
+        compress_ratio=compress_ratio,
+        pack_metadata=pack_metadata,
+        token_pack=8,
     )
 
 

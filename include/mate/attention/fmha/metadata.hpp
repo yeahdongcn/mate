@@ -429,10 +429,13 @@ inline int num_splits_heuristic(int  total_mblocks,
                                 int  size_one_kv_head,
                                 bool is_causal_or_local,
                                 int  max_splits) {
+  constexpr float kMinWaveOccupancy = 0.8f;
+  constexpr float kEfficiencySlack  = 0.85f;
+
   // If we have enough to almost fill the SMs, then just use 1 split
   // However, in the case of super long seqlen where each head of KV doesn't even fit into
   // L2 (we assume that L2 size is 50MB), we want to split.
-  if (total_mblocks >= 0.8f * num_mp) {
+  if (total_mblocks >= kMinWaveOccupancy * num_mp) {
     int const size_l2 = 1.5 * 1024 * 1024;  // 1.5 MB
     // Only split if there are enough queries to go over the KV at least twice
     // Don't split if causal
@@ -446,7 +449,15 @@ inline int num_splits_heuristic(int  total_mblocks,
   if (num_n_blocks <= 4) {
     return 1;
   }
-  max_splits                        = std::min({max_splits, num_mp, num_n_blocks});
+  max_splits                    = std::min({max_splits, num_mp, num_n_blocks});
+  int const one_wave_cap        = total_mblocks > 0 ? num_mp / total_mblocks : 0;
+  int const one_wave_max_splits = one_wave_cap > 0 ? std::min(one_wave_cap, max_splits) : 0;
+  if (one_wave_max_splits > 0) {
+    float const one_wave_eff = static_cast<float>(total_mblocks * one_wave_max_splits) / num_mp;
+    if (one_wave_eff >= kMinWaveOccupancy && max_splits > one_wave_max_splits) {
+      max_splits = one_wave_max_splits;
+    }
+  }
   float              max_efficiency = 0.f;
   std::vector<float> efficiency;
   efficiency.reserve(max_splits);
@@ -459,20 +470,24 @@ inline int num_splits_heuristic(int  total_mblocks,
     }
     efficiency.push_back(eff);
   }
+  int chosen = 1;
   for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-    if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
-      // printf("num_splits chosen = %d\n", num_splits);
-      return num_splits;
+    if (efficiency[num_splits - 1] >= kEfficiencySlack * max_efficiency) {
+      chosen = num_splits;
+      break;
     }
   }
-  return 1;
+  return chosen;
 }
 
-inline int get_num_splits(FmhaFwdParams const& params, int tile_m, int tile_n) {
+inline int get_num_splits(FmhaFwdParams const& params, int tile_m, int tile_n, bool verbose = false) {
   // TODO: leftpad_k
   bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k;
 
   int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
+  if (verbose) {
+    printf("varlen: %d, seqlen_q_packgqa: %d\n", varlen, seqlen_q_packgqa);
+  }
   // metadata kernel need to set params for local.
   // int const seqlen_k_loaded = params.seqlen_k;
   int const seqlen_k_loaded =
@@ -481,10 +496,16 @@ inline int get_num_splits(FmhaFwdParams const& params, int tile_m, int tile_n) {
           : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + tile_m));
   int const num_n_blocks = (seqlen_k_loaded + tile_n - 1) / tile_n;
   int const num_m_blocks = (seqlen_q_packgqa + tile_m - 1) / tile_m;
-  // TODO: Other dtype size (fp8, etc.)
-  int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (2);
+  if (verbose) {
+    printf("tile_n: %d, tile_m: %d\n", tile_n, tile_m);
+    printf("seqlen_k_loaded: %d, num_n_blocks: %d, num_m_blocks: %d\n", seqlen_k_loaded, num_n_blocks, num_m_blocks);
+  }
+  int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_fp8 ? 1 : 2);
   // TODO: for non-scheduled, this should be batch
   int total_mblocks = params.b * params.h_k * num_m_blocks;
+  if (verbose) {
+    printf("size_one_kv_head: %d, total_mblocks: %d\n", size_one_kv_head, total_mblocks);
+  }
 
   return num_splits_heuristic(total_mblocks,
                               params.num_mp,

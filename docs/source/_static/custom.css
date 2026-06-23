@@ -1,0 +1,36 @@
+table.docutils,
+table.docutils.align-default {
+  margin-left: 0;
+  margin-right: auto;
+}
+
+table.docutils th,
+table.docutils td {
+  text-align: left;
+}
+
+.mermaid {
+  margin: 1.5rem 0;
+  text-align: center;
+  overflow-x: auto;
+}
+
+.mermaid svg {
+  height: auto;
+  max-width: 100%;
+  min-width: 860px;
+}
+
+.mermaid svg text,
+.mermaid svg .nodeLabel,
+.mermaid svg .edgeLabel,
+.mermaid svg foreignObject,
+.mermaid svg foreignObject div {
+  font-size: 11px !important;
+}
+
+@media (max-width: 900px) {
+  .mermaid svg {
+    min-width: 700px;
+  }
+}

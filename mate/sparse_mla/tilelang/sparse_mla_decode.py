@@ -1,4 +1,3 @@
-# ruff: noqa
 """Unified TileLang sparse decode entrypoint.
 
 FlashMLA exposes sparse decode as one operation.  MODEL1 and V3.2 differ in
@@ -7,8 +6,10 @@ remain layout-specialized.  This module keeps the wrapper-facing path unified:
 shape/default handling, metadata initialization, and variant dispatch live here.
 """
 
+# ruff: noqa
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -29,6 +30,15 @@ from .sparse_mla_model1_decode_fwd_scheduled import (
 
 
 MetadataGetter = Callable[..., Tuple[torch.Tensor, torch.Tensor]]
+
+
+def _model1_decode_schedule(num_heads_q: int) -> Tuple[int, int, int, int, int, int]:
+    """Choose MODEL1 decode tiling and role sizes from the visible q shape."""
+    if os.getenv("MATE_MODEL1_DECODE_FORCE_BM64", "0").lower() in ("1", "true", "yes"):
+        return 64, 64, 256, 256, 128, 640
+    if num_heads_q <= 16:
+        return 16, 64, 256, 256, 128, 640
+    return 64, 64, 256, 256, 128, 640
 
 
 def _byte_view_k_cache(k_cache: torch.Tensor, name: str) -> torch.Tensor:
@@ -266,6 +276,15 @@ def _sparse_decode_model1(
             extra_topk_length=extra_topk_length,
         )
 
+    (
+        block_m,
+        block_i,
+        consumer0_threads,
+        consumer1_threads,
+        producer_threads,
+        threads,
+    ) = _model1_decode_schedule(num_heads_q)
+
     return _decode_model1(
         q,
         k_cache_nope,
@@ -283,6 +302,12 @@ def _sparse_decode_model1(
         sm_scale=softmax_scale,
         attn_sink=attn_sink,
         d_v=head_dim_v,
+        block_m=block_m,
+        block_i=block_i,
+        threads=threads,
+        consumer0_threads=consumer0_threads,
+        consumer1_threads=consumer1_threads,
+        producer_threads=producer_threads,
         page_block_size=k_cache.shape[1],
         extra_page_block_size=(
             extra_k_cache.shape[1] if extra_k_cache is not None else k_cache.shape[1]

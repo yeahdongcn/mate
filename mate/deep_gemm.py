@@ -1,8 +1,13 @@
-import functools
 import torch
 from typing import Tuple, Optional
 from mate.api_logging import mate_api
+from mate.mate_runtime import (
+    get_num_mps as get_num_mps,
+    resolve_num_mps,
+    set_num_mps as set_num_mps,
+)
 from mate.gemm import (
+    bmm_fp8,
     ragged_m_moe_gemm_16bit,
     masked_moe_gemm_16bit,
     ragged_k_moe_gemm_16bit,
@@ -11,27 +16,17 @@ from mate.gemm import (
     gemm_fp8_nt_groupwise,
     ragged_k_moe_gemm_8bit,
 )
-from mate.jit.deep_gemm_attention import (
-    get_deep_gemm_attention_module,
-    get_metadata_module,
+from mate.jit.gemm.deep_gemm.gemm import (
+    GEMM_TYPE_NORMAL,
+    get_deep_gemm_gemm_module,
 )
 from mate.jit.gemm.deep_gemm.hyperconnection import get_hyperconnection_module
+from mate.jit.gemm.deep_gemm.mqa_logits import get_mqa_logits_module
+from mate.jit.gemm.deep_gemm.paged_mqa_logits import (
+    get_paged_mqa_logits_metadata_module,
+    get_paged_mqa_logits_module,
+)
 from mate.jit.runtime import ffi_to_torch
-
-
-@functools.cache
-def _get_module():
-    return get_deep_gemm_attention_module()
-
-
-def _resolve_num_mps(device: torch.device, num_mps: int) -> int:
-    if num_mps > 0:
-        return num_mps
-
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.musa.current_device()
-    return torch.musa.get_device_properties(device_index).multi_processor_count
 
 
 def m_grouped_bf16_gemm_nt_contiguous(
@@ -40,6 +35,7 @@ def m_grouped_bf16_gemm_nt_contiguous(
     d: torch.Tensor,
     m_indices: torch.Tensor,
     alignment_m: int = 128,
+    backend: str = "auto",
 ):
     ragged_m_moe_gemm_16bit(
         a,
@@ -47,6 +43,7 @@ def m_grouped_bf16_gemm_nt_contiguous(
         m_indices,
         d,
         alignment_m=alignment_m,
+        backend=backend,
     )
 
 
@@ -59,6 +56,7 @@ def m_grouped_bf16_gemm_nt_masked(
     compiled_dims: str = "nk",
     enable_overlap: bool = False,
     signal: torch.Tensor = None,
+    backend: str = "auto",
 ):
     res = masked_moe_gemm_16bit(
         a,
@@ -68,6 +66,7 @@ def m_grouped_bf16_gemm_nt_masked(
         expect_tokens=expected_m,
         enable_overlap=enable_overlap,
         signal=signal,
+        backend=backend,
     )
 
     return res[2:] if enable_overlap else None
@@ -82,12 +81,19 @@ def m_grouped_fp8_gemm_nt_contiguous(
     compiled_dims: str = "nk",
     disable_ue8m0_cast: bool = True,
     alignment_m: int = 128,
+    backend: str = "auto",
 ):
     if not disable_ue8m0_cast:
         raise Exception("m_grouped_fp8_gemm_nt_contiguous UE8M0 cast is not supported!")
 
     ragged_m_moe_gemm_8bit(
-        a, b, m_indices, d, scale_granularity_mnk=recipe, alignment_m=alignment_m
+        a,
+        b,
+        m_indices,
+        d,
+        scale_granularity_mnk=recipe,
+        alignment_m=alignment_m,
+        backend=backend,
     )
 
 
@@ -102,6 +108,7 @@ def m_grouped_fp8_gemm_nt_masked(
     disable_ue8m0_cast: bool = True,
     enable_overlap: bool = False,
     signal: torch.Tensor = None,
+    backend: str = "auto",
 ):
     if not disable_ue8m0_cast:
         raise Exception("m_grouped_fp8_gemm_nt_masked UE8M0 cast is not supported!")
@@ -115,6 +122,7 @@ def m_grouped_fp8_gemm_nt_masked(
         expected_m,
         enable_overlap=enable_overlap,
         signal=signal,
+        backend=backend,
     )
 
     return res[2:] if enable_overlap else None
@@ -173,6 +181,34 @@ fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
 bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 
 
+def bf16_gemm_nt(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+    compiled_dims: str = "nk",
+    backend: str = "auto",
+):
+    assert c is None, "Not support GEMM with C"
+    if backend not in ("auto", "mutlass"):
+        raise ValueError(f"bf16_gemm_nt only supports mutlass backend, got {backend}")
+
+    dispatch_name, mod = get_deep_gemm_gemm_module(
+        kind="bf16",
+        gemm_type=GEMM_TYPE_NORMAL,
+        config_m=a.shape[0],
+    )
+    mod.get_function(dispatch_name)(
+        a,
+        b,
+        d,
+        None,
+        0,
+        resolve_num_mps(a.device),
+    )
+    return d
+
+
 def fp8_gemm_nt(
     a: Tuple[torch.Tensor, torch.Tensor],
     b: Tuple[torch.Tensor, torch.Tensor],
@@ -181,12 +217,156 @@ def fp8_gemm_nt(
     recipe: Optional[Tuple[int, int, int]] = None,
     compiled_dims: str = "nk",
     disable_ue8m0_cast: bool = True,
+    backend: str = "auto",
 ):
     assert c is None, "Not support GEMM with C"
+    if not disable_ue8m0_cast:
+        raise Exception("fp8_gemm_nt UE8M0 cast is not supported!")
 
-    return gemm_fp8_nt_groupwise(
-        a[0], b[0], a[1], b[1], scale_granularity_mnk=recipe, out=d
+    if backend in ("auto", "mudnn"):
+        return gemm_fp8_nt_groupwise(
+            a[0],
+            b[0],
+            a[1],
+            b[1],
+            scale_granularity_mnk=recipe,
+            out=d,
+            backend=backend,
+        )
+    if backend != "mutlass":
+        raise ValueError(f"Unsupported fp8_gemm_nt backend: {backend}")
+
+    dispatch_name, mod = get_deep_gemm_gemm_module(
+        kind="fp8",
+        gemm_type=GEMM_TYPE_NORMAL,
+        config_m=a[0].shape[0],
     )
+    mod.get_function(dispatch_name)(
+        a[0],
+        a[1],
+        b[0],
+        b[1],
+        d,
+        None,
+        0,
+        resolve_num_mps(a[0].device),
+    )
+    return d
+
+
+def _validate_fp8_einsum_pair(
+    name: str, value: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(value, tuple) or len(value) != 2:
+        raise TypeError(f"{name} must be a tuple of (fp8_tensor, scale_tensor)")
+    tensor, scale = value
+    if tensor.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(f"{name}[0] must be an FP8 tensor")
+    if scale.dtype != torch.float32:
+        raise ValueError(f"{name}[1] must be a float32 scale tensor")
+    if tensor.device != scale.device:
+        raise ValueError(f"{name}[0] and {name}[1] must be on the same device")
+    return tensor, scale
+
+
+@mate_api
+def fp8_einsum(
+    expr: str,
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+    recipe: Tuple[int, int, int] = (1, 128, 128),
+) -> None:
+    r"""DeepGEMM-compatible FP8 einsum.
+
+    Supported expressions are ``"bhr,hdr->bhd"``, ``"bhd,hdr->bhr"``, and
+    ``"bhd,bhr->hdr"``. The quantization recipe must be ``(1, 128, 128)`` or
+    ``(1, 1, 128)``.
+    """
+    recipe_values = tuple(int(x) for x in recipe)
+    if len(recipe_values) != 3:
+        raise ValueError("fp8_einsum recipe must be a 3-tuple")
+    recipe = (recipe_values[0], recipe_values[1], recipe_values[2])
+    if recipe not in ((1, 128, 128), (1, 1, 128)):
+        raise ValueError("fp8_einsum only supports recipe (1, 128, 128) or (1, 1, 128)")
+
+    a_fp8, a_scale = _validate_fp8_einsum_pair("a", a)
+    b_fp8, b_scale = _validate_fp8_einsum_pair("b", b)
+    if a_fp8.device != b_fp8.device or a_fp8.device != d.device:
+        raise ValueError("a, b and d must be on the same device")
+    if c is not None:
+        if c.device != d.device:
+            raise ValueError("c must be on the same device as d")
+        if c.dtype != torch.float32 or d.dtype != torch.float32:
+            raise ValueError("fp8_einsum with c expects fp32 c and d tensors")
+
+    if expr == "bhr,hdr->bhd":
+        if a_fp8.dim() != 3 or b_fp8.dim() != 3 or d.dim() != 3:
+            raise ValueError("fp8_einsum('bhr,hdr->bhd') expects 3D tensors")
+        batch, heads, r_dim = a_fp8.shape
+        h_b, d_dim, r_b = b_fp8.shape
+        if heads != h_b or r_dim != r_b or tuple(d.shape) != (batch, heads, d_dim):
+            raise ValueError("expected a[b,h,r], b[h,d,r] and d[b,h,d]")
+        c_view = c.permute(1, 0, 2) if c is not None else None
+        bmm_fp8(
+            a_fp8.permute(1, 0, 2),
+            b_fp8,
+            a_scale.permute(1, 0, 2),
+            b_scale,
+            d.dtype,
+            out=d.permute(1, 0, 2),
+            scale_granularity_mnk=recipe,
+            c=c_view,
+            major_a_mode="K",
+            major_b_mode="K",
+        )
+        return None
+
+    if expr == "bhd,hdr->bhr":
+        if a_fp8.dim() != 3 or b_fp8.dim() != 3 or d.dim() != 3:
+            raise ValueError("fp8_einsum('bhd,hdr->bhr') expects 3D tensors")
+        batch, heads, d_dim = a_fp8.shape
+        h_b, d_b, r_dim = b_fp8.shape
+        if heads != h_b or d_dim != d_b or tuple(d.shape) != (batch, heads, r_dim):
+            raise ValueError("expected a[b,h,d], b[h,d,r] and d[b,h,r]")
+        c_view = c.permute(1, 0, 2) if c is not None else None
+        bmm_fp8(
+            a_fp8.permute(1, 0, 2),
+            b_fp8,
+            a_scale.permute(1, 0, 2),
+            b_scale,
+            d.dtype,
+            out=d.permute(1, 0, 2),
+            scale_granularity_mnk=recipe,
+            c=c_view,
+            major_a_mode="K",
+            major_b_mode="N",
+        )
+        return None
+
+    if expr == "bhd,bhr->hdr":
+        if a_fp8.dim() != 3 or b_fp8.dim() != 3 or d.dim() != 3:
+            raise ValueError("fp8_einsum('bhd,bhr->hdr') expects 3D tensors")
+        batch, heads, d_dim = a_fp8.shape
+        b_batch, h_b, r_dim = b_fp8.shape
+        if batch != b_batch or heads != h_b or tuple(d.shape) != (heads, d_dim, r_dim):
+            raise ValueError("expected a[b,h,d], b[b,h,r] and d[h,d,r]")
+        bmm_fp8(
+            a_fp8.permute(1, 0, 2),
+            b_fp8.permute(1, 0, 2),
+            a_scale.permute(1, 0, 2),
+            b_scale.permute(1, 0, 2),
+            d.dtype,
+            out=d,
+            scale_granularity_mnk=recipe,
+            c=c,
+            major_a_mode="M",
+            major_b_mode="N",
+        )
+        return None
+
+    raise ValueError(f"Unsupported fp8_einsum expression: {expr}")
 
 
 @mate_api
@@ -209,14 +389,14 @@ def get_paged_mqa_logits_metadata(
     Tensor
         Schedule metadata, shape ``(num_mps + 1, 2)``
     """
-    num_mps = _resolve_num_mps(context_lens.device, num_mps)
+    num_mps = resolve_num_mps(context_lens.device, num_mps)
     schedule_meta = torch.empty(
         (num_mps + 1, 2), device=context_lens.device, dtype=torch.int32
     )
     batch_size = context_lens.shape[0]
-    get_metadata_module(batch_size).get_function("get_paged_mqa_logits_metadata")(
-        context_lens, block_kv, schedule_meta
-    )
+    get_paged_mqa_logits_metadata_module(batch_size).get_function(
+        "get_paged_mqa_logits_metadata"
+    )(context_lens, block_kv, schedule_meta)
     return schedule_meta
 
 
@@ -269,8 +449,20 @@ def fp8_paged_mqa_logits(
     Tensor
         FP32 logits, shape ``(batch_size * next_n, max_context_len)``
     """
+    next_n = q.shape[1]
+    num_heads = q.shape[2]
+    head_dim = q.shape[3]
+    block_kv = fused_kv_cache.shape[1]
+    is_context_lens_2d = context_lens.dim() == 2
+
     return ffi_to_torch(
-        _get_module().get_function("fp8_paged_mqa_logits")(
+        get_paged_mqa_logits_module(
+            next_n,
+            num_heads,
+            head_dim,
+            block_kv,
+            is_context_lens_2d,
+        ).get_function("fp8_paged_mqa_logits")(
             q,
             fused_kv_cache,
             weights,
@@ -336,8 +528,23 @@ def fp8_mqa_logits(
     kv_fp8, kv_scale = kv
     if max_seqlen_k > 0 and clean_logits:
         raise ValueError("max_seqlen_k is not supported with clean_logits")
+
+    seq_len = q.shape[0]
+    seq_len_kv = kv_fp8.shape[0]
+    num_heads = q.shape[1]
+    head_dim = q.shape[2]
+    compressed_logits = max_seqlen_k > 0
+    num_mps = resolve_num_mps(q.device)
+
     return ffi_to_torch(
-        _get_module().get_function("fp8_mqa_logits")(
+        get_mqa_logits_module(
+            seq_len,
+            seq_len_kv,
+            num_heads,
+            head_dim,
+            compressed_logits,
+            num_mps,
+        ).get_function("fp8_mqa_logits")(
             q,
             kv_fp8,
             weights,
@@ -385,7 +592,7 @@ def tf32_hc_prenorm_gemm(
     m = a.shape[0]
     n = b.shape[0]
     num_splits = 1 if num_splits is None or num_splits <= 1 else int(num_splits)
-    num_mps = _resolve_num_mps(a.device, 0)
+    num_mps = resolve_num_mps(a.device)
 
     get_hyperconnection_module(m, n, num_splits, num_mps).get_function(
         "tf32_hc_prenorm_gemm"

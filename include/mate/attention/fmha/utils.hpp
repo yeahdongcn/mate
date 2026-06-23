@@ -115,7 +115,8 @@ MUTE_HOST_DEVICE int round_up_headdim(int headdim) {
 }
 
 MUTE_HOST_DEVICE int div_floor(mutlass::FastDivmod const& divmod, int dividend) {
-  return dividend >= 0 ? divmod.divide(dividend) : -1 - divmod.divide(-1 - dividend);
+  int const sign = -static_cast<int>(static_cast<unsigned>(dividend) >> 31);
+  return divmod.divide(dividend ^ sign) ^ sign;
 }
 
 MUTE_HOST_DEVICE int div_ceil(mutlass::FastDivmod const& divmod, int dividend) {

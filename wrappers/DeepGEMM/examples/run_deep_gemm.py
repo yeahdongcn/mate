@@ -18,7 +18,7 @@ def run_fp8_grouped_gemm_example():
     ms_per_group = [512, 768]
     n = 1024
     k = 1024
-    alignment_m = 128
+    alignment_m = deep_gemm.get_mk_alignment_for_contiguous_layout()
     out_dtype = torch.bfloat16
 
     quant_tile = 128

@@ -144,6 +144,8 @@ struct FmhaFwdParams {
 
   int window_size_left, window_size_right;
   int attention_chunk;
+
+  bool is_fp8;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const FmhaFwdParams& p) {

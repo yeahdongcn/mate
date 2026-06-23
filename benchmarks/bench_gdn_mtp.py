@@ -9,8 +9,15 @@ from mate.testing.utils import bench_kineto
 
 
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
-DEFAULT_SEQ_LENS = (2, 3, 4, 8)
-DEFAULT_HEAD_CONFIGS = ("8, 16", "16,32", "16, 48", "16, 64")
+DEFAULT_SEQ_LENS = (2, 3)
+DEFAULT_HEAD_CONFIGS = (
+    "2,8",
+    "4,8",
+    "16,16",
+    "16,32",
+    "16,48",
+    "16,64",
+)
 KERNEL_NAME = "gated_deltanet_mtp_fp32_vk_smem"
 
 
@@ -176,6 +183,7 @@ def _make_runner(
         num_v_heads=num_v_heads,
         v_dim=head_size,
         cache_intermediate_states=cache_intermediate_states,
+        state_dtype=state_dtype,
     )
     tile_v = default_tile_v if tile_v_override is None else tile_v_override
     ilp_rows = default_ilp_rows if ilp_rows_override is None else ilp_rows_override
@@ -199,6 +207,14 @@ def _make_runner(
         use_identity_state_indices=False,
         tile_v=tile_v,
         ilp_rows=ilp_rows,
+        disable_index_type_promotion=mtp_backend._should_disable_index_type_promotion(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_v_heads=num_v_heads,
+            state_dtype=state_dtype,
+            cache_intermediate_states=cache_intermediate_states,
+            disable_state_update=disable_state_update,
+        ),
     )
     kernel_fn = mtp_backend._get_mtp_fp32_vk_smem_kernel(
         cache_intermediate_states=cache_intermediate_states,
@@ -271,7 +287,7 @@ def main():
     parser.add_argument(
         "--state-dtype",
         choices=["fp32", "bf16"],
-        default="fp32",
+        default="bf16",
         help="State and intermediate-state buffer dtype.",
     )
     parser.add_argument("--num-tests", type=int, default=10)
@@ -298,7 +314,8 @@ def main():
     )
     parser.add_argument(
         "--cache-intermediate-states",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Cache intermediate states.",
     )
     parser.add_argument(

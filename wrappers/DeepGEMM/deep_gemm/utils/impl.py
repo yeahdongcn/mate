@@ -1,39 +1,38 @@
-import torch
 from typing import Optional
 
-_num_sms: Optional[int] = None
-__all__ = ["get_num_sms", "set_num_sms", "get_tc_util", "set_tc_util"]
+import torch
 
+from mate.mate_runtime import (
+    get_num_mps,
+    resolve_num_mps,
+    set_num_mps,
+)
 
-def get_num_sms() -> int:
-    """Return the effective SM count for kernel dispatch.
-
-    Returns the value set by set_num_sms() if called,
-    otherwise returns the physical SM count of the current device.
-    """
-    if _num_sms is not None:
-        return _num_sms
-    return torch.musa.get_device_properties(
-        torch.musa.current_device()
-    ).multi_processor_count
-
-
-def set_num_sms(num: Optional[int]) -> None:
-    """Limit the maximum SM count available to kernel dispatch.
-
-    Pass None to reset to device default.
-
-    NOTE: Currently a stub. To take effect requires plumbing through
-    to the C++ kernel launch layer. Tracked as a follow-up task.
-    """
-    global _num_sms
-    assert num is None or (isinstance(num, int) and num > 0), (
-        f"num_sms must be a positive int or None, got {num}"
-    )
-    _num_sms = num
+__all__ = [
+    "get_num_sms",
+    "resolve_num_sms",
+    "set_num_sms",
+    "get_tc_util",
+    "set_tc_util",
+]
 
 
 _tc_util: float = 1.0
+
+
+def get_num_sms() -> int:
+    """Return the effective SM count using DeepGEMM compatibility terminology."""
+    return get_num_mps()
+
+
+def resolve_num_sms(device: Optional[torch.device] = None) -> int:
+    """Return the effective SM count using DeepGEMM compatibility terminology."""
+    return resolve_num_mps(device)
+
+
+def set_num_sms(num: Optional[int]) -> None:
+    """Set the effective SM count using DeepGEMM compatibility terminology."""
+    set_num_mps(num)
 
 
 def get_tc_util() -> float:

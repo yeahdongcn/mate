@@ -4,6 +4,7 @@ import pytest
 
 import mate
 import mate.gemm
+from mate.utils import ceil_div
 from mate.testing.utils import (
     tensor_quantize_fp8,
     group_quantize_fp8,
@@ -65,7 +66,7 @@ def test_bmm_fp8(
         with torch.musa.graph(g):
             mate.gemm.bmm_fp8(
                 fp8_a,
-                fp8_b.transpose(-2, -1),
+                fp8_b,
                 scale_a,
                 scale_b,
                 out_dtype,
@@ -103,7 +104,7 @@ def test_bmm_fp8(
 
         mate.gemm.bmm_fp8(
             fp8_a,
-            fp8_b.transpose(-2, -1),
+            fp8_b,
             scale_a,
             scale_b,
             out_dtype,
@@ -113,6 +114,101 @@ def test_bmm_fp8(
         )
 
     torch.testing.assert_close(d.float(), ref_d, rtol=5e-3, atol=5e-3)
+
+
+def _make_groupwise_bmm_inputs(batch, m, n, k, recipe):
+    a = torch.rand((batch, m, k), device="musa", dtype=torch.float)
+    b = torch.rand((batch, n, k), device="musa", dtype=torch.float)
+    _, scale_granularity_n, scale_granularity_k = recipe
+
+    fp8_a, scale_a = group_quantize_fp8(
+        a,
+        (batch, m, ceil_div(k, scale_granularity_k)),
+        (1, 1, scale_granularity_k),
+        torch.float8_e4m3fn,
+        "K",
+    )
+    fp8_b, scale_b = group_quantize_fp8(
+        b,
+        (
+            batch,
+            ceil_div(n, scale_granularity_n),
+            ceil_div(k, scale_granularity_k),
+        ),
+        (1, scale_granularity_n, scale_granularity_k),
+        torch.float8_e4m3fn,
+        "K",
+    )
+    return fp8_a, scale_a, fp8_b, scale_b
+
+
+def _a_arg_for_major(fp8_a, major_a_mode):
+    return fp8_a if major_a_mode == "K" else fp8_a.transpose(-2, -1).contiguous()
+
+
+def _b_arg_for_major(fp8_b, major_b_mode):
+    return fp8_b.transpose(-2, -1).contiguous() if major_b_mode == "N" else fp8_b
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("recipe", [(1, 128, 128), (1, 1, 128)])
+@pytest.mark.parametrize("major_a_mode", ["K", "M"])
+@pytest.mark.parametrize("major_b_mode", ["N", "K"])
+def test_bmm_fp8_groupwise_recipes(recipe, major_a_mode, major_b_mode):
+    batch, m, n, k = 2, 128, 256, 384
+    fp8_a, scale_a, fp8_b, scale_b = _make_groupwise_bmm_inputs(batch, m, n, k, recipe)
+
+    a_arg = _a_arg_for_major(fp8_a, major_a_mode)
+    b_arg = _b_arg_for_major(fp8_b, major_b_mode)
+
+    d = torch.empty((batch, m, n), device="musa", dtype=torch.bfloat16)
+    ref_d = torch.bmm(
+        group_dequantize_fp8(fp8_a, scale_a, "K"),
+        group_dequantize_fp8(fp8_b, scale_b, "K").transpose(-2, -1),
+    )
+
+    mate.gemm.bmm_fp8(
+        a_arg,
+        b_arg,
+        scale_a,
+        scale_b,
+        torch.bfloat16,
+        d,
+        "mudnn",
+        recipe,
+        major_a_mode=major_a_mode,
+        major_b_mode=major_b_mode,
+    )
+
+    torch.testing.assert_close(d.float(), ref_d, rtol=5e-3, atol=5e-3)
+
+
+@supported_musa_compute_capability([31])
+def test_bmm_fp8_groupwise_fp32_accumulate_with_c():
+    batch, m, n, k = 2, 128, 128, 128
+    recipe = (1, 1, 128)
+    fp8_a, scale_a, fp8_b, scale_b = _make_groupwise_bmm_inputs(batch, m, n, k, recipe)
+    c = torch.randn((batch, m, n), device="musa", dtype=torch.float32)
+    d = torch.empty_like(c)
+
+    ref_d = c + torch.bmm(
+        group_dequantize_fp8(fp8_a, scale_a, "K"),
+        group_dequantize_fp8(fp8_b, scale_b, "K").transpose(-2, -1),
+    )
+
+    mate.gemm.bmm_fp8(
+        fp8_a,
+        fp8_b,
+        scale_a,
+        scale_b,
+        torch.float32,
+        d,
+        "mudnn",
+        recipe,
+        c=c,
+    )
+
+    torch.testing.assert_close(d, ref_d, rtol=5e-3, atol=5e-3)
 
 
 @supported_musa_compute_capability([31])
@@ -170,7 +266,7 @@ def test_bmm_fp8_not_contiguous_output(
 
     mate.gemm.bmm_fp8(
         fp8_a,
-        fp8_b.transpose(-2, -1),
+        fp8_b,
         scale_a,
         scale_b,
         out_dtype,

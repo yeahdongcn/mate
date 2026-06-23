@@ -3,9 +3,12 @@
 #include <mutlass/fast_math.h>
 #include <tvm/ffi/extra/musa/base.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <mute/int_tuple.hpp>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 #include "musa.h"
 #include "musa_runtime.h"
@@ -59,6 +62,19 @@ struct TmeDesc {
 
   TmeDesc() = default;
 
+  static uint64_t desc_byte_stride(uint64_t stride, int element_size) {
+    TVM_FFI_ICHECK_GT(element_size, 0) << "TME element size must be positive";
+    return stride * static_cast<uint64_t>(element_size);
+  }
+
+  template <typename T>
+  static uint64_t checked_desc_extent(T value, const char* name) {
+    if constexpr (std::is_signed_v<T>) {
+      TVM_FFI_ICHECK_GE(value, static_cast<T>(0)) << name << " must be non-negative";
+    }
+    return static_cast<uint64_t>(value);
+  }
+
   TmeDesc(const std::vector<uint64_t>& dims,
           const std::vector<uint64_t>& strides,
           void*                        ptr,
@@ -67,14 +83,15 @@ struct TmeDesc {
           uint64_t                     oob_constant_fill = 0) {
     auto rank = dims.size();
 
-    assert(rank > 0);
-    assert(rank <= 5);
-    assert((int)strides.size() == rank - 1);
+    TVM_FFI_ICHECK_GT(rank, 0) << "TmeDesc dims must be non-empty";
+    TVM_FFI_ICHECK_LE(rank, 5) << "TmeDesc rank must be <= 5";
+    TVM_FFI_ICHECK_EQ(strides.size(), rank - 1) << "TmeDesc strides must have rank - 1 entries";
 
-    uint64_t desc_strides[4]{};
+    uint64_t  desc_strides[4]{};
+    const int element_size = get_data_type_size(tensor_dtype);
 
     for (size_t i = 0; i < rank - 1; ++i) {
-      desc_strides[i] = strides[i] * get_data_type_size(tensor_dtype);
+      desc_strides[i] = desc_byte_stride(strides[i], element_size);
     }
     MATE_MUSA_DRIVER_CHECK(muTensorDescriptorEncode(
         &desc, tensor_dtype, rank, ptr, dims.data(), desc_strides, interleave, oob_constant_fill));
@@ -94,11 +111,15 @@ struct TmeDesc {
     static_assert(int(dim_rank) > 0, "TmeDesc Dim must be > 0");
     static_assert(int(dim_rank) == int(stride_rank) + 1, "TmeDesc Dim and Stride must match!");
 
-    uint64_t desc_dims[dim_rank]{};
-    uint64_t desc_strides[stride_rank]{};
-    mute::for_each(mute::make_seq<dim_rank>{}, [&](auto i) { desc_dims[i] = mute::get<i>(dim); });
-    mute::for_each(mute::make_seq<stride_rank>{},
-                   [&](auto i) { desc_strides[i] = mute::get<i>(stride) * get_data_type_size(tensor_dtype); });
+    uint64_t  desc_dims[dim_rank]{};
+    uint64_t  desc_strides[stride_rank]{};
+    const int element_size = get_data_type_size(tensor_dtype);
+    mute::for_each(mute::make_seq<dim_rank>{},
+                   [&](auto i) { desc_dims[i] = checked_desc_extent(mute::get<i>(dim), "TME dim"); });
+    mute::for_each(mute::make_seq<stride_rank>{}, [&](auto i) {
+      const auto stride_elem = checked_desc_extent(mute::get<i>(stride), "TME stride");
+      desc_strides[i]        = desc_byte_stride(stride_elem, element_size);
+    });
 
     MATE_MUSA_DRIVER_CHECK(muTensorDescriptorEncode(
         &desc, tensor_dtype, dim_rank, ptr, desc_dims, desc_strides, interleave, oob_constant_fill));

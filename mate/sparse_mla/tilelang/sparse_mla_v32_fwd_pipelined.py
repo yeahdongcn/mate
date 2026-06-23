@@ -604,7 +604,7 @@ def sparse_attention_fwd_kernel(
                         kperm_indices_local[r] = T.if_then_else(
                             kperm_mask_local[r],
                             kperm_indices_local[r],
-                            (seq_len_kv * kv_group * (dim + tail_dim)) * 2 + 1,
+                            seq_len_kv,
                         )
 
                     T.barrier_wait(bar_kv0_free, (i_i & 1) ^ 1)

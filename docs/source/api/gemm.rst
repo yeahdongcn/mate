@@ -3,6 +3,10 @@
 GEMM
 =========
 
+For framework integrations that already target DeepGEMM style Python APIs,
+prefer the ``deep-gemm`` wrapper first. Use the MATE APIs below when wrapper
+coverage is not enough.
+
 MoE GEMM
 -------------------------
 

@@ -185,17 +185,23 @@ def test_fa_interface(
 
     # ckv&kpe should be contiguous
     kv_concat = torch.cat([ckv, kpe], dim=-1)
+    use_flash_mla_asm = num_heads == 128
+    k_cache = kv_concat[:, :, head_dim_ckv:]
+    v_cache = kv_concat[:, :, :head_dim_ckv]
+    if not use_flash_mla_asm:
+        k_cache = k_cache.unsqueeze(2)
+        v_cache = v_cache.unsqueeze(2)
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, device=device, dtype=torch.uint8)
 
     scheduler_metadata = None
 
-    if schedule_mode == "inited":
+    if use_flash_mla_asm and schedule_mode == "inited":
         # Used to init schedule info
         flash_attn_with_kvcache(
             q_pe,
-            kv_concat[:, :, head_dim_ckv:],
-            kv_concat[:, :, :head_dim_ckv],
+            k_cache,
+            v_cache,
             qv=q_nope,
             cache_seqlens=kv_lens,
             page_table=page_table,
@@ -205,13 +211,13 @@ def test_fa_interface(
             return_softmax_lse=True,
         )
         scheduler_metadata = (workspace_buffer, True)
-    elif schedule_mode == "uninited":
+    elif use_flash_mla_asm and schedule_mode == "uninited":
         scheduler_metadata = (workspace_buffer, False)
 
     o, lse, *rest = flash_attn_with_kvcache(
         q_pe,
-        kv_concat[:, :, head_dim_ckv:],
-        kv_concat[:, :, :head_dim_ckv],
+        k_cache,
+        v_cache,
         qv=q_nope,
         cache_seqlens=kv_lens,
         page_table=page_table,
@@ -220,6 +226,8 @@ def test_fa_interface(
         scheduler_metadata=scheduler_metadata,
         return_softmax_lse=True,
     )
+    if not use_flash_mla_asm:
+        lse = lse.transpose(1, 2).contiguous()
 
     atol, rtol = 1.5e-2, 1e-2
     torch.testing.assert_close(o, o_ref, atol=atol, rtol=rtol)
@@ -382,8 +390,12 @@ def test_mla_decode_varlen(
     o_ref, lse_ref = attention_ref_varlen(
         q, k, v, kv_lens, cu_seqlens_q, page_table, is_causal, sm_scale
     )
-    workspace_buffer = torch.zeros(128 * 1024 * 1024, device=device, dtype=torch.uint8)
-    scheduler_metadata = (workspace_buffer, False)
+    scheduler_metadata = None
+    if num_heads_q == 128:
+        workspace_buffer = torch.zeros(
+            128 * 1024 * 1024, device=device, dtype=torch.uint8
+        )
+        scheduler_metadata = (workspace_buffer, False)
     o, lse, *rest = flash_attn_with_kvcache(
         q=q_pe,
         k_cache=kv_concat[..., head_dim_ckv:],
@@ -524,10 +536,12 @@ def test_mla_q_not_contig(
             is_causal,
         )
     else:
-        workspace_buffer = torch.zeros(
-            128 * 1024 * 1024, device=device, dtype=torch.uint8
-        )
-        scheduler_metadata = (workspace_buffer, False)
+        scheduler_metadata = None
+        if num_heads_q == 128:
+            workspace_buffer = torch.zeros(
+                128 * 1024 * 1024, device=device, dtype=torch.uint8
+            )
+            scheduler_metadata = (workspace_buffer, False)
         o, lse, *rest = flash_attn_with_kvcache(
             q=q_pe,
             k_cache=kv_concat[..., head_dim_ckv:],

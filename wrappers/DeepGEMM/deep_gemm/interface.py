@@ -2,6 +2,7 @@ import torch
 from typing import Optional, Tuple
 
 from mate.deep_gemm import (
+    fp8_einsum as mate_fp8_einsum,
     fp8_mqa_logits as mate_fp8_mqa_logits,
     fp8_paged_mqa_logits as mate_fp8_paged_mqa_logits,
     get_paged_mqa_logits_metadata as mate_get_paged_mqa_logits_metadata,
@@ -16,6 +17,7 @@ from mate.gemm import (
     ragged_m_moe_gemm_16bit,
     ragged_m_moe_gemm_8bit,
 )
+from .utils import get_mk_alignment_for_contiguous_layout
 
 
 def bf16_gemm_nt(
@@ -63,14 +65,19 @@ def m_grouped_bf16_gemm_nt_contiguous(
     b: torch.Tensor,
     d: torch.Tensor,
     m_indices: torch.Tensor,
-    alignment_m: int = 128,
+    alignment_m: Optional[int] = None,
+    backend: str = "auto",
 ):
+    if alignment_m is None:
+        alignment_m = get_mk_alignment_for_contiguous_layout()
+
     ragged_m_moe_gemm_16bit(
         a,
         b,
         m_indices,
         d,
         alignment_m=alignment_m,
+        backend=backend,
     )
 
 
@@ -83,6 +90,7 @@ def m_grouped_bf16_gemm_nt_masked(
     compiled_dims: str = "nk",
     enable_overlap: bool = False,
     signal: torch.Tensor = None,
+    backend: str = "auto",
 ):
     res = masked_moe_gemm_16bit(
         a,
@@ -92,6 +100,7 @@ def m_grouped_bf16_gemm_nt_masked(
         expect_tokens=expected_m,
         enable_overlap=enable_overlap,
         signal=signal,
+        backend=backend,
     )
 
     return res[2:] if enable_overlap else None
@@ -105,13 +114,22 @@ def m_grouped_fp8_gemm_nt_contiguous(
     recipe: Optional[Tuple[int, int, int]] = None,
     compiled_dims: str = "nk",
     disable_ue8m0_cast: bool = True,
-    alignment_m: int = 128,
+    alignment_m: Optional[int] = None,
+    backend: str = "auto",
 ):
     if not disable_ue8m0_cast:
         raise Exception("m_grouped_fp8_gemm_nt_contiguous UE8M0 cast is not supported!")
+    if alignment_m is None:
+        alignment_m = get_mk_alignment_for_contiguous_layout()
 
     ragged_m_moe_gemm_8bit(
-        a, b, m_indices, d, scale_granularity_mnk=recipe, alignment_m=alignment_m
+        a,
+        b,
+        m_indices,
+        d,
+        scale_granularity_mnk=recipe,
+        alignment_m=alignment_m,
+        backend=backend,
     )
 
 
@@ -126,6 +144,7 @@ def m_grouped_fp8_gemm_nt_masked(
     disable_ue8m0_cast: bool = True,
     enable_overlap: bool = False,
     signal: torch.Tensor = None,
+    backend: str = "auto",
 ):
     if not disable_ue8m0_cast:
         raise Exception("m_grouped_fp8_gemm_nt_masked UE8M0 cast is not supported!")
@@ -139,6 +158,7 @@ def m_grouped_fp8_gemm_nt_masked(
         expected_m,
         enable_overlap=enable_overlap,
         signal=signal,
+        backend=backend,
     )
 
     return res[2:] if enable_overlap else None
@@ -184,6 +204,17 @@ def fp8_gemm_nt(
     return gemm_fp8_nt_groupwise(
         a[0], b[0], a[1], b[1], scale_granularity_mnk=recipe, out=d
     )
+
+
+def fp8_einsum(
+    expr: str,
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+    recipe: Tuple[int, int, int] = (1, 128, 128),
+):
+    return mate_fp8_einsum(expr, a, b, d, c=c, recipe=recipe)
 
 
 def tf32_hc_prenorm_gemm(

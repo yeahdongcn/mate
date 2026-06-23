@@ -15,6 +15,111 @@ from mate.testing.utils import (
 from mate.testing import supported_musa_compute_capability
 
 
+def _quantize_einsum_a(x: torch.Tensor):
+    return group_quantize_fp8(
+        x,
+        (*x.shape[:-1], ceil_div(x.size(-1), 128)),
+        (*([1] * (x.dim() - 1)), 128),
+        torch.float8_e4m3fn,
+        "K",
+    )
+
+
+def _quantize_einsum_b_nk(x: torch.Tensor, recipe):
+    _, scale_granularity_n, scale_granularity_k = recipe
+    return group_quantize_fp8(
+        x,
+        (
+            x.size(0),
+            ceil_div(x.size(1), scale_granularity_n),
+            ceil_div(x.size(2), scale_granularity_k),
+        ),
+        (1, scale_granularity_n, scale_granularity_k),
+        torch.float8_e4m3fn,
+        "K",
+    )
+
+
+def _quantize_einsum_batch_k(x: torch.Tensor):
+    return group_quantize_fp8(
+        x,
+        (ceil_div(x.size(0), 128), x.size(1), x.size(2)),
+        (128, 1, 1),
+        torch.float8_e4m3fn,
+        "K",
+    )
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("recipe", [(1, 128, 128), (1, 1, 128)])
+def test_fp8_einsum_bhr_hdr_bhd(recipe):
+    batch, heads, r_dim, d_dim = 4, 2, 128, 256
+    x = torch.rand((batch, heads, r_dim), device="musa", dtype=torch.float32)
+    y = torch.rand((heads, d_dim, r_dim), device="musa", dtype=torch.float32)
+    x_fp8, x_scale = _quantize_einsum_a(x)
+    y_fp8, y_scale = _quantize_einsum_b_nk(y, recipe)
+    out = torch.empty((batch, heads, d_dim), device="musa", dtype=torch.bfloat16)
+
+    ref = torch.einsum(
+        "bhr,hdr->bhd",
+        group_dequantize_fp8(x_fp8, x_scale, "K"),
+        group_dequantize_fp8(y_fp8, y_scale, "K"),
+    )
+
+    mate.deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd", (x_fp8, x_scale), (y_fp8, y_scale), out, recipe=recipe
+    )
+
+    torch.testing.assert_close(out.float(), ref, rtol=5e-3, atol=5e-3)
+
+
+@supported_musa_compute_capability([31])
+def test_fp8_einsum_bhd_hdr_bhr():
+    batch, heads, d_dim, r_dim = 4, 2, 128, 256
+    recipe = (1, 128, 128)
+    x = torch.rand((batch, heads, d_dim), device="musa", dtype=torch.float32)
+    y = torch.rand((heads, d_dim, r_dim), device="musa", dtype=torch.float32)
+    x_fp8, x_scale = _quantize_einsum_a(x)
+    y_fp8, y_scale = _quantize_einsum_b_nk(y, recipe)
+    out = torch.empty((batch, heads, r_dim), device="musa", dtype=torch.bfloat16)
+
+    ref = torch.einsum(
+        "bhd,hdr->bhr",
+        group_dequantize_fp8(x_fp8, x_scale, "K"),
+        group_dequantize_fp8(y_fp8, y_scale, "K"),
+    )
+
+    mate.deep_gemm.fp8_einsum(
+        "bhd,hdr->bhr", (x_fp8, x_scale), (y_fp8, y_scale), out, recipe=recipe
+    )
+
+    torch.testing.assert_close(out.float(), ref, rtol=5e-3, atol=5e-3)
+
+
+@supported_musa_compute_capability([31])
+def test_fp8_einsum_bhd_bhr_hdr_with_c():
+    batch, heads, d_dim, r_dim = 128, 2, 128, 128
+    recipe = (1, 1, 128)
+    x = torch.rand((batch, heads, d_dim), device="musa", dtype=torch.float32)
+    y = torch.rand((batch, heads, r_dim), device="musa", dtype=torch.float32)
+    x_fp8, x_scale = _quantize_einsum_batch_k(x)
+    y_fp8, y_scale = _quantize_einsum_batch_k(y)
+    out = torch.randn((heads, d_dim, r_dim), device="musa", dtype=torch.float32)
+    c = out.clone()
+
+    ref = c + torch.einsum(
+        "bhd,bhr->hdr",
+        group_dequantize_fp8(x_fp8, x_scale, "K"),
+        group_dequantize_fp8(y_fp8, y_scale, "K"),
+    )
+
+    mate.deep_gemm.fp8_einsum(
+        "bhd,bhr->hdr", (x_fp8, x_scale), (y_fp8, y_scale), out, c, recipe=recipe
+    )
+
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
+
+
 def kv_cache_cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
     num_blocks, block_size, num_heads, head_dim = x.shape
     assert num_heads == 1
@@ -275,8 +380,9 @@ def get_deepgemm_group_gemm_contig_cases():
 @pytest.mark.parametrize("b_fp8_type", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("alignment_m", [128, 256])
+@pytest.mark.parametrize("backend", ["mubin", "mutlass"])
 def test_m_grouped_fp8_gemm_nt_contiguous(
-    ms_per_group, n, k, a_fp8_type, b_fp8_type, out_dtype, alignment_m
+    ms_per_group, n, k, a_fp8_type, b_fp8_type, out_dtype, alignment_m, backend
 ):
     quant_tile = 128
     scale_granularity_mnk = (1, quant_tile, quant_tile)
@@ -321,6 +427,7 @@ def test_m_grouped_fp8_gemm_nt_contiguous(
         m_indices,
         scale_granularity_mnk,
         alignment_m=alignment_m,
+        backend=backend,
     )
 
     d = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
@@ -333,7 +440,10 @@ def test_m_grouped_fp8_gemm_nt_contiguous(
 @pytest.mark.parametrize("k", [2048])
 @pytest.mark.parametrize("data_type", [torch.bfloat16])
 @pytest.mark.parametrize("alignment_m", [128, 256])
-def test_m_grouped_bf16_gemm_nt_contiguous(ms_per_group, n, k, data_type, alignment_m):
+@pytest.mark.parametrize("backend", ["mubin", "mutlass"])
+def test_m_grouped_bf16_gemm_nt_contiguous(
+    ms_per_group, n, k, data_type, alignment_m, backend
+):
     num_expert = len(ms_per_group)
     aligned_ms = [align(m, alignment_m) for m in ms_per_group]
     m = sum(aligned_ms)
@@ -359,6 +469,7 @@ def test_m_grouped_bf16_gemm_nt_contiguous(ms_per_group, n, k, data_type, alignm
         d,
         m_indices,
         alignment_m=alignment_m,
+        backend=backend,
     )
 
     d = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
@@ -380,7 +491,8 @@ def get_m_grouped_gemm_nt_masked_cases():
 @pytest.mark.parametrize("a_fp8_type", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("b_fp8_type", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("enable_overlap", [True])
+@pytest.mark.parametrize("enable_overlap", [False, True])
+@pytest.mark.parametrize("backend", ["mubin", "mutlass"])
 def test_m_grouped_fp8_gemm_nt_masked(
     ms_per_group,
     n,
@@ -390,7 +502,11 @@ def test_m_grouped_fp8_gemm_nt_masked(
     b_fp8_type,
     out_dtype,
     enable_overlap,
+    backend,
 ):
+    if backend == "mutlass" and enable_overlap:
+        pytest.skip('backend="mutlass" does not support enable_overlap')
+
     tile_signal = 64
     quant_tile = 128
     scale_granularity_mnk = (1, quant_tile, quant_tile)
@@ -433,6 +549,7 @@ def test_m_grouped_fp8_gemm_nt_masked(
         scale_granularity_mnk,
         enable_overlap=enable_overlap,
         signal=signal,
+        backend=backend,
     )
 
     d = d.to(torch.float)
@@ -718,7 +835,8 @@ def test_mqa_logits(seq_q, seq_kv, compressed_logits, disable_cp):
 @pytest.mark.parametrize("k", [4096])
 @pytest.mark.parametrize("expected_m", [None, 8192])
 @pytest.mark.parametrize("data_type", [torch.bfloat16])
-@pytest.mark.parametrize("enable_overlap", [True])
+@pytest.mark.parametrize("enable_overlap", [False, True])
+@pytest.mark.parametrize("backend", ["mubin", "mutlass"])
 def test_m_grouped_bf16_gemm_nt_masked(
     ms_per_group,
     n,
@@ -726,7 +844,11 @@ def test_m_grouped_bf16_gemm_nt_masked(
     expected_m,
     data_type,
     enable_overlap,
+    backend,
 ):
+    if backend == "mutlass" and enable_overlap:
+        pytest.skip('backend="mutlass" does not support enable_overlap')
+
     tile_signal = 64
 
     max_m = max(ms_per_group)
@@ -752,6 +874,7 @@ def test_m_grouped_bf16_gemm_nt_masked(
         expected_m,
         enable_overlap=enable_overlap,
         signal=signal,
+        backend=backend,
     )
 
     for i in range(num_expert):

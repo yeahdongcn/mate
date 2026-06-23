@@ -27,6 +27,8 @@ _LAZY_SUBMODULES = {
     "gemm",
     "hyperconnection",
     "jit",
+    "memory_debug",
+    "kda",
     "mha_interface",
     "sage_attention_interface",
     "testing",
@@ -35,6 +37,7 @@ _LAZY_SUBMODULES = {
 }
 
 _LAZY_ATTR_MODULES = {
+    "flash_attn_combine": "mha_interface",
     "flash_attn_varlen_func": "mha_interface",
     "flash_attn_with_kvcache": "mha_interface",
     "get_scheduler_metadata": "mha_interface",
@@ -42,6 +45,7 @@ _LAZY_ATTR_MODULES = {
     "flash_mla_with_kvcache": "flashmla",
     "gated_delta_rule_decode": "gdn_decode",
     "gdn_prefill": "gdn_prefill",
+    "chunk_kda": "kda",
     "hash_topk": "hash_topk",
     "mate_api": "api_logging",
     "mhc_pre": "hyperconnection",
@@ -56,6 +60,7 @@ __all__ = [
     "aot",
     "api_logging",
     "deep_gemm",
+    "flash_attn_combine",
     "flash_attn_varlen_func",
     "flash_attn_with_kvcache",
     "flash_mla_with_kvcache",
@@ -69,6 +74,9 @@ __all__ = [
     "get_scheduler_metadata",
     "hyperconnection",
     "jit",
+    "memory_debug",
+    "kda",
+    "chunk_kda",
     "mate_api",
     "mha_interface",
     "mhc_pre",

@@ -21,13 +21,13 @@ void {{ func_name }} (
   ffi::TensorView lse,
   ffi::TensorView out_accum,
   ffi::TensorView lse_accum,
-  ffi::TensorView num_splits_dynamic,
-  ffi::TensorView batch_table,
+  ffi::Optional<ffi::TensorView> metadata,
   int num_split
 ) {
   // FMHA config
   constexpr bool HasCuseqlensQ = {{ 'true' if has_cu_seqlens_q else 'false' }};
   constexpr bool HasSequsedQ = {{ 'true' if has_seqused_q else 'false' }};
+  constexpr bool HasMetadata = {{ 'true' if has_metadata else 'false' }};
 
   constexpr int TileM = {{ tile_m }};
   constexpr int TileN = {{ tile_n }};
@@ -44,10 +44,20 @@ void {{ func_name }} (
   ffi::MUSADeviceGuard device_guard(out.device().device_id);
 
   int const headdim_v   = out_accum.size(-1);
-  int const batch_size  = HasCuseqlensQ ? cu_seqlens_q.value().size(0) - 1 : out_accum.size(0);
+  int const batch_size  = HasCuseqlensQ
+      ? cu_seqlens_q.value().size(0) - 1
+      : (HasMetadata ? out_accum.size(0) : out_accum.size(1));
   int const seqlen_q    = HasCuseqlensQ ? max_seqlen_q.value() : out_accum.size(-2);
   int const total_q     = HasCuseqlensQ ? out_accum.size(-2) : batch_size * seqlen_q;
-  int const num_head    = out_accum.size(1);
+  int const num_head    = HasMetadata ? out_accum.size(1) : out_accum.size(2);
+  int32_t* num_splits_dynamic_ptr = nullptr;
+  int32_t* batch_table_ptr = nullptr;
+  int b_rounded = (batch_size + 4 - 1) / 4 * 4; // round up to multiple of 4
+  if constexpr (HasMetadata) {
+    int32_t* metadata_ptr = static_cast<int32_t*>(metadata.value().data_ptr());
+    num_splits_dynamic_ptr = metadata_ptr;
+    batch_table_ptr = metadata_ptr + b_rounded;
+  }
 
   using CombineKernel = mate::attention::fmha::FmhaFwdCombine<TileShape_MK, MaxSplits,
                                                               256 /*kNThreads*/, 1 /*AlignmentLSE*/,
@@ -83,15 +93,17 @@ void {{ func_name }} (
     .seqused_q = HasSequsedQ ? static_cast<uint32_t*>(seqused_q.value().data_ptr()) : nullptr,
 
     // Oaccum strides
-    .oaccum_split_stride = out_accum.stride(2),
-    .oaccum_batch_stride = HasCuseqlensQ ? 0 : out_accum.stride(0),
+    .oaccum_split_stride = HasMetadata ? out_accum.stride(2) : out_accum.stride(0),
+    .oaccum_batch_stride = HasCuseqlensQ ? 0 : (
+        HasMetadata ? out_accum.stride(0) : out_accum.stride(1)),
     .oaccum_row_stride = out_accum.stride(-2),
-    .oaccum_head_stride = out_accum.stride(1),
+    .oaccum_head_stride = HasMetadata ? out_accum.stride(1) : out_accum.stride(2),
 
     // lseaccum strides
-    .lseaccum_split_stride = lse_accum.stride(2),
-    .lseaccum_batch_stride = HasCuseqlensQ ? 0 : lse_accum.stride(0),
-    .lseaccum_head_stride = lse_accum.stride(1),
+    .lseaccum_split_stride = HasMetadata ? lse_accum.stride(2) : lse_accum.stride(0),
+    .lseaccum_batch_stride = HasCuseqlensQ ? 0 : (
+        HasMetadata ? lse_accum.stride(0) : lse_accum.stride(1)),
+    .lseaccum_head_stride = HasMetadata ? lse_accum.stride(1) : lse_accum.stride(2),
 
     .num_splits = num_split,
   };
@@ -109,8 +121,8 @@ void {{ func_name }} (
     .stride_LSE = {_1{}, !HasCuseqlensQ ? params.seqlen_q : params.total_q, !HasCuseqlensQ ? params.h * params.seqlen_q : 0},
     .cu_seqlens = params.cu_seqlens_q,
     .seqused = params.seqused_q,
-    .num_splits_dynamic_ptr = static_cast<int*>(num_splits_dynamic.data_ptr()),
-    .varlen_batch_idx_ptr = static_cast<int*>(batch_table.data_ptr()),
+    .num_splits_dynamic_ptr = num_splits_dynamic_ptr,
+    .varlen_batch_idx_ptr = batch_table_ptr,
   };
   typename CombineKernel::Params combine_params = CombineKernel::to_underlying_arguments(combine_args);
   musaStream_t stream = static_cast<musaStream_t>(TVMFFIEnvGetStream(out.device().device_type, out.device().device_id));

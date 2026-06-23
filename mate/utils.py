@@ -90,4 +90,8 @@ def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-__all__ = ["ceil_div", "cosize", "tensor_cache"]
+def round_up(x: int, y: int) -> int:
+    return ceil_div(x, y) * y
+
+
+__all__ = ["ceil_div", "cosize", "round_up", "tensor_cache"]

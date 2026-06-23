@@ -755,6 +755,7 @@ MODEL1_PREFILL_CASES = [
 MODEL1_DECODE_CASES = [
     # (tag, B, S, SKV, topk, SKV_EXTRA, extra_topk, H, topk_len, extra_topk_len, sink)
     ("basic", 128, 1, 8192, 2048, 0, 0, 128, False, False, False),
+    ("tp8_local_h8_topk512_sink", 128, 1, 8192, 512, 0, 0, 8, True, False, True),
     ("basic_small", 4, 1, 512, 64, 0, 0, 64, False, False, False),
     ("batch_topk_len_s3", 4, 3, 512, 64, 0, 0, 64, True, False, False),
     ("extra", 74, 1, 1024, 576, 1024, 576, 128, False, False, False),
@@ -1021,8 +1022,11 @@ def test_model1_sparse_mla_decode(case):
         num_heads_k=1,
         num_heads_q=num_heads,
         topk=topk,
+        extra_topk=extra_topk if extra_topk > 0 else None,
         is_fp8_kvcache=True,
         q=q,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
     )
 
     tl_out, tl_lse = flash_mla.flash_mla_with_kvcache(
@@ -1410,8 +1414,11 @@ def test_model1_sparse_mla_decode_official_style(case):
         num_heads_k=1,
         num_heads_q=num_heads,
         topk=topk,
+        extra_topk=extra_topk if extra_topk > 0 else None,
         is_fp8_kvcache=True,
         q=q,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
     )
     tl_out, tl_lse = flash_mla.flash_mla_with_kvcache(
         q=q,

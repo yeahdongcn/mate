@@ -20,6 +20,9 @@ _SOFTPLUS_BETA = 1.0
 _SOFTPLUS_THRESHOLD = 20.0
 _KERNEL_THREADS = 128
 
+_STATE_TME_INNER_CACHE_POLICY = "cache_normal"
+_STATE_TME_OUTER_CACHE_POLICY = "cache_none"
+
 # Tuned on S5000 from benchmarks/perf_all.log with continuous batch ranges.
 _AUTO_TUNED_BATCH_CONFIGS = (
     (2, (8, 1, 8)),
@@ -27,6 +30,8 @@ _AUTO_TUNED_BATCH_CONFIGS = (
     (16, (8, 2, 2)),
 )
 _AUTO_TUNED_LARGE_BATCH_CONFIG = (4, 1, 8)
+_LOW_PARALLEL_SPLIT_CTA_THRESHOLD = 256
+_LOW_PARALLEL_SPLIT_CONFIG = (8, 1, 4)
 
 
 def _exp2_f32(value):
@@ -41,11 +46,32 @@ def _make_kernel_config(v_tile: int, stage: int, num_blocks_per_state: int) -> d
     }
 
 
-def _resolve_autotuned_kernel_config(batch: int) -> dict:
+def _should_use_low_parallel_split(
+    batch: int, head: int, num_blocks_per_state: int
+) -> bool:
+    if num_blocks_per_state >= _LOW_PARALLEL_SPLIT_CONFIG[2]:
+        return False
+    return batch * head * num_blocks_per_state < _LOW_PARALLEL_SPLIT_CTA_THRESHOLD
+
+
+@functools.lru_cache(maxsize=64)
+def _resolve_autotuned_kernel_config_tuple(
+    batch: int, head: int
+) -> tuple[int, int, int]:
     for max_batch, config in _AUTO_TUNED_BATCH_CONFIGS:
         if batch <= max_batch:
-            return _make_kernel_config(*config)
-    config = _AUTO_TUNED_LARGE_BATCH_CONFIG
+            break
+    else:
+        config = _AUTO_TUNED_LARGE_BATCH_CONFIG
+
+    _, _, num_blocks_per_state = config
+    if _should_use_low_parallel_split(batch, head, num_blocks_per_state):
+        config = _LOW_PARALLEL_SPLIT_CONFIG
+    return config
+
+
+def _resolve_autotuned_kernel_config(batch: int, head: int) -> dict:
+    config = _resolve_autotuned_kernel_config_tuple(batch, head)
     return _make_kernel_config(*config)
 
 
@@ -239,6 +265,8 @@ def _build_decode_fp32_vk_kernel_factory(
                             state[state_slot, hid, prologue_v_base, 0],
                             state_load_stage[i, :, :],
                             barrier=mbars[i],
+                            inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+                            outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                         )
                         T.mbarrier_arrive(mbarrier=mbars[i])
 
@@ -313,6 +341,8 @@ def _build_decode_fp32_vk_kernel_factory(
                                     :,
                                 ],
                                 disable_tma=False,
+                                inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+                                outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                             )
                             tir.call_extern("void", "__musa_tme_store_commit")
                             # Tma arrive only fences the issuing warp; sync before reusing smem.
@@ -372,6 +402,8 @@ def _build_decode_fp32_vk_kernel_factory(
                                 state[state_slot, hid, global_next_v_base, 0],
                                 state_load_stage[stage_idx_var, :, :],
                                 barrier=mbars[stage_idx_var],
+                                inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+                                outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                             )
                             T.mbarrier_arrive(mbarrier=mbars[stage_idx_var])
 
@@ -388,6 +420,8 @@ def _build_decode_fp32_vk_kernel_factory(
                             :,
                         ],
                         disable_tma=False,
+                        inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+                        outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                     )
 
                     if tid < num_v_tiles_per_block * v_tile:
@@ -460,7 +494,7 @@ def run_gated_delta_rule_decode_vk_fp32(
     """
     B, _, Hq, K = q.shape
     _, _, HV, V = v.shape
-    kernel_config = _resolve_autotuned_kernel_config(B)
+    kernel_config = _resolve_autotuned_kernel_config(B, HV)
     use_identity_state_indices = state_indices is None
 
     q_arg = q.squeeze(1)

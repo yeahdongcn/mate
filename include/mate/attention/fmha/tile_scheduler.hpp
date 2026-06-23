@@ -127,8 +127,12 @@ struct StaticPersistentTileScheduler {
   };
 
   static Params to_underlying_arguments(TileSchedulerArguments const& args) {
+    int total_blocks = args.num_blocks * args.num_head * args.num_batch * (!IsSplit ? 1 : args.num_splits);
+    // std::cout << "total_blocks: " << total_blocks << ", num_blocks: " << args.num_blocks;
+    // std::cout << ", num_head: " << args.num_head << ", num_batch: " << args.num_batch;
+    // std::cout << ", num_splits: " << args.num_splits << std::endl;
     return Params{
-        .total_blocks   = args.num_blocks * args.num_head * args.num_batch * (!IsSplit ? 1 : args.num_splits),
+        .total_blocks   = total_blocks,
         .m_block_divmod = mutlass::FastDivmod(args.num_blocks),
         .head_divmod    = mutlass::FastDivmod(args.num_head * (!IsSplit ? 1 : args.num_splits)),
         .nsplits_divmod = mutlass::FastDivmod(!IsSplit ? 1 : args.num_splits),

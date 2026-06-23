@@ -6,13 +6,20 @@ namespace mate::attention::fmha {
 
 using namespace mute;
 
+#define SHOW(x)   \
+  print(#x ": "); \
+  print(x);       \
+  print("\n")
+
 template <bool IsPagedKV,
           class Element,
           int  NumThreads,
           int  TileN,
           int  HeadDimQK,
           int  HeadDimVO,
-          bool IsKVSameIter = false>
+          bool IsKVSameIter   = false,
+          int  LoadsPerRow_LB = 1,
+          int  VectorBits     = 128>
 struct PagedKVManager {
   using ShapePageTable  = Shape<int32_t, int32_t>;
   using StridePageTable = Stride<int64_t, _1>;
@@ -26,21 +33,26 @@ struct PagedKVManager {
   using TensorKV =
       decltype(make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapeKV{}, StrideKV{})(_, _, 0, _));
 
+  static constexpr bool SameHeadDim = (HeadDimQK == HeadDimVO);
+  static constexpr int  HeadDimGCD  = mute::gcd(HeadDimQK, HeadDimVO);
   // For Lsu Paged Load
-  static constexpr int GmemThreadsPerRow = 8;
-  static constexpr int ElementsPerLoad   = 128 / sizeof_bits_v<Element>;
-  using FragmentType                     = mute::uint_bit_t<128>;
+  static constexpr int ElementsPerLoad = VectorBits / sizeof_bits_v<Element>;
+  static_assert(HeadDimGCD % ElementsPerLoad == 0, "HeadDimQK and HeadDimVO must be a multiple of ElementsPerLoad");
+  static_assert(HeadDimGCD % LoadsPerRow_LB == 0, "HeadDimQK and HeadDimVO must be a multiple of LoadsPerRow_LB");
+  static constexpr int BytePerRow = HeadDimGCD / LoadsPerRow_LB * sizeof(Element);
+  static constexpr int BlockKGmem = (BytePerRow % 128 == 0 ? 128 : (BytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
+  static constexpr int GmemThreadsPerRow = BlockKGmem / ElementsPerLoad;
+  using FragmentType                     = mute::uint_bit_t<VectorBits>;
   using GmemCopyAtom                     = Copy_Atom<MP31_ROBUST_LDGSTS<FragmentType>, Element>;
-  using GmemTiledCopy                    = decltype(make_tiled_copy(
-      GmemCopyAtom{},
-      make_ordered_layout(make_shape(Int<NumThreads / GmemThreadsPerRow>{}, Int<GmemThreadsPerRow>{}), Step<_1, _0>{}),
-      make_layout(make_shape(_1{}, Int<ElementsPerLoad>{}))));
-  using ThrGmemTiledCopy                 = decltype(GmemTiledCopy{}.get_thread_slice(0));
-
   using GmemLayoutAtom =
       Layout<Shape<Int<NumThreads / GmemThreadsPerRow>, Int<GmemThreadsPerRow>>, Stride<Int<GmemThreadsPerRow>, _1>>;
+
+  using GmemTiledCopy =
+      decltype(make_tiled_copy(GmemCopyAtom{}, GmemLayoutAtom{}, Layout<Shape<_1, Int<ElementsPerLoad>>>{}));
+  using ThrGmemTiledCopy = decltype(GmemTiledCopy{}.get_thread_slice(0));
+
   using GmemTiledCopyKVStore =
-      decltype(make_tiled_copy(Copy_Atom<MP31_ROBUST_STORE<mute::uint128_t>, Element>{},
+      decltype(make_tiled_copy(Copy_Atom<MP31_ROBUST_STORE<FragmentType>, Element>{},
                                GmemLayoutAtom{},
                                Layout<Shape<_1, Int<ElementsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
   using ThrGmemTiledCopyStore = decltype(GmemTiledCopyKVStore{}.get_thread_slice(0));
@@ -59,7 +71,7 @@ struct PagedKVManager {
 
   // Permutation traits
   static constexpr int MmaAtomN = 8;
-  static constexpr int Fragment = 128 / sizeof_bits_v<Element>;  // Sts vector width
+  static constexpr int Fragment = ElementsPerLoad;  // Sts vector width
   static constexpr int Repeats  = TileN / (MmaAtomN * Fragment);
   static_assert(TileN % 64 == 0);
   using PermuteTile =
@@ -130,27 +142,31 @@ struct PagedKVManager {
     }
   }
 
-  template <bool FirstIter = false, bool PermuteK = true>
+  // K page offsets must use the same lane grouping as the later K pointer broadcast. Rotary store may use
+  // GmemThreadsPerRow=4 for qk=64, while V keeps the default grouping used by load_V/store_V.
+  template <bool FirstIter = false, bool PermuteK = true, int KThreadsPerRow = GmemThreadsPerRow>
   MUTLASS_DEVICE void load_page_table_for_lsu(int const n_block) {
+    static_assert(NumThreads % KThreadsPerRow == 0);
     if constexpr (IsPagedKV) {
       MUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < PageEntryPerThread; ++i) {
-        int32_t const row = i * NumThreads + (NumThreads / GmemThreadsPerRow) * (thread_idx % GmemThreadsPerRow) +
-                            (thread_idx / GmemThreadsPerRow);
-        int32_t const permute_row = PermuteTile{}(row);
+        int32_t const k_row = i * NumThreads + (NumThreads / KThreadsPerRow) * (thread_idx % KThreadsPerRow) +
+                              (thread_idx / KThreadsPerRow);
+        int32_t const v_row = i * NumThreads + (NumThreads / GmemThreadsPerRow) * (thread_idx % GmemThreadsPerRow) +
+                              (thread_idx / GmemThreadsPerRow);
+        int32_t const k_permute_row = PermuteTile{}(k_row);
 
-        int32_t const row_idx         = n_block * TileN + row;
-        int32_t const permute_row_idx = n_block * TileN + permute_row;
-
-        // printf("tid:%d row:%d permute_row:%d\n", thread_idx, row, permute_row);
+        int32_t const k_row_idx         = n_block * TileN + k_row;
+        int32_t const k_permute_row_idx = n_block * TileN + k_permute_row;
+        int32_t const v_row_idx         = n_block * TileN + v_row;
 
         // K
         {
           int32_t page_idx, page_offset;
           if constexpr (PermuteK) {
-            page_idx = page_size_divmod.divmod(page_offset, permute_row_idx + leftpad_k);
+            page_idx = page_size_divmod.divmod(page_offset, k_permute_row_idx + leftpad_k);
           } else {
-            page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
+            page_idx = page_size_divmod.divmod(page_offset, k_row_idx + leftpad_k);
           }
           int32_t page;
           mute::MP31_ROBUST_LOAD<int32_t>::copy(mPageTable(page_idx), page, true, desc_page_table);
@@ -160,7 +176,7 @@ struct PagedKVManager {
         // V
         {
           int32_t page_idx, page_offset;
-          page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
+          page_idx = page_size_divmod.divmod(page_offset, v_row_idx + leftpad_k);
           int32_t page;
           mute::MP31_ROBUST_LOAD<int32_t>::copy(mPageTable(page_idx), page, true, desc_page_table);
           tPrPageOffsetV(i) = {page, page_offset};
@@ -220,7 +236,7 @@ struct PagedKVManager {
     }
   }
 
-  template <class TensorV>
+  template <bool SwapDestinationRowPair = false, class TensorV>
   MUTLASS_DEVICE void load_V(int const n_block, TensorV&& sV) {
     Tensor cV   = make_identity_tensor(Shape<Int<TileN>, Int<HeadDimVO>>{});
     Tensor tVcV = gmem_thr_copy_kv.partition_S(cV);

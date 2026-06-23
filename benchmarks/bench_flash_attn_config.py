@@ -179,6 +179,8 @@ class FlashAttnBenchConfig:
             datatype=self.dtype_gen,
             device=self.device,
         )
+        if self.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            q = q.to(self.dtype)
         return q
 
     @property
@@ -195,6 +197,9 @@ class FlashAttnBenchConfig:
                 device=self.device,
                 dtype=self.dtype_gen,
             )
+            if self.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                k_paged = k_paged.to(self.dtype)
+                v_paged = v_paged.to(self.dtype)
             return KVTensors(k=k_paged, v=v_paged, page_table=page_table)
         else:
             k, _, _ = gen_input_tensor(
@@ -215,6 +220,9 @@ class FlashAttnBenchConfig:
                 datatype=self.dtype_gen,
                 device=self.device,
             )
+            if self.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                k = k.to(self.dtype)
+                v = v.to(self.dtype)
             return KVTensors(k=k, v=v)
 
     @property

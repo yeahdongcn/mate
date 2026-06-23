@@ -8,6 +8,7 @@
 
 #include "../../common/mma_mp31_sqmma.hpp"
 #include "mate/attention/fmha/utils.hpp"
+#include "mate/gemm/deep_gemm/mp31_fp8_mqa_logits.hpp"
 
 namespace mate::deep_gemm {
 
@@ -468,9 +469,6 @@ struct Mp31Fp8PagedMqaLogits {
       Tensor tKsK = thr_mma.partition_A(sK(make_coord(_, kv_group_idx), _, _));
       Tensor tKrK = thr_mma.make_fragment_A(tKsK);
 
-      const auto& sub_warp_offset = (warp_idx % 4) * 4;
-      const auto& base_v_offset   = lane_idx / 8;
-
       while (scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv)) {
         Tensor accum    = partition_fragment_C(TiledMma{}, take<0, 2>(TileShape{}));
         Tensor accum_mn = make_tensor(accum.data(), mate::attention::fmha::layout_acc_mn(tiled_mma, accum.layout()));
@@ -504,10 +502,29 @@ struct Mp31Fp8PagedMqaLogits {
         mate::warpsquad_commit_batch();
 
         static_assert(BLOCK_KV == 64);
-        float scales_kv[size<0>(accum_mn)];
+        using LayoutC_TV = typename TiledMma::LayoutC_TV;
+
+        constexpr auto separated =
+            mate::attention::fmha::layout_separate(get<0>(typename TiledMma::Shape_MNK{}),
+                                                   mute::make_layout(mute::shape<0>(LayoutC_TV{})),
+                                                   mute::stride<0>(LayoutC_TV{}));
+        constexpr int lanes_per_pos = mute::size(get<1>(separated));
+
+        constexpr int kSubWarpStride = mutlass::NumThreadsPerWarp / lanes_per_pos;
+        constexpr int kKVPack        = mute::size(get<0>(separated));
+        constexpr int kRows          = int(BLOCK_KV) / kKVPack;
+        constexpr int kBurst         = 4;
+        static_assert(kRows % kBurst == 0);
+
+        const int lane_idx        = thread_idx_in_warp_squad % mutlass::NumThreadsPerWarp;
+        const int sub_warp_offset = warp_idx_in_warp_squad * kSubWarpStride;
+        const int base_v_offset   = lane_idx / lanes_per_pos;
+        const int sfk_lane        = thread_idx_in_warp_squad / lanes_per_pos;
+
+        float scales_kv[kRows];
         MUTE_UNROLL
-        for (int i = 0; i < size<0>(accum_mn); ++i) {
-          scales_kv[i] = sSFK(i * 16 + thread_idx_in_warp_squad / 8, _0{}, kv_stage_idx, kv_group_idx);
+        for (int i = 0; i < kRows; ++i) {
+          scales_kv[i] = sSFK(i * kKVPack + sfk_lane, _0{}, kv_stage_idx, kv_group_idx);
         }
 
         mate::warpsquad_wait();
@@ -515,24 +532,49 @@ struct Mp31Fp8PagedMqaLogits {
         pipeline_k.consumer_release(pipeline_k_consumer_state);
         ++pipeline_k_consumer_state;
 
-        int kv_offset =
-            q_idx * NextN * get<0>(params.stride_logits) + ((kv_idx + kv_group_idx) * BLOCK_KV + sub_warp_offset);
+        const int kv_block_base = int(kv_idx + kv_group_idx) * BLOCK_KV + sub_warp_offset;
+        const int stride_row    = get<0>(params.stride_logits);
+        const int J             = int(NumHeads / reduction_target);
 
         MUTE_UNROLL
-        for (int row_idx = 0; row_idx < size<0>(accum_mn); ++row_idx) {
+        for (int row_base = 0; row_base + (kBurst - 1) < kRows; row_base += kBurst) {
           MUTE_UNROLL
-          for (int i = 0; i < NextN; ++i) {
-            float sum = 0.0f;
+          for (int ni = 0; ni < NextN; ++ni) {
+            f4        accv     = f4{0.f, 0.f, 0.f, 0.f};
+            const int col_base = ni * J;
+
             MUTE_UNROLL
-            for (int j = 0; j < NumHeads / reduction_target; ++j) {
-              sum += fmaxf(accum_mn(row_idx, i * NumHeads / reduction_target + j), 0.0f) * weights(i, j);
+            for (int j = 0; j < J; ++j) {
+              const float w   = weights(ni, j);
+              const int   col = col_base + j;
+              f4          v   = f4{
+                  accum_mn(row_base + 0, col),
+                  accum_mn(row_base + 1, col),
+                  accum_mn(row_base + 2, col),
+                  accum_mn(row_base + 3, col),
+              };
+              v    = bst4_relu(v);
+              accv = bst4_fma_svv(w, v, accv);
             }
-            sum *= scales_kv[row_idx];
-            MUTE_UNROLL
-            for (int j = 1; j < reduction_target; j *= 2) {
-              sum += __shfl_xor_sync(uint32_t(-1), sum, j);
-            }
-            params.ptr_logits[i * get<0>(params.stride_logits) + kv_offset + base_v_offset + row_idx * 16] = sum;
+
+            const f4 sc = f4{
+                scales_kv[row_base + 0],
+                scales_kv[row_base + 1],
+                scales_kv[row_base + 2],
+                scales_kv[row_base + 3],
+            };
+
+            accv    = bst4_mul_vv(sc, accv);
+            f4 sum4 = warp_group_reduce_sum_f4<reduction_target>(accv);
+
+            float* out_row = params.ptr_logits + (int(q_idx) * NextN + ni) * stride_row;
+
+            const int kv_base = kv_block_base + base_v_offset + row_base * kKVPack;
+            float*    p       = out_row + kv_base;
+            p[0]              = sum4[0];
+            p[1 * kKVPack]    = sum4[1];
+            p[2 * kKVPack]    = sum4[2];
+            p[3 * kKVPack]    = sum4[3];
           }
         }
       }
