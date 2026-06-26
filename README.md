@@ -1,5 +1,7 @@
 # MUSA AI Tensor Engine
 
+[![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://mate-docs.mthreads.com/latest/)
+
 MATE (**M**USA **A**I **T**ensor **E**ngine) is a centralized library for Generative AI workloads on MUSA. It provides high-performance Attention and GEMM operators, and compatibility wrappers for CUDA-oriented Python APIs.
 
 ## Highlights
@@ -175,18 +177,9 @@ For the guided wrapper-first documentation path, start with [docs/source/overvie
 | `tests/` | Correctness and integration tests |
 | `benchmarks/` | Performance and benchmarking scripts |
 
-## Build Documentation
-
-After installing `mate`, build the Sphinx docs with:
-
-```bash
-pip install sphinx furo myst-parser
-cd docs
-make html
-```
-
 ## Quick Links
 
+- Official documentation: [https://mate-docs.mthreads.com/latest/](https://mate-docs.mthreads.com/latest/)
 - CLI documentation: [docs/mate_cli.md](docs/mate_cli.md)
 - Guard allocator debugging: [docs/guard_allocator.md](docs/guard_allocator.md)
 - Environment variables: [docs/environment_variables.md](docs/environment_variables.md)
