@@ -3,6 +3,7 @@
 #include <mutlass/mutlass.h>
 
 #include <cstdint>
+#include <mute/atom/copy_atom.hpp>
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
 
@@ -164,6 +165,9 @@ struct Mp31Fp8Gemm1D2D {
     StrideSFB stride_sfb;
     StrideD   stride_d;
 
+    RobustDescriptor desc_sfa;
+    RobustDescriptor desc_sfb;
+
     int m, n, k;
     int num_groups;
     int expected_m;
@@ -185,24 +189,16 @@ struct Mp31Fp8Gemm1D2D {
     TME_A tme_a = make_tme_copy<TmeAInnerHint, TmeAOuterHint>(MP31_TME_LOAD{}, gA, take<0, 2>(SmemLayoutA{}));
     TME_B tme_b = make_tme_copy<TmeBInnerHint, TmeBOuterHint>(MP31_TME_LOAD{}, gB, take<0, 2>(SmemLayoutB{}));
 
-    return Params{tme_a,
-                  tme_b,
-                  args.ptr_d,
-                  args.ptr_grouped_layout,
-                  args.ptr_sfa,
-                  args.ptr_sfb,
-                  args.stride_sfa,
-                  args.stride_sfb,
-                  args.stride_d,
-                  args.m,
-                  args.n,
-                  args.k,
-                  args.num_groups,
-                  args.expected_m,
-                  args.num_mps,
-                  args.quant_tile,
-                  k_tiles_qt,
-                  n_tiles_qt,
+    auto sfa_layout = make_layout(make_shape(args.m, k_tiles_qt, args.num_groups), args.stride_sfa);
+    auto sfb_layout = make_layout(make_shape(n_tiles_qt, k_tiles_qt, args.num_groups), args.stride_sfb);
+    auto desc_sfa   = make_robust_desc(args.ptr_sfa, static_cast<size_t>(cosize(sfa_layout)));
+    auto desc_sfb   = make_robust_desc(args.ptr_sfb, static_cast<size_t>(cosize(sfb_layout)));
+
+    return Params{tme_a,         tme_b,           args.ptr_d,      args.ptr_grouped_layout,
+                  args.ptr_sfa,  args.ptr_sfb,    args.stride_sfa, args.stride_sfb,
+                  args.stride_d, desc_sfa,        desc_sfb,        args.m,
+                  args.n,        args.k,          args.num_groups, args.expected_m,
+                  args.num_mps,  args.quant_tile, k_tiles_qt,      n_tiles_qt,
                   k_blocks};
   }
 
@@ -362,6 +358,7 @@ struct Mp31Fp8Gemm1D2D {
         Tensor tCrB = thr_mma.make_fragment_B(tCsB);
 
         using ElementBlockScale = float;
+        using ScaleGmemCopyAtom = Copy_Atom<MP31_ROBUST_LOAD<ElementBlockScale>, ElementBlockScale>;
 
         Tensor mScaleA = make_tensor(make_gmem_ptr(params.ptr_sfa),
                                      make_shape(params.m, params.k_tiles_qt, params.num_groups),
@@ -387,6 +384,9 @@ struct Mp31Fp8Gemm1D2D {
         Tensor tCrScaleA = make_tensor_like<ElementBlockScale>(tCgScaleA0);
         Tensor tCrScaleB = make_tensor_like<ElementBlockScale>(tCgScaleB0);
 
+        auto scale_copy_a = ScaleGmemCopyAtom{}.with(params.desc_sfa);
+        auto scale_copy_b = ScaleGmemCopyAtom{}.with(params.desc_sfb);
+
         using AccumTensor  = decltype(rAcc);
         using ScaleATensor = decltype(tCrScaleA);
         using ScaleBTensor = decltype(tCrScaleB);
@@ -401,8 +401,8 @@ struct Mp31Fp8Gemm1D2D {
 
           const uint32_t mma_per_iter = (uint32_t)size<2>(tCrA);
           IterAccum      accumulation(rAcc, mma_per_iter, mma_per_iter, tCrScaleA, tCrScaleB);
-          accumulation.initializeA(tCgScaleA0, tCrScaleA);
-          accumulation.initializeB(tCgScaleB0, tCrScaleB);
+          accumulation.initializeA(scale_copy_a, tCgScaleA0, tCrScaleA);
+          accumulation.initializeB(scale_copy_b, tCgScaleB0, tCrScaleB);
 
           auto consumer_iter = [&](uint32_t iter) {
             const uint32_t kqt = iter;
@@ -410,8 +410,8 @@ struct Mp31Fp8Gemm1D2D {
             {
               Tensor tCgScaleA = thr_mma.partition_C(gScaleA(_, kqt).compose(ScaleAViewAsCLayout{}));
               Tensor tCgScaleB = thr_mma.partition_C(gScaleB(_, kqt).compose(ScaleBViewAsCLayout{}));
-              accumulation.copyA(tCgScaleA, tCrScaleA);
-              accumulation.copyB(tCgScaleB, tCrScaleB);
+              accumulation.copyA(scale_copy_a, tCgScaleA, tCrScaleA);
+              accumulation.copyB(scale_copy_b, tCgScaleB, tCrScaleB);
             }
 
             if (accumulation.prepare_if_needed()) {
@@ -459,10 +459,14 @@ struct Mp31Fp8Gemm1D2D {
               tiled_mma.accumulate_ = MP31::SQMMA::ScaleOut::Zero;
             }
 
-            Tensor tCgScaleA = thr_mma.partition_C(gScaleA(_, kqt).compose(ScaleAViewAsCLayout{}));
-            Tensor tCgScaleB = thr_mma.partition_C(gScaleB(_, kqt).compose(ScaleBViewAsCLayout{}));
-            copy(tCgScaleA, tCrScaleA);
-            copy(tCgScaleB, tCrScaleB);
+            Tensor tCgScaleA     = thr_mma.partition_C(gScaleA(_, kqt).compose(ScaleAViewAsCLayout{}));
+            Tensor tCgScaleB     = thr_mma.partition_C(gScaleB(_, kqt).compose(ScaleBViewAsCLayout{}));
+            auto   tCgScaleAFlat = mute::filter_zeros(tCgScaleA);
+            auto   tCgScaleBFlat = mute::filter_zeros(tCgScaleB);
+            auto   tCrScaleAFlat = mute::filter_zeros(tCrScaleA);
+            auto   tCrScaleBFlat = mute::filter_zeros(tCrScaleB);
+            copy(scale_copy_a, tCgScaleAFlat, tCrScaleAFlat);
+            copy(scale_copy_b, tCgScaleBFlat, tCrScaleBFlat);
 
             pipeline.consumer_wait(pipe_read);
             pipeline_seq.wait();

@@ -49,7 +49,8 @@ def require_token_lengths(
         return torch.full((seq_len,), fill, dtype=torch.int32, device=device)
     assert lengths.dtype == torch.int32, f"{name} must be int32"
     assert lengths.shape == (seq_len,), f"{name} must have shape [S_q]"
-    assert lengths.stride(-1) == 1, f"{name} last dimension must be contiguous"
+    if lengths.shape[-1] != 1:
+        assert lengths.stride(-1) == 1, f"{name} last dimension must be contiguous"
     return lengths.contiguous()
 
 
@@ -62,5 +63,23 @@ def optional_prefill_attn_sink(
         return torch.empty((heads,), dtype=torch.float32, device=device), False
     assert attn_sink.dtype == torch.float32, "attn_sink must be float32"
     assert attn_sink.shape == (heads,), "attn_sink must have shape [H_q]"
-    assert attn_sink.stride(-1) == 1, "attn_sink last dimension must be contiguous"
+    if attn_sink.shape[-1] != 1:
+        assert attn_sink.stride(-1) == 1, "attn_sink last dimension must be contiguous"
     return attn_sink.contiguous(), True
+
+
+def check_sparse_mla_strides(
+    name: str, tensor: torch.Tensor, multiple: Optional[int] = None
+) -> None:
+    if tensor.is_contiguous():
+        return
+    if tensor.shape[-1] != 1:
+        assert tensor.stride(-1) == 1, f"{name} last dimension must be contiguous"
+    for dim, (size, stride) in enumerate(zip(tensor.shape[:-1], tensor.stride()[:-1])):
+        if size == 1:
+            continue
+        assert stride > 0, f"{name} stride({dim}) must be positive, got {stride}"
+        if multiple is not None:
+            assert stride % multiple == 0, (
+                f"{name} stride({dim}) must be divisible by {multiple}, got {stride}"
+            )

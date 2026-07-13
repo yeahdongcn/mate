@@ -67,6 +67,16 @@ from .kda_ops import (
 from .mla_ops import gen_mla_ops_aot as gen_mla_ops_aot
 from .mla_ops import gen_mla_ops_spec as gen_mla_ops_spec
 from .mla_ops import get_mla_ops_module as get_mla_ops_module
+from .mega_moe import (
+    MegaMoEKernelConfig as MegaMoEKernelConfig,
+    gen_fp8_fp8_mega_moe_stage1_spec as gen_fp8_fp8_mega_moe_stage1_spec,
+    gen_fp8_fp8_mega_moe_stage2_spec as gen_fp8_fp8_mega_moe_stage2_spec,
+    gen_mega_moe_runtime_utils_spec as gen_mega_moe_runtime_utils_spec,
+    gen_mega_moe_specs as gen_mega_moe_specs,
+    get_fp8_fp8_mega_moe_stage1_module as get_fp8_fp8_mega_moe_stage1_module,
+    get_fp8_fp8_mega_moe_stage2_module as get_fp8_fp8_mega_moe_stage2_module,
+    get_mega_moe_runtime_utils_module as get_mega_moe_runtime_utils_module,
+)
 from .moe_fused_gate import gen_moe_fused_gate_aot as gen_moe_fused_gate_aot
 from .moe_fused_gate import gen_moe_fused_gate_spec as gen_moe_fused_gate_spec
 from .moe_fused_gate import get_moe_fused_gate_module as get_moe_fused_gate_module
@@ -112,6 +122,14 @@ __all__ = [
     "gen_mla_ops_aot",
     "gen_mla_ops_spec",
     "get_mla_ops_module",
+    "MegaMoEKernelConfig",
+    "gen_fp8_fp8_mega_moe_stage1_spec",
+    "gen_fp8_fp8_mega_moe_stage2_spec",
+    "gen_mega_moe_runtime_utils_spec",
+    "gen_mega_moe_specs",
+    "get_fp8_fp8_mega_moe_stage1_module",
+    "get_fp8_fp8_mega_moe_stage2_module",
+    "get_mega_moe_runtime_utils_module",
     "gen_jit_spec",
     "jit_spec_registry",
     "gen_moe_fused_gate_aot",

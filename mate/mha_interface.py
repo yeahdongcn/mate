@@ -527,7 +527,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
         headdim = q.shape[-1]
-        if headdim == 256:
+        use_tilelang_bwd = headdim == v.shape[-1] and headdim in (128, 256)
+        if use_tilelang_bwd:
             from .flash_attention.tilelang.flash_attention_varlen_bwd import (
                 flashattn_varlen_bwd_interface,
             )
@@ -546,10 +547,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 is_causal=ctx.causal,
                 smscale=ctx.softmax_scale,
                 dtype=None,
-                block_M=64,
-                block_N=64,
-                threads=640,
                 is_bhsd=False,
+                deterministic=ctx.deterministic,
             )
         else:
             # dnn bwd need (b,h max_q) lse but fwd lse is (h, total_q) currently!
@@ -573,28 +572,42 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 )
                 return lse_padded.permute(1, 0, 2).contiguous()
 
-            softmax_lse = lse_varlen_to_padded(
+            is_varlen = cu_seqlens_q is not None and cu_seqlens_k is not None
+            if not is_varlen:
+                raise ValueError("DNN fallback backward currently supports varlen only")
+            q_bwd, k_bwd, v_bwd = q, k, v
+            out_bwd, dout_bwd = out, dout
+            cu_seqlens_q_bwd = cu_seqlens_q
+            cu_seqlens_k_bwd = cu_seqlens_k
+            max_seqlen_q_bwd = ctx.max_seqlen_q
+            max_seqlen_k_bwd = ctx.max_seqlen_k
+            softmax_lse_bwd = lse_varlen_to_padded(
                 softmax_lse, cu_seqlens_q, ctx.max_seqlen_q
             )
             dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-            head_size_og = dout.size(2)
-            dout_padded = dout
+            dq_bwd = dq
+            dk_bwd = dk
+            dv_bwd = dv
+            head_size_og = dout_bwd.size(2)
+            dout_padded = dout_bwd
             if head_size_og % 8 != 0:
-                dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+                dout_padded = torch.nn.functional.pad(
+                    dout_bwd, [0, 8 - head_size_og % 8]
+                )
             _flash_attn_varlen_backward(
                 dout_padded,
-                q,
-                k,
-                v,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                ctx.max_seqlen_q,
-                ctx.max_seqlen_k,
+                q_bwd,
+                k_bwd,
+                v_bwd,
+                out_bwd,
+                softmax_lse_bwd,
+                dq_bwd,
+                dk_bwd,
+                dv_bwd,
+                cu_seqlens_q_bwd,
+                cu_seqlens_k_bwd,
+                max_seqlen_q_bwd,
+                max_seqlen_k_bwd,
                 dropout_p=0.0,
                 softmax_scale=ctx.softmax_scale,
                 causal=ctx.causal,
@@ -1057,6 +1070,80 @@ def get_scheduler_metadata(
     has_qv=False,
     mp_margin=0,  # Can be tuned if some MPs are used for communication):
 ):
+    r"""
+    Build scheduler metadata for ``flash_attn_with_kvcache``.
+
+    Use this helper to precompute the tensor passed through the
+    ``scheduler_metadata`` argument of ``flash_attn_with_kvcache``. This is the
+    direct top-level API exposed as ``mate.get_scheduler_metadata``.
+
+    Parameters
+    ----------
+    batch_size : int
+        Batch size for the scheduled attention workload.
+    max_seqlen_q : int
+        Maximum query sequence length used by the target
+        ``flash_attn_with_kvcache`` call.
+    max_seqlen_k : int
+        Maximum key sequence length already present in the cache.
+    num_heads_q : int
+        Number of query heads.
+    num_heads_kv : int
+        Number of key / value heads.
+    headdim : int
+        Query and key head dimension.
+    seqused_q : Optional[Tensor]
+        Optional per-batch query lengths with shape ``(batch_size,)``.
+    seqused_k : Optional[Tensor]
+        Optional per-batch key lengths with shape ``(batch_size,)``.
+    qkv_dtype : torch.dtype
+        Data type of the scheduled QKV path. Default ``torch.bfloat16``.
+    headdim_v : Optional[int]
+        Value head dimension. Defaults to ``headdim``.
+    cu_seqlens_q : Optional[Tensor]
+        Optional cumulative query sequence lengths with shape
+        ``(batch_size + 1,)``.
+    cu_seqlens_k : Optional[Tensor]
+        Optional cumulative cached key sequence lengths with shape
+        ``(batch_size + 1,)``.
+    cu_seqlens_k_new : Optional[Tensor]
+        Optional cumulative new-KV sequence lengths with shape
+        ``(batch_size + 1,)``.
+    cache_leftpad : Optional[Tensor]
+        Optional per-batch left padding offsets for the KV cache.
+    page_size : Optional[int]
+        Page size for paged KV-cache scheduling.
+    max_seqlen_k_new : int
+        Maximum number of newly appended KV tokens.
+    causal : bool
+        Whether the target attention call uses causal masking.
+    window_size : Tuple[int, int]
+        Sliding-window attention bounds. ``(-1, -1)`` means full context.
+    attention_chunk : int
+        Chunk size used by chunked attention scheduling.
+    has_softcap : bool
+        Whether the target attention call enables softcapping.
+    num_splits : int
+        Requested split count for key / value scheduling.
+    pack_gqa : Optional[bool]
+        Optional GQA packing mode.
+    has_qv : bool
+        Whether the target attention call includes the optional ``qv`` input.
+    mp_margin : int
+        Number of MPs reserved for communication or other work.
+
+    Returns
+    -------
+    Tensor
+        Scheduler metadata tensor to pass to
+        ``flash_attn_with_kvcache(..., scheduler_metadata=...)``.
+
+    Notes
+    -----
+    Keep the scheduling-related arguments aligned with the corresponding
+    ``flash_attn_with_kvcache`` call so the generated metadata matches the
+    actual workload.
+    """
     if window_size is None:
         window_size = (-1, -1)
     seqused_q = maybe_contiguous(seqused_q)

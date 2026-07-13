@@ -40,12 +40,39 @@ def _with_dev_suffix(version: str) -> str:
     return f"{public_part}{separator}{local_part}" if separator else public_part
 
 
-def _read_version() -> str:
+def _without_musa_local_version(version: str) -> str:
+    public_part, separator, local_part = version.partition("+")
+    if not separator:
+        return version
+    local_parts = local_part.split(".")
+    if local_parts[-1] != "musa":
+        return version
+    remaining_local = ".".join(local_parts[:-1])
+    return f"{public_part}+{remaining_local}" if remaining_local else public_part
+
+
+def _with_musa_local_version(version: str) -> str:
+    public_part, separator, local_part = version.partition("+")
+    if not separator:
+        return f"{public_part}+musa"
+    if local_part.split(".")[-1] == "musa":
+        return version
+    return f"{public_part}+{local_part}.musa"
+
+
+def _read_mate_version() -> str:
     repo_version_file = _REPO_ROOT / "version.txt"
     if repo_version_file.exists():
         return _with_dev_suffix(repo_version_file.read_text(encoding="utf-8").strip())
+    if _REQUIREMENTS_METADATA.exists():
+        requirement = _REQUIREMENTS_METADATA.read_text(encoding="utf-8").strip()
+        match = re.fullmatch(r"mate\s*==\s*(\S+)", requirement)
+        if match:
+            return match.group(1)
     if _VERSION_METADATA.exists():
-        return _VERSION_METADATA.read_text(encoding="utf-8").strip()
+        return _without_musa_local_version(
+            _VERSION_METADATA.read_text(encoding="utf-8").strip()
+        )
     raise RuntimeError("Unable to resolve MATE wrapper version")
 
 
@@ -82,7 +109,8 @@ def _write_if_changed(path: Path, content: str) -> None:
 
 
 def _prepare_wrapper_metadata() -> None:
-    version = _read_version()
+    mate_version = _read_mate_version()
+    wrapper_version = _with_musa_local_version(mate_version)
     package_dir = _WRAPPER_ROOT / _package_name()
     if not package_dir.exists():
         raise RuntimeError(f"Wrapper package directory not found: {package_dir}")
@@ -90,12 +118,12 @@ def _prepare_wrapper_metadata() -> None:
     build_meta_file = package_dir / "_build_meta.py"
     git_version = _read_git_version(build_meta_file)
 
-    _write_if_changed(_VERSION_METADATA, f"{version}\n")
-    _write_if_changed(_REQUIREMENTS_METADATA, f"mate=={version}\n")
+    _write_if_changed(_VERSION_METADATA, f"{wrapper_version}\n")
+    _write_if_changed(_REQUIREMENTS_METADATA, f"mate=={mate_version}\n")
     _write_if_changed(
         build_meta_file,
         '"""Build metadata for MATE wrapper package."""\n'
-        f'__version__ = "{version}"\n'
+        f'__version__ = "{wrapper_version}"\n'
         f'__git_version__ = "{git_version}"\n',
     )
 

@@ -19,11 +19,14 @@ The current compatibility scope includes `sageattn` and
 - Import path: `sageattention`
 - Runtime backend: MATE dense quantized attention operators on MUSA
 
+MUSA wrapper releases use the PEP 440 local version suffix `+musa`, for
+example `0.2.4+musa`. Use `python -m pip show sageattention` to distinguish
+this wrapper from the native package.
+
 ## Requirements
 
 Before using this wrapper, make sure the following are available:
 
-- MATE is installed and importable.
 - TorchMUSA and the MUSA runtime environment are available.
 - The target workload is configured to execute on MUSA devices.
 
@@ -43,16 +46,26 @@ dist/
 
 ## Installation
 
-Install from source:
+For delivered packages, install from the external MUSA wheel source:
 
 ```bash
-pip install --no-build-isolation -e .
+python -m pip install sageattention \
+  --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 ```
 
-Install a built wheel:
+This installs the matching `mate` dependency automatically.
+
+For local wrapper development, install from source:
 
 ```bash
-pip install dist/sageattention-*.whl
+python -m pip install --no-build-isolation --no-deps -e ../.. -v
+python -m pip install --no-build-isolation --no-deps -e .
+```
+
+Install a built local wheel:
+
+```bash
+python -m pip install --no-deps dist/sageattention-*.whl
 ```
 
 ## Import

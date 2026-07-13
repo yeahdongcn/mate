@@ -144,7 +144,7 @@ struct PagedKVManager {
 
   // K page offsets must use the same lane grouping as the later K pointer broadcast. Rotary store may use
   // GmemThreadsPerRow=4 for qk=64, while V keeps the default grouping used by load_V/store_V.
-  template <bool FirstIter = false, bool PermuteK = true, int KThreadsPerRow = GmemThreadsPerRow>
+  template <bool FirstIter = false, bool PermuteK = true, bool PermuteV = false, int KThreadsPerRow = GmemThreadsPerRow>
   MUTLASS_DEVICE void load_page_table_for_lsu(int const n_block) {
     static_assert(NumThreads % KThreadsPerRow == 0);
     if constexpr (IsPagedKV) {
@@ -155,10 +155,12 @@ struct PagedKVManager {
         int32_t const v_row = i * NumThreads + (NumThreads / GmemThreadsPerRow) * (thread_idx % GmemThreadsPerRow) +
                               (thread_idx / GmemThreadsPerRow);
         int32_t const k_permute_row = PermuteTile{}(k_row);
+        int32_t const v_permute_row = PermuteTile{}(v_row);
 
         int32_t const k_row_idx         = n_block * TileN + k_row;
         int32_t const k_permute_row_idx = n_block * TileN + k_permute_row;
         int32_t const v_row_idx         = n_block * TileN + v_row;
+        int32_t const v_permute_row_idx = n_block * TileN + v_permute_row;
 
         // K
         {
@@ -176,7 +178,11 @@ struct PagedKVManager {
         // V
         {
           int32_t page_idx, page_offset;
-          page_idx = page_size_divmod.divmod(page_offset, v_row_idx + leftpad_k);
+          if constexpr (PermuteV) {
+            page_idx = page_size_divmod.divmod(page_offset, v_permute_row_idx + leftpad_k);
+          } else {
+            page_idx = page_size_divmod.divmod(page_offset, v_row_idx + leftpad_k);
+          }
           int32_t page;
           mute::MP31_ROBUST_LOAD<int32_t>::copy(mPageTable(page_idx), page, true, desc_page_table);
           tPrPageOffsetV(i) = {page, page_offset};
@@ -236,7 +242,7 @@ struct PagedKVManager {
     }
   }
 
-  template <bool SwapDestinationRowPair = false, class TensorV>
+  template <class TensorV>
   MUTLASS_DEVICE void load_V(int const n_block, TensorV&& sV) {
     Tensor cV   = make_identity_tensor(Shape<Int<TileN>, Int<HeadDimVO>>{});
     Tensor tVcV = gmem_thr_copy_kv.partition_S(cV);

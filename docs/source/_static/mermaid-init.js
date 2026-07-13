@@ -1,4 +1,4 @@
-window.addEventListener("DOMContentLoaded", async () => {
+function initializeMermaid() {
   if (typeof mermaid === "undefined") {
     return;
   }
@@ -25,4 +25,38 @@ window.addEventListener("DOMContentLoaded", async () => {
       useMaxWidth: true,
     },
   });
+}
+
+async function resolveVersionSwitcherLinks() {
+  const versionLinks = document.querySelectorAll(
+    ".docs-version-switcher__link[data-target-path]",
+  );
+
+  await Promise.all(
+    Array.from(versionLinks, async (link) => {
+      if (link.classList.contains("is-active")) {
+        return;
+      }
+
+      const targetPath = link.dataset.targetPath;
+      const fallbackPath = link.dataset.fallbackPath;
+      if (!targetPath || !fallbackPath || targetPath === fallbackPath) {
+        return;
+      }
+
+      try {
+        const response = await fetch(targetPath, { method: "HEAD" });
+        if (response.ok) {
+          link.href = targetPath;
+        }
+      } catch (_error) {
+        // Keep the safer version-home fallback when same-page probing fails.
+      }
+    }),
+  );
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  initializeMermaid();
+  void resolveVersionSwitcherLinks();
 });

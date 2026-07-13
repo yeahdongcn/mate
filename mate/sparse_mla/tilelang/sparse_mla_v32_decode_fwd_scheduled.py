@@ -39,6 +39,7 @@ def sparse_attention_fwd_kernel(
     threads=640,
     max_nums_splits=32,
     has_attn_sink=False,
+    support_split=True,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
@@ -104,6 +105,7 @@ def sparse_attention_fwd_kernel(
         l0_start=0,
         l1_start=dim_qk // 4,
         out_dtype=dtype,
+        support_split=support_split,
     )
     finalize_right = make_scheduled_decode_finalize_right(
         h_per_block=heads_per_block,
@@ -114,12 +116,17 @@ def sparse_attention_fwd_kernel(
         r0_start=dim_qk // 2,
         r1_start=dim_qk // 2 + dim_qk // 4,
         out_dtype=dtype,
+        support_split=support_split,
     )
     stage_value_shared = make_scheduled_decode_stage_value_shared(
         block_i=block_i,
         continuity=pv_mma_n,
     )
     load_indices = make_scheduled_decode_indices_loader(block_i=block_i)
+    glse_shape = [batch + num_mp_parts, seq_len, num_heads] if support_split else [1]
+    output_partial_shape = (
+        [batch + num_mp_parts, seq_len, num_heads, dim] if support_split else [1]
+    )
 
     @T.macro
     def dsa_decode_split(
@@ -132,10 +139,8 @@ def sparse_attention_fwd_kernel(
         attn_sink: T.Tensor([num_heads], T.float32),  # type: ignore
         tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),  # type: ignore
         num_splits: T.Tensor([batch + 1], T.int32),  # type: ignore
-        glse: T.Tensor([batch + num_mp_parts, seq_len, num_heads], T.float32),  # type: ignore
-        output_partial: T.Tensor(
-            [batch + num_mp_parts, seq_len, num_heads, dim], accum_dtype
-        ),  # type: ignore
+        glse: T.Tensor(glse_shape, T.float32),  # type: ignore
+        output_partial: T.Tensor(output_partial_shape, accum_dtype),  # type: ignore
         output: T.Tensor([batch, seq_len, num_heads, dim], dtype),  # type: ignore
         lse: T.Tensor([batch, num_heads, seq_len], T.float32),  # type: ignore
     ):
@@ -797,6 +802,7 @@ def sparse_attention_fwd_kernel(
                         T.ptx_commit_group()
                         T.ptx_wait_group(0)
                         T.barrier_arrive(bar_kv1_ready)
+                        T.sync_threads(1, 128)
                         phase_count[0] = phase_count[0] ^ 1
 
     dsa_combine = make_scheduled_decode_combine(
@@ -823,10 +829,8 @@ def sparse_attention_fwd_kernel(
         attn_sink: T.Tensor([num_heads], T.float32),  # type: ignore
         tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),  # type: ignore
         num_splits: T.Tensor([batch + 1], T.int32),  # type: ignore
-        glse: T.Tensor([batch + num_mp_parts, seq_len, num_heads], accum_dtype),  # type: ignore
-        output_partial: T.Tensor(
-            [batch + num_mp_parts, seq_len, num_heads, dim], accum_dtype
-        ),  # type: ignore
+        glse: T.Tensor(glse_shape, accum_dtype),  # type: ignore
+        output_partial: T.Tensor(output_partial_shape, accum_dtype),  # type: ignore
         output: T.Tensor([batch, seq_len, num_heads, dim], dtype),  # type: ignore
         lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),  # type: ignore
     ):
@@ -845,7 +849,8 @@ def sparse_attention_fwd_kernel(
             output,
             lse,
         )
-        dsa_combine(num_splits, glse, output_partial, attn_sink, output, lse)
+        if support_split:
+            dsa_combine(num_splits, glse, output_partial, attn_sink, output, lse)
 
     return dsa_decode
 
@@ -884,6 +889,8 @@ def tilelang_flashmla_interface(
     tail_dim = dim_plus_tail_dim - dim
     _, _, _, topk = indices.shape
     assert indices.shape == (b, seq_len, kv_group, topk)
+    num_mp_parts = int(tile_scheduler_metadata.shape[0])
+    support_split = num_mp_parts != 1
     runtime = prepare_scheduled_decode_runtime(
         batch=b,
         seq_len=seq_len,
@@ -897,6 +904,7 @@ def tilelang_flashmla_interface(
         out_dtype=q.dtype,
         device=q.device,
         variant_name="V3.2",
+        dummy_partials=not support_split,
     )
     # kernel = sparse_attention_fwd_kernel_v1(
     threads = 640
@@ -910,6 +918,7 @@ def tilelang_flashmla_interface(
         threads=threads,
         max_nums_splits=runtime.max_nums_splits,
         has_attn_sink=runtime.has_attn_sink,
+        support_split=support_split,
     )
     if verbose:
         kernel.show_source()

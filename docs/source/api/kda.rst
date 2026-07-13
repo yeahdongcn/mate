@@ -24,6 +24,13 @@ At a glance
 - Optional recurrent state input/output
 - Optional preallocated ``output`` and ``final_state``
 
+Toolchain requirements
+----------------------
+
+- The repository-wide install baseline still applies, but build the current
+  fused chunk KDA path with MUSA SDK / MTCC 5.1.0 or newer.
+- The 4.3.6 toolchain may fail to compile KDA kernels.
+
 Shape contract
 --------------
 

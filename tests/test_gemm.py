@@ -13,6 +13,162 @@ from mate.testing.utils import (
 from mate.testing import supported_musa_compute_capability
 
 
+def _pack_int4_k(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.int8
+    assert x.size(-1) % 2 == 0
+    x_i16 = x.to(torch.int16)
+    low = x_i16[..., 0::2] & 0xF
+    high = x_i16[..., 1::2] & 0xF
+    return (low | (high << 4)).to(torch.int8).contiguous()
+
+
+def _quantize_w4a8_a_per_channel(x: torch.Tensor, out_dtype: torch.dtype):
+    fp8_amax = torch.tensor(
+        torch.finfo(out_dtype).max, device=x.device, dtype=torch.float32
+    )
+    abs_max = x.abs().amax(dim=-1).clamp(1e-4)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(abs_max / fp8_amax)))
+    return (x / (scale.unsqueeze(-1) + 1e-8)).to(out_dtype), scale.float()
+
+
+def _dequant_w4a8_a_per_channel(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x.float() * scale.unsqueeze(-1)
+
+
+def _make_w4a8_b_nk(num_expert: int, n: int, k: int, device):
+    b = torch.rand((num_expert, n, k), device=device, dtype=torch.float) * 2 - 1
+    b_blocks = b.reshape(num_expert, n, k // 128, 128)
+    scale_b = (b_blocks.abs().amax(dim=3).clamp(1e-4) / 7.0).to(torch.bfloat16)
+    b_int4 = (
+        (b_blocks / scale_b.float().unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
+    )
+    b_int4 = b_int4.reshape(num_expert, n, k).contiguous()
+    return b_int4, _pack_int4_k(b_int4), scale_b
+
+
+def _dequant_w4a8_b_nk(
+    b_int4: torch.Tensor, scale_b: torch.Tensor, expert_id: int, n: int, k: int
+) -> torch.Tensor:
+    b_scale = scale_b[expert_id].float().repeat_interleave(128, dim=1)[:, :k]
+    return b_int4[expert_id].float() * b_scale
+
+
+def _w4a8_ragged_cases():
+    return [
+        ([64, 128], 512, 512, 128),
+        ([256, 256], 1024, 1024, 256),
+    ]
+
+
+def _w4a8_masked_cases():
+    return [
+        ([64, 128], 512, 512, 128),
+        ([256, 256], 1024, 1024, 512),
+    ]
+
+
+def test_moe_gemm_quant_recipe_validation():
+    assert mate.gemm._resolve_moe_gemm_quant_recipe(
+        "a_quant_recipe",
+        (1, -1),
+    ) == (1, -1)
+    assert mate.gemm._resolve_moe_gemm_quant_recipe(
+        "b_quant_recipe",
+        (1, 128),
+    ) == (1, 128)
+
+    with pytest.raises(
+        TypeError, match="a_quant_recipe must be a tuple of two int values"
+    ):
+        mate.gemm._resolve_moe_gemm_quant_recipe("a_quant_recipe", "fp8_per_channel")
+
+    with pytest.raises(
+        TypeError, match="b_quant_recipe must be a tuple of two int values"
+    ):
+        mate.gemm._resolve_moe_gemm_quant_recipe("b_quant_recipe", (1, 128, 128))
+
+
+def test_moe_gemm_mixed_dtype_apis_require_quant_recipes():
+    input_a = (object(), object())
+    input_b = (object(), object())
+    out = object()
+
+    with pytest.raises(TypeError, match="mixed_dtype"):
+        mate.gemm.ragged_moe_gemm_mixed_dtype(input_a, input_b, object(), out)
+
+    with pytest.raises(TypeError, match="mixed_dtype"):
+        mate.gemm.masked_moe_gemm_mixed_dtype(input_a, input_b, object(), out)
+
+    with pytest.raises(TypeError, match="a_quant_recipe"):
+        mate.gemm.ragged_moe_gemm_mixed_dtype(
+            input_a,
+            input_b,
+            object(),
+            out,
+            mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
+        )
+
+    with pytest.raises(TypeError, match="a_quant_recipe"):
+        mate.gemm.masked_moe_gemm_mixed_dtype(
+            input_a,
+            input_b,
+            object(),
+            out,
+            mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
+        )
+
+
+def test_moe_gemm_mixed_dtype_apis_accept_quant_recipe_tuples(monkeypatch):
+    calls = []
+
+    class FakeModule:
+        def get_function(self, name):
+            def _func(*args):
+                calls.append((name, args))
+                return (1, 2)
+
+            return _func
+
+    monkeypatch.setattr(mate.gemm, "_get_module", lambda: FakeModule())
+
+    input_a = (object(), object())
+    input_b = (object(), object())
+    ragged_tokens_info = object()
+    masked_tokens_info = object()
+    out = object()
+
+    assert (
+        mate.gemm.ragged_moe_gemm_mixed_dtype(
+            input_a,
+            input_b,
+            ragged_tokens_info,
+            out,
+            mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
+            a_quant_recipe=(1, -1),
+            b_quant_recipe=(1, 128),
+        )
+        is out
+    )
+    assert (
+        mate.gemm.masked_moe_gemm_mixed_dtype(
+            input_a,
+            input_b,
+            masked_tokens_info,
+            out,
+            mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
+            a_quant_recipe=(1, -1),
+            b_quant_recipe=(1, 128),
+        )
+        is out
+    )
+    assert [name for name, _ in calls] == [
+        "ragged_moe_gemm_mixed_dtype",
+        "masked_moe_gemm_mixed_dtype",
+    ]
+    assert calls[0][1][-2:] == ((1, -1), (1, 128))
+    assert calls[1][1][-2:] == ((1, -1), (1, 128))
+
+
 def get_ragged_moe_gemm_16bit_cases():
     return [
         [111],
@@ -409,6 +565,113 @@ def test_masked_moe_gemm_8bit(
             ref_d[i, : ms_per_group[i], :],
             rtol=5e-3,
             atol=5e-3,
+        )
+
+    if enable_overlap:
+        block_m = res[2]
+        threshold = res[3]
+        check_gemm_sbo_signal(num_expert, max_m, block_m, threshold, signal, masked_m)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("ms_per_group,n,k,alignment_m", _w4a8_ragged_cases())
+@pytest.mark.parametrize("a_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.half])
+def test_ragged_moe_gemm_mixed_dtype(
+    ms_per_group, n, k, alignment_m, a_fp8_type, out_dtype
+):
+    torch.manual_seed(0)
+    num_expert = len(ms_per_group)
+    aligned_ms = [align(m, alignment_m) for m in ms_per_group]
+    m = sum(aligned_ms)
+    device = torch.device("musa")
+
+    a = torch.rand((m, k), device=device, dtype=torch.float)
+    fp8_a, scale_a = _quantize_w4a8_a_per_channel(a, a_fp8_type)
+    b_int4, packed_b, scale_b = _make_w4a8_b_nk(num_expert, n, k, device)
+    m_indices = torch.full((m,), -1, device=device, dtype=torch.int32)
+    out = torch.empty((m, n), device=device, dtype=out_dtype)
+    ref = torch.zeros((m, n), device=device, dtype=torch.float)
+    dequant_a = _dequant_w4a8_a_per_channel(fp8_a, scale_a)
+
+    m_base = 0
+    for expert_id, expert_m in enumerate(ms_per_group):
+        rows = slice(m_base, m_base + expert_m)
+        m_indices[rows] = expert_id
+        dequant_b = _dequant_w4a8_b_nk(b_int4, scale_b, expert_id, n, k)
+        ref[rows] = dequant_a[rows] @ dequant_b.t()
+        m_base += aligned_ms[expert_id]
+
+    mate.gemm.ragged_moe_gemm_mixed_dtype(
+        (fp8_a, scale_a),
+        (packed_b, scale_b),
+        m_indices,
+        out,
+        alignment_m=alignment_m,
+        mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
+        backend="mubin",
+        a_quant_recipe=(1, -1),
+        b_quant_recipe=(1, 128),
+    )
+
+    out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
+    torch.testing.assert_close(out.float(), ref, rtol=5e-2, atol=5e-2)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("ms_per_group,n,k,expected_m", _w4a8_masked_cases())
+@pytest.mark.parametrize("a_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.half])
+@pytest.mark.parametrize("enable_overlap", [False, True])
+def test_masked_moe_gemm_mixed_dtype(
+    ms_per_group, n, k, expected_m, a_fp8_type, out_dtype, enable_overlap
+):
+    torch.manual_seed(1)
+    num_expert = len(ms_per_group)
+    max_m = max(ms_per_group)
+    device = torch.device("musa")
+
+    a = torch.rand((num_expert, max_m, k), device=device, dtype=torch.float)
+    fp8_a, scale_a = _quantize_w4a8_a_per_channel(a, a_fp8_type)
+    b_int4, packed_b, scale_b = _make_w4a8_b_nk(num_expert, n, k, device)
+    masked_m = torch.tensor(ms_per_group, device=device, dtype=torch.int32)
+    out = torch.empty((num_expert, max_m, n), device=device, dtype=out_dtype)
+    signal = None
+
+    if enable_overlap:
+        tile_signal = 64
+        signal = torch.zeros(
+            num_expert * ceil_div(max_m, tile_signal),
+            dtype=torch.int32,
+            device=device,
+        )
+
+    dequant_a = _dequant_w4a8_a_per_channel(fp8_a, scale_a)
+    ref = torch.zeros((num_expert, max_m, n), device=device, dtype=torch.float)
+    for expert_id, expert_m in enumerate(ms_per_group):
+        dequant_b = _dequant_w4a8_b_nk(b_int4, scale_b, expert_id, n, k)
+        ref[expert_id, :expert_m] = dequant_a[expert_id, :expert_m] @ dequant_b.t()
+
+    res = mate.gemm.masked_moe_gemm_mixed_dtype(
+        (fp8_a, scale_a),
+        (packed_b, scale_b),
+        masked_m,
+        out,
+        expect_tokens=expected_m,
+        enable_overlap=enable_overlap,
+        signal=signal,
+        mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
+        backend="mubin",
+        a_quant_recipe=(1, -1),
+        b_quant_recipe=(1, 128),
+    )
+
+    for expert_id, expert_m in enumerate(ms_per_group):
+        torch.testing.assert_close(
+            out[expert_id, :expert_m].float(),
+            ref[expert_id, :expert_m],
+            rtol=5e-2,
+            atol=5e-2,
         )
 
     if enable_overlap:

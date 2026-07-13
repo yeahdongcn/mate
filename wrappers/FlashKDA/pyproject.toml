@@ -10,7 +10,7 @@ description = "A Python wrapper of MATE KDA with the FlashKDA package surface"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-authors = [{ name = "MATE Team" }]
+authors = [{ name = "MATE Contributors" }]
 keywords = ["musa", "flash-kda", "kda", "attention", "pytorch", "mate"]
 classifiers = [
   "Development Status :: 4 - Beta",

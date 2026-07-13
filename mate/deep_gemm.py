@@ -27,6 +27,12 @@ from mate.jit.gemm.deep_gemm.paged_mqa_logits import (
     get_paged_mqa_logits_module,
 )
 from mate.jit.runtime import ffi_to_torch
+from mate.mega_moe import (
+    SymmBuffer as SymmBuffer,
+    fp8_fp8_mega_moe as fp8_fp8_mega_moe,
+    get_symm_buffer_for_mega_moe as get_symm_buffer_for_mega_moe,
+    transform_weights_for_mega_moe as transform_weights_for_mega_moe,
+)
 
 
 def m_grouped_bf16_gemm_nt_contiguous(

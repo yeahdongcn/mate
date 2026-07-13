@@ -66,3 +66,12 @@ repos:
       # Run the formatter.
       - id: ruff-format
         types_or: [ python, pyi ]
+
+  - repo: local
+    hooks:
+      - id: check-api-docs
+        name: check-api-docs
+        entry: python scripts/check_api_docs.py
+        language: system
+        pass_filenames: false
+        files: ^(docs/api_manifest\.yaml|docs/source/api_reference\.rst|docs/source/api/.*\.rst|docs/gdn\.md|mate/__init__\.py|mate/(deep_gemm|flashmla|gdn_decode|gdn_prefill|gemm|hash_topk|hyperconnection|kda|mha_interface|moe_fused_gate|sage_attention_interface)\.py|scripts/check_api_docs\.py|tests/test_check_api_docs\.py)$

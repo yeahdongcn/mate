@@ -68,8 +68,9 @@ Examples
 --------
 
 - **Wrapper-first example:** Your framework already imports a supported surface
-  such as FlashAttention-3. Install the matching wrapper and keep the import
-  path stable, then validate with ``mate check``.
+  such as FlashAttention-3. Install the matching wrapper, let it pull in the
+  matching ``mate`` dependency automatically, keep the import path stable, then
+  validate with ``mate check``.
 - **Direct API example:** You need a specific operator entrypoint or variant
   not covered by wrappers. Call the MATE Python API directly for that operator
   family and integrate it into your application or module.
@@ -81,8 +82,8 @@ Next Steps
   and the relevant wrapper quickstart.
 - If you need direct entrypoints, go to :doc:`Python APIs <api_reference>` and
   the operator family reference for :doc:`Attention <api/attention>`,
-  :doc:`GEMM <api/gemm>`, :doc:`HyperConnection <api/hyperconnection>`, or
-  :doc:`KDA <api/kda>`.
+  :doc:`GEMM <api/gemm>`, :doc:`Mega MoE <api/mega_moe>`,
+  :doc:`HyperConnection <api/hyperconnection>`, or :doc:`KDA <api/kda>`.
 - If runtime validation fails, start with
   :doc:`CLI & Diagnostics <diagnostics>` using ``mate check``,
   ``mate show-config``, and ``mate env``.

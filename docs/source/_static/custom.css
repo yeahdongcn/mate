@@ -34,3 +34,49 @@ table.docutils td {
     min-width: 700px;
   }
 }
+
+.docs-version-switcher {
+  border-bottom: 1px solid var(--color-sidebar-background-border);
+  margin-bottom: 1rem;
+  padding-bottom: 1rem;
+}
+
+:root {
+  --mate-docs-brand-color: #ff671d;
+  --mate-docs-brand-color-dark: #ff5401;
+  --mate-docs-brand-color-soft: rgba(255, 103, 29, 0.08);
+}
+
+.docs-version-switcher__list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.docs-version-switcher__link {
+  background: var(--color-sidebar-item-background);
+  border: 1px solid var(--color-sidebar-background-border);
+  border-radius: 0.5rem;
+  color: var(--color-foreground-primary);
+  display: block;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 0.55rem 0.75rem;
+  text-decoration: none;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease,
+    color 0.2s ease;
+}
+
+.docs-version-switcher__link:hover {
+  background: var(--mate-docs-brand-color-soft);
+  border-color: var(--mate-docs-brand-color);
+  color: var(--mate-docs-brand-color);
+}
+
+.docs-version-switcher__link.is-active {
+  background: var(--mate-docs-brand-color);
+  border-color: var(--mate-docs-brand-color);
+  color: var(--color-background-primary);
+}

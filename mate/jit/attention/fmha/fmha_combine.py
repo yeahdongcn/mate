@@ -280,6 +280,7 @@ def _flash_attn_combine(
     if num_splits == 1:
         out.copy_(out_partial[0].to(dtype=out.dtype))
         lse.copy_(lse_partial[0])
+        out.masked_fill_(~torch.isfinite(lse).unsqueeze(-1), 0)
         return out, lse
     if batch_size == 0 or seqlen_q == 0:
         return out, lse

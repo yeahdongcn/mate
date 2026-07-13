@@ -82,8 +82,12 @@ struct ScalingAccumulation {
     static_assert(mute::is_rmem<TensorScaleA>::value, "ScaleA tensor must be rmem resident.");
     static_assert(mute::is_rmem<TensorScaleB>::value, "ScaleB tensor must be rmem resident.");
 
-    static_assert(LayoutAccum{}.shape() == LayoutScaleA{}.shape(), "Accumulator and scaleA must have same shape.");
-    static_assert(LayoutAccum{}.shape() == LayoutScaleB{}.shape(), "Accumulator and scaleB must have same shape.");
+    // MegaMoE uses broadcast/zero-stride scale layouts whose shape can differ
+    // from the accumulator layout. The accumulation loop below indexes these
+    // tensors linearly, so matching register element counts is the real
+    // requirement.
+    static_assert(size(LayoutAccum{}) == size(LayoutScaleA{}), "Accumulator and scaleA size mismatch.");
+    static_assert(size(LayoutAccum{}) == size(LayoutScaleB{}), "Accumulator and scaleB size mismatch.");
 
     warpsquad_wait();
     MUTLASS_PRAGMA_UNROLL
@@ -357,9 +361,25 @@ struct ScalingAccumulationIterative {
     sanitize_scale_tensor(rscaleA);
   }
 
+  template <class CopyPolicy, class GTensor, class RTensor>
+  MUTLASS_DEVICE void initializeA(CopyPolicy const &copy_policy, GTensor &gscaleA, RTensor &rscaleA) {
+    auto gscaleA_flat = mute::filter_zeros(gscaleA);
+    auto rscaleA_flat = mute::filter_zeros(rscaleA);
+    mute::copy(copy_policy, gscaleA_flat, rscaleA_flat);
+    sanitize_scale_tensor(rscaleA);
+  }
+
   template <class GTensor, class RTensor>
   MUTLASS_DEVICE void initializeB(GTensor &gscaleB, RTensor &rscaleB) {
     mute::copy(gscaleB, rscaleB);
+    sanitize_scale_tensor(rscaleB);
+  }
+
+  template <class CopyPolicy, class GTensor, class RTensor>
+  MUTLASS_DEVICE void initializeB(CopyPolicy const &copy_policy, GTensor &gscaleB, RTensor &rscaleB) {
+    auto gscaleB_flat = mute::filter_zeros(gscaleB);
+    auto rscaleB_flat = mute::filter_zeros(rscaleB);
+    mute::copy(copy_policy, gscaleB_flat, rscaleB_flat);
     sanitize_scale_tensor(rscaleB);
   }
 
@@ -371,12 +391,35 @@ struct ScalingAccumulationIterative {
     mute::copy(gscaleA, rscaleA);
     sanitize_scale_tensor(rscaleA);
   }
+
+  template <class CopyPolicy, class GTensor, class RTensor>
+  MUTLASS_DEVICE void copyA(CopyPolicy const &copy_policy, GTensor &gscaleA, RTensor &rscaleA) {
+    MUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(mute::filter_zeros(rscaleA)); i++)
+      mute::filter_zeros(iterative_scaleA)(i) = mute::filter_zeros(rscaleA)(i);
+    auto gscaleA_flat = mute::filter_zeros(gscaleA);
+    auto rscaleA_flat = mute::filter_zeros(rscaleA);
+    mute::copy(copy_policy, gscaleA_flat, rscaleA_flat);
+    sanitize_scale_tensor(rscaleA);
+  }
+
   template <class GTensor, class RTensor>
   MUTLASS_DEVICE void copyB(GTensor &gscaleB, RTensor &rscaleB) {
     MUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(mute::filter_zeros(rscaleB)); i++)
       mute::filter_zeros(iterative_scaleB)(i) = mute::filter_zeros(rscaleB)(i);
     mute::copy(gscaleB, rscaleB);
+    sanitize_scale_tensor(rscaleB);
+  }
+
+  template <class CopyPolicy, class GTensor, class RTensor>
+  MUTLASS_DEVICE void copyB(CopyPolicy const &copy_policy, GTensor &gscaleB, RTensor &rscaleB) {
+    MUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(mute::filter_zeros(rscaleB)); i++)
+      mute::filter_zeros(iterative_scaleB)(i) = mute::filter_zeros(rscaleB)(i);
+    auto gscaleB_flat = mute::filter_zeros(gscaleB);
+    auto rscaleB_flat = mute::filter_zeros(rscaleB);
+    mute::copy(copy_policy, gscaleB_flat, rscaleB_flat);
     sanitize_scale_tensor(rscaleB);
   }
 

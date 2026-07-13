@@ -11,7 +11,6 @@ from ... import env as jit_env
 from ...core import JitSpec, gen_jit_spec
 from ....utils import ceil_div
 from .fmha_utils import (
-    FMHA_EXTRA_CUDA_CFLAGS,
     _get_fwd_kernel_config,
     fmha_extra_include_paths,
     get_fmha_template,
@@ -30,6 +29,19 @@ from ....execution_context import raise_complete_if_dry_run, is_fake_mode
 
 
 kern_fwd = get_fmha_template("fwd_kern.j2")
+
+FMHA_FWD_EXTRA_CUDA_CFLAGS = [
+    "-Od3",
+    "-O2",
+    "-DNDEBUG",
+    "-fno-strict-aliasing",
+    "-fno-signed-zeros",
+    "-fmusa-flush-denormals-to-zero",
+    "-mllvm",
+    "-mtgpu-load-cluster-mutation=1",
+    "-mllvm",
+    "--num-dwords-of-load-in-mutation=64",
+]
 
 
 def _fmha_fwd_encode(config: Mapping[str, object]) -> str:
@@ -81,14 +93,9 @@ def _select_lsu_load_kv(
     dtype: torch.dtype,
 ) -> tuple[bool, bool]:
     tme_page_size = _paged_kv_tme_page_size(dtype)
-    use_lsu_load_k = (
-        (not paged_kv) or (paged_kv and page_size != tme_page_size) or has_leftpad_k
-    )
-    use_lsu_load_v = (
-        (paged_kv and page_size != tme_page_size)
-        or has_leftpad_k
-        or (has_qv and not paged_kv)
-    )
+    paged_tme_ok = paged_kv and page_size == tme_page_size and not has_leftpad_k
+    use_lsu_load_k = not paged_tme_ok
+    use_lsu_load_v = (paged_kv and not paged_tme_ok) or (has_qv and not paged_kv)
     return use_lsu_load_k, use_lsu_load_v
 
 
@@ -331,6 +338,30 @@ specs_attn = [
         sweep=False,
     ),
     ParamSpec(
+        name="has_q_descale",
+        domain=[False],
+        meaningful_if=lambda cfg: cfg["dtype"]
+        in [torch.float8_e4m3fn, torch.float8_e5m2],
+        depends_on=("dtype",),
+        sweep=False,
+    ),
+    ParamSpec(
+        name="has_k_descale",
+        domain=[False],
+        meaningful_if=lambda cfg: cfg["dtype"]
+        in [torch.float8_e4m3fn, torch.float8_e5m2],
+        depends_on=("dtype",),
+        sweep=False,
+    ),
+    ParamSpec(
+        name="has_v_descale",
+        domain=[False],
+        meaningful_if=lambda cfg: cfg["dtype"]
+        in [torch.float8_e4m3fn, torch.float8_e5m2],
+        depends_on=("dtype",),
+        sweep=False,
+    ),
+    ParamSpec(
         name="head_ratio",
         domain=domain_by_case(config_selector, CONFIG_TABLE, "head_ratio"),
         depends_on=("config_level",),
@@ -501,7 +532,7 @@ def gen_fmha_fwd_spec(config: Mapping[str, object]) -> JitSpec:
         name=dispatch_name,
         sources=[source_file],
         generated_sources={source_file: _render_fmha_fwd_source(config)},
-        extra_cuda_cflags=list(FMHA_EXTRA_CUDA_CFLAGS),
+        extra_cuda_cflags=list(FMHA_FWD_EXTRA_CUDA_CFLAGS),
         extra_include_paths=fmha_extra_include_paths(),
     )
 

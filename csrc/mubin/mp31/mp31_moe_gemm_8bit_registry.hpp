@@ -113,6 +113,9 @@ inline void init_moe_gemm_asm_kern_registry() {
     moe_gemm_asm_src_type_to_id[bfloat16_code]      = 1;
     moe_gemm_asm_src_type_to_id[float8_e4m3fn_code] = 2;
     moe_gemm_asm_src_type_to_id[float8_e5m2_code]   = 3;
+    moe_gemm_asm_src_type_to_id[int8_code]          = 4;
+    moe_gemm_asm_src_type_to_id[uint8_code]         = 4;
+    moe_gemm_asm_src_type_to_id[int4_code]          = 5;
 
     moe_gemm_asm_dst_type_to_id[bfloat16_code]      = 0;
     moe_gemm_asm_dst_type_to_id[float16_code]       = 1;
@@ -132,6 +135,326 @@ inline void init_moe_gemm_asm_kern_registry() {
     moe_gemm_asm_tile_k_to_id[128] = 0;
 
     // clang-format off
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 0,
+      3,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3s4bf16bf16sbf16gemm_gm3_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 0,
+      3,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3s4bf16bf16sbf16gemm_gm3_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_btmenc_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 0,
+      4,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3s4bf16bf16sbf16gemm_gm4_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 0,
+      4,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3s4bf16bf16sbf16gemm_gm4_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_btmenc_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 1,
+      3,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3s4hhsbf16gemm_gm3_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 1,
+      3,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3s4hhsbf16gemm_gm3_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_btmenc_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 1,
+      4,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3s4hhsbf16gemm_gm4_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 1,
+      4,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3s4hhsbf16gemm_gm4_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_btmenc_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 0,
+      3,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2s4bf16bf16sbf16gemm_gm3_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 0,
+      3,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2s4bf16bf16sbf16gemm_gm3_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_btmenc_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 0,
+      4,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2s4bf16bf16sbf16gemm_gm4_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 0,
+      4,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2s4bf16bf16sbf16gemm_gm4_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_btmenc_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 1,
+      3,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2s4hhsbf16gemm_gm3_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 1,
+      3,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2s4hhsbf16gemm_gm3_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_btmenc_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 1,
+      4,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2s4hhsbf16gemm_gm4_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 1,
+      4,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2s4hhsbf16gemm_gm4_nt_tce_512_256x256B128_epilogue_group_128_persis_stage2_btmenc_nsplit
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 0,
+      3,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3s4bf16bf16sbf16gemm_gm3_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 0,
+      3,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3s4bf16bf16sbf16gemm_gm3_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2_btmenc
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 0,
+      4,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3s4bf16bf16sbf16gemm_gm4_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 0,
+      4,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3s4bf16bf16sbf16gemm_gm4_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2_btmenc
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 1,
+      3,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3s4hhsbf16gemm_gm3_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 1,
+      3,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3s4hhsbf16gemm_gm3_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2_btmenc
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 1,
+      4,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3s4hhsbf16gemm_gm4_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 5, 1,
+      4,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3s4hhsbf16gemm_gm4_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2_btmenc
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 0,
+      3,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2s4bf16bf16sbf16gemm_gm3_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 0,
+      3,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2s4bf16bf16sbf16gemm_gm3_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2_btmenc
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 0,
+      4,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2s4bf16bf16sbf16gemm_gm4_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 0,
+      4,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2s4bf16bf16sbf16gemm_gm4_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2_btmenc
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 1,
+      3,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2s4hhsbf16gemm_gm3_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 1,
+      3,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2s4hhsbf16gemm_gm3_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2_btmenc
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 1,
+      4,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2s4hhsbf16gemm_gm4_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 5, 1,
+      4,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2s4hhsbf16gemm_gm4_nt_tce_256_128x256B128_epilogue_group_128_persis_stage2_btmenc
+    )
 
     REGISTER_MOE_GEMM_ASM_KERNEL(
       3, 2, 0,

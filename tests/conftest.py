@@ -206,6 +206,37 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help="Disable guard allocator allocation logging.",
     )
+    fmha_group = parser.getgroup("mate-dnn-fmha")
+    fmha_group.addoption(
+        "--dnn-fmha-stress-iters",
+        action="store",
+        type=int,
+        default=0,
+        help=(
+            "Run this many extra stress iterations after each "
+            "tests/test_dnn_fmha.py correctness case."
+        ),
+    )
+    fmha_group.addoption(
+        "--dnn-fmha-stress-mode",
+        action="store",
+        choices=("kernel-only", "check"),
+        default="kernel-only",
+        help=(
+            "DNN FMHA stress mode: kernel-only only launches/synchronizes; "
+            "check also validates every iteration."
+        ),
+    )
+    fmha_group.addoption(
+        "--dnn-fmha-stress-progress-interval",
+        action="store",
+        type=int,
+        default=0,
+        help=(
+            "Print DNN FMHA stress progress every N iterations. "
+            "0 disables progress output."
+        ),
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:

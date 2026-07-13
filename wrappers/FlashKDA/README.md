@@ -21,13 +21,18 @@ The current compatibility scope includes:
 - Import path: `flash_kda`
 - Runtime backend: MATE KDA operators on MUSA
 
+MUSA wrapper releases use the PEP 440 local version suffix `+musa`, for
+example `0.2.4+musa`. Use `python -m pip show flash_kda` to distinguish this
+wrapper from the native package.
+
 ## Requirements
 
 Before using this wrapper, make sure the following are available:
 
-- MATE is installed and importable.
 - TorchMUSA is installed and the MUSA runtime environment is configured.
 - The target workload is configured to run on MUSA devices.
+- Use MUSA Toolkit / MTCC 5.1.0 or newer to build the current fused chunk KDA
+  path. The 4.3.6 toolchain may fail to compile these kernels.
 
 ## Build
 
@@ -45,16 +50,26 @@ dist/
 
 ## Installation
 
-Install from source:
+For delivered packages, install from the external MUSA wheel source:
 
 ```bash
-pip install --no-build-isolation -e .
+python -m pip install flash_kda \
+  --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 ```
 
-Install a built wheel:
+This installs the matching `mate` dependency automatically.
+
+For local wrapper development, install from source:
 
 ```bash
-pip install dist/flash_kda-*.whl
+python -m pip install --no-build-isolation --no-deps -e ../.. -v
+python -m pip install --no-build-isolation --no-deps -e .
+```
+
+Install a built local wheel:
+
+```bash
+python -m pip install --no-deps dist/flash_kda-*.whl
 ```
 
 ## Import

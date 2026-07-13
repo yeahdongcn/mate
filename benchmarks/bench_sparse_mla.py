@@ -4,7 +4,8 @@
 Measures two views for each case:
 - end-to-end wrapper latency with MUSA events
 - graph-replayed kernel-path latency with MUSA/CUDA events
-- optional profiler time for the main sparse kernel and scheduled combine only
+- implementation-kernel-only profiler time, filtered to sparse split/combine kernels
+- optional per-kernel profiler breakdowns
 
 Run with GPU 2, for example:
     MUSA_VISIBLE_DEVICES=2 python benchmarks/bench_sparse_mla.py --mode both --quick
@@ -230,6 +231,8 @@ def _kernel_role(kernel_name: str) -> str | None:
 def _bench_kernel_us(
     fn: Callable[[], object],
     repeat: int,
+    *,
+    roles: set[str] | None = None,
 ) -> tuple[float, list[tuple[str, str, float]]]:
     fn()
     _sync()
@@ -242,6 +245,8 @@ def _bench_kernel_us(
         role = _kernel_role(evt.key)
         if role is None:
             continue
+        if roles is not None and role not in roles:
+            continue
         total_us = float(
             getattr(evt, "device_time_total", 0.0)
             or getattr(evt, "cuda_time_total", 0.0)
@@ -251,6 +256,15 @@ def _bench_kernel_us(
             rows.append((role, evt.key, total_us / repeat))
     rows.sort(key=lambda item: item[2], reverse=True)
     return sum(time_us for _, _, time_us in rows), rows
+
+
+def _bench_impl_kernel_us(
+    fn: Callable[[], object],
+    repeat: int,
+) -> tuple[float, list[tuple[str, str, float]]]:
+    # Device-body-only implementation time: only the sparse MLA split/combine
+    # kernels, excluding graph replay helpers and framework fill kernels.
+    return _bench_kernel_us(fn, max(2, repeat), roles={"split", "combine"})
 
 
 def _make_indices(rows: int, topk: int, seq_len_kv: int, device: str) -> torch.Tensor:
@@ -315,13 +329,24 @@ def _mask_by_topk_length(
     return masked
 
 
-def _format_perf(stats: WorkloadStats, e2e_us: float, kernel_path_us: float) -> str:
-    return (
+def _format_perf(
+    stats: WorkloadStats,
+    e2e_us: float,
+    kernel_path_us: float,
+    impl_kernel_us: float | None = None,
+) -> str:
+    perf = (
         f"compute/mem={stats.compute_memory_ratio:.2f}, "
         f"e2e={stats.tflops(e2e_us):.1f} TFLOPS/{stats.gbps(e2e_us):.0f} GB/s, "
         f"kernel_path={stats.tflops(kernel_path_us):.1f} TFLOPS/"
         f"{stats.gbps(kernel_path_us):.0f} GB/s"
     )
+    if impl_kernel_us is not None:
+        perf += (
+            f", impl_kernel={stats.tflops(impl_kernel_us):.1f} TFLOPS/"
+            f"{stats.gbps(impl_kernel_us):.0f} GB/s"
+        )
+    return perf
 
 
 def _kernel_path_name(used_graph: bool) -> str:
@@ -365,6 +390,15 @@ def _attn_sink_arg(
     if attn_sink is not None:
         return attn_sink
     return torch.empty((heads,), dtype=torch.float32, device=device)
+
+
+def _parse_int_list(value: str) -> list[int]:
+    vals = [int(item) for item in value.split(",") if item.strip()]
+    if not vals:
+        raise argparse.ArgumentTypeError("expected a comma-separated integer list")
+    if any(val <= 0 for val in vals):
+        raise argparse.ArgumentTypeError("all values must be positive")
+    return vals
 
 
 def _prefill_stats(
@@ -467,6 +501,8 @@ def _make_v32_prefill_graph_runner(
         is_causal=False,
         threads=640,
         has_attn_sink=attn_sink is not None,
+        is_persistence=case.is_persistence,
+        persistent_blocks=case.persistent_blocks,
     )
     out = torch.empty((seq_len, heads, dim), dtype=q.dtype, device=q.device)
     max_logits = torch.empty((seq_len, heads), dtype=torch.float32, device=q.device)
@@ -646,6 +682,8 @@ def _run_prefill_case(
                     attn_sink=attn_sink,
                     d_v=DV,
                     return_max_logits=True,
+                    is_persistence=case.is_persistence,
+                    persistent_blocks=case.persistent_blocks,
                 )
         else:
             raise AssertionError(
@@ -687,6 +725,9 @@ def _run_prefill_case(
             extra_indices,
             extra_topk_length,
         )
+    impl_kernel_us, impl_kernel_rows = _bench_impl_kernel_us(
+        run_graph if run_graph is not None else run, repeat
+    )
     kernel_path_us, used_graph = _bench_kernel_path_us(
         run,
         repeat,
@@ -695,14 +736,18 @@ def _run_prefill_case(
         graph_fn=run_graph,
     )
     label = "prefill-direct" if case.direct_tilelang else "prefill"
-    if case.d_qk == 512 and case.is_persistence:
+    if case.d_qk in (512, 576) and case.is_persistence:
         label += f"-persist{case.persistent_blocks}"
     print(
         f"{label} {case.name}: e2e={e2e_us:.1f} us, "
         f"{_kernel_path_name(used_graph)}={kernel_path_us:.1f} us, "
-        f"{_format_perf(stats, e2e_us, kernel_path_us)}"
+        f"impl_kernel_us={impl_kernel_us:.1f} us, "
+        f"{_format_perf(stats, e2e_us, kernel_path_us, impl_kernel_us)}"
     )
     if profile_kernels:
+        print(f"  impl kernels={impl_kernel_us:.1f} us")
+        for role, name, time_us in impl_kernel_rows:
+            print(f"  {time_us:8.1f} us  [{role}] {name}")
         kernel_us, kernel_rows = _bench_kernel_us(run, max(2, repeat // 2))
         print(f"  profiled kernels={kernel_us:.1f} us")
         for role, name, time_us in kernel_rows:
@@ -889,6 +934,7 @@ def _make_v32_decode_graph_runner(
     tail_dim = dim_plus_tail_dim - dim
     kv_flat = k_cache.view(-1, k_cache.shape[-2], k_cache.shape[-1])
     kv_group = kv_flat.shape[1]
+    support_split = int(sched_meta.shape[0]) != 1
     runtime = prepare_scheduled_decode_runtime(
         batch=batch,
         seq_len=seq_len,
@@ -902,6 +948,7 @@ def _make_v32_decode_graph_runner(
         out_dtype=q.dtype,
         device=q.device,
         variant_name="V3.2",
+        dummy_partials=not support_split,
     )
     kernel = sparse_attention_fwd_kernel(
         heads,
@@ -913,6 +960,7 @@ def _make_v32_decode_graph_runner(
         threads=640,
         max_nums_splits=runtime.max_nums_splits,
         has_attn_sink=runtime.has_attn_sink,
+        support_split=support_split,
     )
     kv_latent_f8 = kv_flat.view(torch.float8_e4m3fn)
     k_rope = kv_flat.view(torch.bfloat16)
@@ -965,6 +1013,7 @@ def _make_model1_decode_graph_runner(
     extra_kv_nope, extra_kv_rope, extra_kv_scales = model1_cache_page_views(
         extra_k_cache
     )
+    support_split = int(sched_meta.shape[0]) != 1
     runtime = prepare_scheduled_decode_runtime(
         batch=batch,
         seq_len=seq_len,
@@ -978,6 +1027,7 @@ def _make_model1_decode_graph_runner(
         out_dtype=q.dtype,
         device=q.device,
         variant_name="MODEL1",
+        dummy_partials=not support_split,
     )
     kernel = sparse_attention_decode_fwd_scheduled_kernel_model1(
         heads,
@@ -992,6 +1042,7 @@ def _make_model1_decode_graph_runner(
         extra_page_block_size=extra_k_cache.shape[1],
         page_stride_bytes=kv_nope.shape[1],
         extra_page_stride_bytes=extra_kv_nope.shape[1],
+        support_split=support_split,
     )
 
     def run_graph():
@@ -1060,6 +1111,9 @@ def _run_decode_case(
         )
         run_direct_kernel_path()
         _sync()
+        impl_kernel_us, impl_kernel_rows = _bench_impl_kernel_us(
+            run_graph if run_graph is not None else run_direct_kernel_path, repeat
+        )
         kernel_path_us, used_graph = _bench_kernel_path_us(
             run_direct_kernel_path,
             repeat,
@@ -1070,10 +1124,14 @@ def _run_decode_case(
         max_splits = int(torch.diff(num_splits).max().item())
         print(
             f"decode-direct {case.name}: {_kernel_path_name(used_graph)}={kernel_path_us:.1f} us, "
+            f"impl_kernel_us={impl_kernel_us:.1f} us, "
             f"mp_parts={sched_meta.shape[0]}, max_splits={max_splits}, "
-            f"{_format_perf(stats, kernel_path_us, kernel_path_us)}"
+            f"{_format_perf(stats, kernel_path_us, kernel_path_us, impl_kernel_us)}"
         )
         if profile_kernels:
+            print(f"  impl kernels={impl_kernel_us:.1f} us")
+            for role, name, time_us in impl_kernel_rows:
+                print(f"  {time_us:8.1f} us  [{role}] {name}")
             kernel_us, kernel_rows = _bench_kernel_us(
                 run_direct_kernel_path, max(2, repeat // 2)
             )
@@ -1167,6 +1225,9 @@ def _run_decode_case(
             sched_meta.tile_scheduler_metadata,
             sched_meta.num_splits,
         )
+    impl_kernel_us, impl_kernel_rows = _bench_impl_kernel_us(
+        run_graph if run_graph is not None else run_kernel_path, repeat
+    )
     kernel_path_us, used_graph = _bench_kernel_path_us(
         run_kernel_path,
         repeat,
@@ -1177,9 +1238,13 @@ def _run_decode_case(
     print(
         f"decode  {case.name}: e2e={e2e_us:.1f} us, "
         f"{_kernel_path_name(used_graph)}={kernel_path_us:.1f} us, "
-        f"{_format_perf(stats, e2e_us, kernel_path_us)}"
+        f"impl_kernel_us={impl_kernel_us:.1f} us, "
+        f"{_format_perf(stats, e2e_us, kernel_path_us, impl_kernel_us)}"
     )
     if profile_kernels:
+        print(f"  impl kernels={impl_kernel_us:.1f} us")
+        for role, name, time_us in impl_kernel_rows:
+            print(f"  {time_us:8.1f} us  [{role}] {name}")
         kernel_us, kernel_rows = _bench_kernel_us(run_kernel_path, max(2, repeat // 2))
         print(f"  profiled kernels={kernel_us:.1f} us")
         for role, name, time_us in kernel_rows:
@@ -1190,11 +1255,33 @@ def _prefill_cases(
     quick: bool, case_set: str, include_large: bool
 ) -> Iterable[PrefillCase]:
     skvs = [8192]
-    templates = [(512, 64, 512), (512, 64, 2048)]
+    templates = [(512, 64, 512), (512, 64, 2048), (576, 64, 512), (576, 64, 2048)]
     for d_qk, heads, topk in templates:
         for skv in skvs:
             yield PrefillCase(
                 f"d{d_qk}_h{heads}_skv{skv}_topk{topk}", d_qk, heads, 4096, skv, topk
+            )
+
+
+def _custom_prefill_cases(
+    *,
+    d_qk: int,
+    heads: int,
+    sqs: Iterable[int],
+    skv: int,
+    topks: Iterable[int],
+    full_topk: bool,
+) -> Iterable[PrefillCase]:
+    for sq in sqs:
+        for topk in topks:
+            yield PrefillCase(
+                f"d{d_qk}_h{heads}_sq{sq}_skv{skv}_topk{topk}",
+                d_qk,
+                heads,
+                sq,
+                skv,
+                topk,
+                topk_length=not full_topk,
             )
 
 
@@ -1203,8 +1290,18 @@ def _decode_cases(
 ) -> Iterable[DecodeCase]:
     batches = [128]
     for bsz in batches:
-        yield DecodeCase(f"v32_b{bsz}", 512, 64, bsz, 1, 8192, 2048, 64)
-        yield DecodeCase(f"v32_b{bsz}", 512, 64, bsz, 1, 8192, 512, 64)
+        yield DecodeCase(
+            f"b{bsz}_d{512}_heads{64}_topk{2048}", 512, 64, bsz, 1, 8192, 2048, 64
+        )
+        yield DecodeCase(
+            f"b{bsz}_d{512}_heads{64}_topk{512}", 512, 64, bsz, 1, 8192, 512, 64
+        )
+        yield DecodeCase(
+            f"b{bsz}_d{576}_heads{64}_topk{2048}", 576, 64, bsz, 1, 8192, 2048, 64
+        )
+        yield DecodeCase(
+            f"b{bsz}_d{576}_heads{64}_topk{512}", 576, 64, bsz, 1, 8192, 512, 64
+        )
 
 
 def main() -> None:
@@ -1228,7 +1325,42 @@ def main() -> None:
     parser.add_argument(
         "--profile-kernels",
         action="store_true",
-        help="Also collect torch-profiler per-kernel names/times; slower and less stable than event timing",
+        help="Also print per-kernel profiler names/times; impl_kernel_us is always collected",
+    )
+    parser.add_argument(
+        "--prefill-sqs",
+        type=_parse_int_list,
+        default=None,
+        help="Comma-separated prefill seq_len_q override, e.g. 1,128,256,2048",
+    )
+    parser.add_argument(
+        "--prefill-topks",
+        type=_parse_int_list,
+        default=None,
+        help="Comma-separated prefill topk override, e.g. 64,512,2048",
+    )
+    parser.add_argument(
+        "--prefill-d-qk",
+        type=int,
+        default=576,
+        help="d_qk for --prefill-sqs/--prefill-topks custom prefill sweep",
+    )
+    parser.add_argument(
+        "--prefill-heads",
+        type=int,
+        default=64,
+        help="num_heads for --prefill-sqs/--prefill-topks custom prefill sweep",
+    )
+    parser.add_argument(
+        "--prefill-skv",
+        type=int,
+        default=8192,
+        help="seq_len_kv for --prefill-sqs/--prefill-topks custom prefill sweep",
+    )
+    parser.add_argument(
+        "--prefill-full-topk",
+        action="store_true",
+        help="Use full topk length for every prefill row instead of the default variable-length perturbation",
     )
     parser.add_argument(
         "--no-graph",
@@ -1273,13 +1405,31 @@ def main() -> None:
     )
 
     if args.mode in ("prefill", "both"):
-        for prefill_case in _prefill_cases(
-            args.quick, args.case_set, args.include_large
-        ):
+        custom_prefill = args.prefill_sqs is not None or args.prefill_topks is not None
+        if custom_prefill:
+            prefill_cases = _custom_prefill_cases(
+                d_qk=args.prefill_d_qk,
+                heads=args.prefill_heads,
+                sqs=args.prefill_sqs or [4096],
+                skv=args.prefill_skv,
+                topks=args.prefill_topks or [512, 2048],
+                full_topk=args.prefill_full_topk,
+            )
+        else:
+            prefill_cases = _prefill_cases(
+                args.quick, args.case_set, args.include_large
+            )
+        for prefill_case in prefill_cases:
             if prefill_case.d_qk == 512:
                 prefill_case = dataclasses.replace(
                     prefill_case,
                     direct_tilelang=True,
+                    is_persistence=not args.no_model1_prefill_persistence,
+                    persistent_blocks=model1_prefill_persistent_blocks,
+                )
+            elif prefill_case.d_qk == 576:
+                prefill_case = dataclasses.replace(
+                    prefill_case,
                     is_persistence=not args.no_model1_prefill_persistence,
                     persistent_blocks=model1_prefill_persistent_blocks,
                 )

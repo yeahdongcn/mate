@@ -16,6 +16,7 @@ constexpr DLDataType dl_uint8            = DLDataType{kDLUInt, 8, 1};
 constexpr DLDataType dl_uint16           = DLDataType{kDLUInt, 16, 1};
 constexpr DLDataType dl_uint32           = DLDataType{kDLUInt, 32, 1};
 constexpr DLDataType dl_uint64           = DLDataType{kDLUInt, 64, 1};
+constexpr DLDataType dl_int4             = DLDataType{kDLInt, 4, 1};
 constexpr DLDataType dl_int8             = DLDataType{kDLInt, 8, 1};
 constexpr DLDataType dl_int16            = DLDataType{kDLInt, 16, 1};
 constexpr DLDataType dl_int32            = DLDataType{kDLInt, 32, 1};
@@ -31,6 +32,7 @@ constexpr DLDataType dl_bfloat16         = DLDataType{kDLBfloat, 16, 1};
 constexpr DLDataType dl_bool             = DLDataType{kDLBool, 8, 1};
 
 constexpr int64_t uint8_code         = encode_dlpack_dtype(dl_uint8);
+constexpr int64_t int4_code          = encode_dlpack_dtype(dl_int4);
 constexpr int64_t int8_code          = encode_dlpack_dtype(dl_int8);
 constexpr int64_t int32_code         = encode_dlpack_dtype(dl_int32);
 constexpr int64_t int64_code         = encode_dlpack_dtype(dl_int64);

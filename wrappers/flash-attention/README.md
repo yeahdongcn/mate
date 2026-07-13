@@ -18,6 +18,10 @@ with minimal code changes. The current compatibility target is the
 - Internal package path: `flash_attn_3`
 - Runtime backend: MATE attention operators on MUSA
 
+MUSA wrapper releases use the PEP 440 local version suffix `+musa`, for
+example `0.2.4+musa`. Use `python -m pip show flash_attn_3` to distinguish
+this wrapper from the native package.
+
 For the current compatibility scope and known limitations, see
 `docs/source/wrappers/flash_attention_forward_compatibility.md`.
 
@@ -25,7 +29,6 @@ For the current compatibility scope and known limitations, see
 
 Before using this wrapper, make sure the following are available:
 
-- MATE is installed and importable.
 - TorchMUSA is installed and the MUSA runtime environment is configured.
 - The target workload is configured to run on MUSA devices.
 
@@ -41,24 +44,34 @@ The generated wheel will be placed under `dist/`.
 
 ## Installation
 
-Install from source:
+For delivered packages, install from the external MUSA wheel source:
 
 ```bash
-pip install --no-build-isolation -e .
+python -m pip install flash_attn_3 \
+  --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 ```
 
-Install a built wheel:
+This installs the matching `mate` dependency automatically.
+
+For local wrapper development, install from source:
 
 ```bash
-pip install dist/flash_attn_3-*.whl
+python -m pip install --no-build-isolation --no-deps -e ../.. -v
+python -m pip install --no-build-isolation --no-deps -e .
+```
+
+Install a built local wheel:
+
+```bash
+python -m pip install --no-deps dist/flash_attn_3-*.whl
 ```
 
 If you previously installed the legacy `mate-flash-attention` package, uninstall it before installing `flash_attn_3` so the
 environment does not keep stale wrapper metadata.
 
 ```bash
-pip uninstall -y mate-flash-attention
-pip install dist/flash_attn_3-*.whl
+python -m pip uninstall -y mate-flash-attention
+python -m pip install --no-deps dist/flash_attn_3-*.whl
 ```
 
 ## Import

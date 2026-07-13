@@ -38,14 +38,16 @@ Typical Workflow
 
    Start with a MUSA-enabled ``torch`` / ``torch_musa`` stack.
 
-2. Install MATE.
-
-   Avoid replacing the MUSA PyTorch stack during installation.
-
-3. Choose the matching wrapper.
+2. Choose the integration surface.
 
    Start with FlashAttention-3, SageAttention, FlashMLA, FlashKDA, or DeepGEMM
    when one matches your framework surface.
+
+3. Install the delivered package.
+
+   Install the matching wrapper from the wheel source when possible. The
+   wrapper pulls in the matching ``mate`` package automatically. Install
+   ``mate`` directly when no wrapper matches.
 
 4. Verify the runtime.
 
@@ -53,7 +55,9 @@ Typical Workflow
 
 5. Debug or fall back to APIs.
 
-   If wrapper coverage does not meet your needs, continue with direct MATE
-   Python APIs.
+   If wrapper coverage does not meet your needs, continue with MATE Python
+   APIs.
 
 Next steps: :doc:`Installing MATE <install>` -> :doc:`Wrappers <wrapper_tutorials>` -> :doc:`CLI & Diagnostics <diagnostics>` -> :doc:`Python APIs <api_reference>`
+
+For version-specific changes, see `GitHub Releases <https://github.com/MooreThreads/mate/releases>`_.

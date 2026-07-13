@@ -8,8 +8,10 @@ enables existing integrations to migrate to Moore Threads platforms with
 minimal code changes.
 
 Wrappers are the default integration path when your framework already targets
-a supported CUDA-oriented Python package. Install MATE first, then choose the
-wrapper that matches your upstream import path.
+a supported CUDA-oriented Python package. For delivered packages, install the
+matching wrapper first. ``pip`` installs the matching ``mate`` dependency
+automatically from the same wheel source. Build from ``wrappers/`` only when
+you are developing a wrapper locally.
 
 How the wrappers work
 ---------------------
@@ -23,6 +25,9 @@ Key mechanisms
 - API mapping: Maps upstream-style calls to MATE operator paths.
 - Namespace preservation: Preserves expected package names and import paths.
 - Kernel routing: Runs calls on MATE-optimized operators and MUSA kernels.
+- Distribution identification: Uses the PEP 440 local version suffix
+  ``+musa`` so installed MUSA wrappers can be distinguished from native
+  implementations with ``python -m pip show <package>``.
 
 Why use wrappers
 ~~~~~~~~~~~~~~~~

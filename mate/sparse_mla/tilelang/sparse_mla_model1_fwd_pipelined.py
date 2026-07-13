@@ -675,6 +675,7 @@ def sparse_attention_fwd_kernel_model1(
                             T.ptx_commit_group()
                             T.ptx_wait_group(0)
                             T.barrier_arrive(bar_kv1_ready)
+                            T.sync_threads(1, 128)
                             phase_count[0] = phase_count[0] ^ 1
                         else:
                             extra_block_index = i_i - dynamic_main_blocks
@@ -772,6 +773,7 @@ def sparse_attention_fwd_kernel_model1(
                             T.ptx_commit_group()
                             T.ptx_wait_group(0)
                             T.barrier_arrive(bar_kv1_ready)
+                            T.sync_threads(1, 128)
                             phase_count[0] = phase_count[0] ^ 1
 
                 if is_persistence:

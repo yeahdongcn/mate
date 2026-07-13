@@ -53,6 +53,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
     extra_page_block_size=64,
     page_stride_bytes=None,
     extra_page_stride_bytes=None,
+    support_split=True,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
@@ -187,6 +188,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         l1_start=128,
         out_dtype=dtype,
         guard_invalid_heads=head_kv < block_m,
+        support_split=support_split,
     )
     finalize_right = make_scheduled_decode_finalize_right(
         h_per_block=heads_per_block,
@@ -198,6 +200,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         r1_start=384,
         out_dtype=dtype,
         guard_invalid_heads=head_kv < block_m,
+        support_split=support_split,
     )
     value_stage_continuity = 64 if block_m == 16 else 128
     stage_value_shared_c0 = make_scheduled_decode_stage_value_shared(
@@ -314,6 +317,12 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         T.ptx_commit_group()
         T.ptx_wait_group(0)
         T.barrier_arrive(bar_kv1_ready)
+        T.sync_threads(1, 128)
+
+    glse_shape = [batch + num_mp_parts, seq_len, num_heads] if support_split else [1]
+    output_partial_shape = (
+        [batch + num_mp_parts, seq_len, num_heads, dim] if support_split else [1]
+    )
 
     @T.prim_func
     def dsa_decode(
@@ -335,10 +344,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         attn_sink: T.Tensor([num_heads], accum_dtype),  # type: ignore
         tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),  # type: ignore
         num_splits: T.Tensor([batch + 1], T.int32),  # type: ignore
-        glse: T.Tensor([batch + num_mp_parts, seq_len, num_heads], accum_dtype),  # type: ignore
-        output_partial: T.Tensor(
-            [batch + num_mp_parts, seq_len, num_heads, dim], accum_dtype
-        ),  # type: ignore
+        glse: T.Tensor(glse_shape, accum_dtype),  # type: ignore
+        output_partial: T.Tensor(output_partial_shape, accum_dtype),  # type: ignore
         output: T.Tensor(o_shape, dtype),  # type: ignore
         lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
     ):
@@ -1169,9 +1176,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                             )
                             phase_count[0] = phase_count[0] ^ 1
 
-        # MODEL1 scheduled combine kernel. Only batches with more than one split
-        # enter this stage; unsplit batches are already written by the split kernel.
-        dsa_combine(num_splits, glse, output_partial, attn_sink, output, lse)
+        if support_split:
+            # MODEL1 scheduled combine kernel. Only batches with more than one split
+            # enter this stage; unsplit batches are already written by the split kernel.
+            dsa_combine(num_splits, glse, output_partial, attn_sink, output, lse)
 
     return dsa_decode
 
@@ -1242,6 +1250,8 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
     extra_topk_length_b = require_batch_lengths(
         extra_topk_length, batch, extra_topk, q.device, "extra_topk_length"
     )
+    num_mp_parts = int(tile_scheduler_metadata.shape[0])
+    support_split = num_mp_parts != 1
     runtime = prepare_scheduled_decode_runtime(
         batch=batch,
         seq_len=seq_len,
@@ -1255,6 +1265,7 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
         out_dtype=q.dtype,
         device=q.device,
         variant_name="MODEL1",
+        dummy_partials=not support_split,
     )
 
     kernel = sparse_attention_decode_fwd_scheduled_kernel_model1(
@@ -1275,6 +1286,7 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
         extra_page_block_size=extra_page_block_size,
         page_stride_bytes=page_block_bytes,
         extra_page_stride_bytes=extra_page_block_bytes,
+        support_split=support_split,
     )
     if verbose:
         kernel.show_source()

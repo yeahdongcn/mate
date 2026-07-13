@@ -767,12 +767,14 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       auto tSrKInverse = thr_mma_inverse.make_fragment_B(tSsKInverse);
       gemm(tiled_mma_inverse, acc_inverse, tSrKDecayed, tSrKInverse, acc_inverse);
       mate::warpsquad_commit_batch();
+      mate::warpsquad_wait();
+      if constexpr (!IsFinalChunk::value) {
+        named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
+      }
+
+      // we put load_beta after warpsquad_wait to avoid the weird compiler MTGPU-DEPENDENCY-GRAPH warning
       bool is_not_full_chunk = IsFinalChunk::value && work_desc.actual_len(chunk_idx) < kChunk;
       load_beta(sBeta, params, problem_size, work_desc, chunk_idx, local_tid, is_not_full_chunk);
-
-      mate::warpsquad_wait();
-      named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
-
       CollectiveInverseNxN inverse_nxn;
       auto sInverseOut = make_tensor(make_smem_ptr(shared_storage.smem_inverse.data()), SmemLayoutInverseA{})(_, _, 0);
       inverse_nxn(
@@ -783,7 +785,6 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
           sBeta,
           []() { named_barrier_arrive_and_wait(KdaNamedBarrier::InverseSmemReady); },
           local_tid);
-      mate::warpsquad_wait();
       named_barrier_arrive(KdaNamedBarrier::InverseReady);
     } else {
       int  local_p_tid = local_tid - mutlass::NumThreadsPerWarpSquad;
@@ -803,7 +804,9 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       gemm(tiled_mma_qk_p, acc_p, tSrQDecayed, tSrKInverse, acc_p);
       mate::warpsquad_commit_batch();
       mate::warpsquad_wait();
-      named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
+      if constexpr (!IsFinalChunk::value) {
+        named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
+      }
 
       MUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(acc_p) / VecSize; ++i) {
@@ -887,7 +890,7 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       // Keep this column's chunk prefix sums in registers so the average-shift path
       // does a single final shared-memory store instead of read-modify-writing g_cumsum.
       // NOTE: for lower_bound=-5, min(g_cumsum) goes down to -120(chunk=32), so we have to do
-      // shifting(renormalization). However, the better way is to increase the lower_bound to -3(maybe), HOWEVER, it
+      // shifting(renormalization). However, the better way is to increase the lower_bound to -3(maybe), which
       // will also change the write/forget strength.
       cumsum_reg[0] = load_gate(0);
       MUTLASS_PRAGMA_UNROLL
@@ -1005,7 +1008,6 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
 
       if constexpr (!decltype(is_first_chunk)::value) {
         named_barrier_wait(KdaNamedBarrier::StateConsumed, uint32_t((chunk_idx - 1) & 1));
-        mate::warpsquad_wait();
       }
       named_barrier_wait(KdaNamedBarrier::GCumsumReady, phase);
       commit_state(sState, rState, shared_storage, stage, local_tid);
@@ -1015,6 +1017,7 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       scale_state(rState, shared_storage, stage, local_tid);
       if constexpr (!(decltype(is_final_chunk)::value && !HasStateOut)) {
         issue_state_update(rState, shared_storage, stage, local_tid, phase);
+        mate::warpsquad_wait();
       }
     };
 
@@ -1029,7 +1032,6 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       state_loop_body(work_desc.n_chunks - 1, false_type{}, true_type{});
     }
     if constexpr (HasStateOut) {
-      mate::warpsquad_wait();
       kv_store(params, problem_size, work_desc, rState, local_tid);
     }
   }
@@ -1204,8 +1206,10 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       prepare_k_restored_half(stage, 16);
       named_barrier_arrive(KdaNamedBarrier::KRestoredReady);
       mate::warpsquad_wait();
-      named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
-      named_barrier_arrive(KdaNamedBarrier::StateConsumed);
+      if constexpr (!decltype(is_final_chunk)::value) {
+        named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
+        named_barrier_arrive(KdaNamedBarrier::StateConsumed);
+      }
       update_v(shared_storage, stage, local_tid, phase);
       issue_intra_output(stage, phase);
       store_output(chunk_idx, is_final_chunk);

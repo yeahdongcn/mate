@@ -9,6 +9,15 @@ MODEL1_KV_SCALE_BYTES = 8
 MODEL1_KV_BYTES_PER_TOKEN = MODEL1_KV_NOPE_ROPE_BYTES + MODEL1_KV_SCALE_BYTES
 
 
+def _check_last_dim_contiguous_unless_singleton(
+    name: str,
+    tensor: torch.Tensor,
+) -> None:
+    if tensor.is_contiguous() or tensor.shape[-1] == 1:
+        return
+    assert tensor.stride(-1) == 1, f"{name} last dimension must be contiguous"
+
+
 def normalize_sparse_decode_indices(
     indices: torch.Tensor,
     batch_size: int,
@@ -17,7 +26,7 @@ def normalize_sparse_decode_indices(
     name: str,
 ) -> torch.Tensor:
     assert indices.dtype == torch.int32, f"{name} must be int32"
-    assert indices.stride(-1) == 1, f"{name} last dimension must be contiguous"
+    _check_last_dim_contiguous_unless_singleton(name, indices)
     if indices.dim() == 3:
         assert num_heads_k == 1, f"{name} without h_k dimension requires h_k == 1"
         assert indices.shape[:2] == (batch_size, seq_len_q)
@@ -38,7 +47,7 @@ def require_batch_topk_length(
     assert topk_length.shape == (batch_size,), (
         f"{name} must have official FlashMLA shape [B], got {tuple(topk_length.shape)}"
     )
-    assert topk_length.stride(-1) == 1, f"{name} last dimension must be contiguous"
+    _check_last_dim_contiguous_unless_singleton(name, topk_length)
     return topk_length
 
 
@@ -52,11 +61,20 @@ def check_model1_k_cache(k_cache: torch.Tensor, name: str = "k_cache") -> None:
     assert k_cache.stride(-1) == 1, f"{name} last dimension must be contiguous"
 
 
-def model1_cache_page_views(k_cache: torch.Tensor):
+def model1_cache_page_views(k_cache: torch.Tensor, *, check: bool = True):
     """Return zero-copy flat MODEL1 cache views over each padded page row."""
-    check_model1_k_cache(k_cache)
+    if check:
+        check_model1_k_cache(k_cache)
     num_blocks = k_cache.shape[0]
-    block_bytes = k_cache.view(torch.uint8).stride(0)
+    logical_block_bytes = k_cache.shape[1] * MODEL1_KV_BYTES_PER_TOKEN
+    if num_blocks == 1:
+        block_bytes = logical_block_bytes
+    else:
+        block_bytes = k_cache.view(torch.uint8).stride(0)
+        assert block_bytes > 0, f"k_cache stride(0) must be positive, got {block_bytes}"
+        assert block_bytes >= logical_block_bytes, (
+            f"k_cache stride(0) must cover a page, got {block_bytes} < {logical_block_bytes}"
+        )
     cache_bytes = torch.as_strided(
         k_cache.view(torch.uint8),
         (num_blocks, block_bytes),

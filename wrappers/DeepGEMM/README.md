@@ -18,11 +18,15 @@ logits APIs.
 - Package name: `deep-gemm`
 - Import path: `deep_gemm`
 - Runtime backend: MATE GEMM and logits operators on MUSA
+
+MUSA wrapper releases use the PEP 440 local version suffix `+musa`, for
+example `0.2.4+musa`. Use `python -m pip show deep-gemm` to distinguish this
+wrapper from the native package.
+
 ## Requirements
 
 Before using this wrapper, make sure the following are available:
 
-- MATE is installed and importable.
 - TorchMUSA is installed and the MUSA runtime environment is configured.
 - The target workload is configured to run on MUSA devices.
 
@@ -42,16 +46,26 @@ dist/
 
 ## Installation
 
-Install from source:
+For delivered packages, install from the external MUSA wheel source:
 
 ```bash
-pip install --no-build-isolation -e .
+python -m pip install deep-gemm \
+  --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 ```
 
-Install a built wheel:
+This installs the matching `mate` dependency automatically.
+
+For local wrapper development, install from source:
 
 ```bash
-pip install dist/deep_gemm-*.whl
+python -m pip install --no-build-isolation --no-deps -e ../.. -v
+python -m pip install --no-build-isolation --no-deps -e .
+```
+
+Install a built local wheel:
+
+```bash
+python -m pip install --no-deps dist/deep_gemm-*.whl
 ```
 
 If you previously installed the legacy `mate-deep-gemm` package, uninstall it
@@ -59,8 +73,8 @@ before installing `deep-gemm` so the environment does not keep stale wrapper
 metadata.
 
 ```bash
-pip uninstall -y mate-deep-gemm
-pip install dist/deep_gemm-*.whl
+python -m pip uninstall -y mate-deep-gemm
+python -m pip install --no-deps dist/deep_gemm-*.whl
 ```
 
 ## Import

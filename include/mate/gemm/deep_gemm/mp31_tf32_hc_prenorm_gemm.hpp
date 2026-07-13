@@ -167,10 +167,11 @@ struct Mp31Tf32HcPrenormGemm {
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
   static constexpr int      SmemAlignmentBytes         = 256;
 
-  using PipelineMain      = mutlass::Mp31PipelineTmeAsyncWarpsepcialized<kStages>;
-  using PipelineCast      = mutlass::Mp31PipelineAsyncWarpsepcialized<kStages>;
-  using PipelineState     = typename PipelineMain::PipelineState;
-  using PipelineCastState = typename PipelineCast::PipelineState;
+  static constexpr uint32_t BarRatio = 4;
+  using PipelineMain                 = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<kStages, BarRatio>;
+  using PipelineCast                 = mutlass::Mp31PipelineAsyncWarpSpecialized<kStages, BarRatio>;
+  using PipelineState                = typename PipelineMain::PipelineState;
+  using PipelineCastState            = typename PipelineCast::PipelineState;
 
   static constexpr int kCastFragmentSize  = 4;
   static constexpr int kCastThreadsPerRow = BlockK / kCastFragmentSize;
@@ -313,30 +314,12 @@ struct Mp31Tf32HcPrenormGemm {
     Tensor mB        = params.tme_b.get_tme_tensor(make_shape(params.n, params.k));
     Tensor gB_full   = local_tile(mB, make_shape(Int<BlockN>{}, Int<BlockK>{}), make_coord(_, _));
 
-    PipelineState     pipe_write;
+    PipelineState     pipe_write = mutlass::make_producer_start_state_warpspecialized<PipelineMain>();
     PipelineState     pipe_read;
-    PipelineCastState pipe_cast_write;
+    PipelineCastState pipe_cast_write = mutlass::make_producer_start_state_warpspecialized<PipelineCast>();
     PipelineCastState pipe_cast_read;
 
     __syncthreads();
-
-    // Consumers prime empty barriers before the first producer acquire.
-    if (is_sqrsum_squad || is_gemm_squad) {
-      PipelineState pipe_empty;
-      MUTE_UNROLL
-      for (int i = 0; i < int(kStages); ++i) {
-        pipeline_main.consumer_release(pipe_empty);
-        ++pipe_empty;
-      }
-    }
-    if (is_gemm_squad) {
-      PipelineCastState pipe_empty_cast;
-      MUTE_UNROLL
-      for (int i = 0; i < int(kStages); ++i) {
-        pipeline_cast.consumer_release(pipe_empty_cast);
-        ++pipe_empty_cast;
-      }
-    }
 
     if (is_producer_squad) {
       if (is_tme_warp) {

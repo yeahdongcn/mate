@@ -3,9 +3,9 @@ name = "mate"
 description = "MATE: MUSA AI Tensor Engine - A centralized library for Generative AI"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.9,<4.0"
+requires-python = ">=3.10,<4.0"
 authors = [
-    { name = "MooreThreads GPU Computing Team" }
+    { name = "MATE Contributors" }
 ]
 keywords = ["musa", "ai", "attention", "gemm", "pytorch"]
 classifiers = [
@@ -87,7 +87,7 @@ all = [
 cli = ["safetensors>=0.4.0"]
 
 # TileLang-backed operators such as FlashMLA / GDN
-tilelang = ["tilelang"]
+tilelang = ["tilelang-musa"]
 
 # Testing dependencies
 testing = [
@@ -109,7 +109,7 @@ dev = [
     "numpy",
     "safetensors>=0.4.0",
     "pytest>=7.0.0",
-    "tilelang",
+    "tilelang-musa",
     "triton",
 ]
 

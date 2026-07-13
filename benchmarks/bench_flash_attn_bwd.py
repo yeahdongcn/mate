@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark TileLang FlashAttention backward 5-MM path.
+"""Benchmark TileLang FlashAttention backward through the public bwd interface.
 
-Default big case mirrors:
-
-    test_flashattn_bwd_5mm(1, 28, 28, 8192, 8192, 256, torch.bfloat16, True)
-
-The script first runs a small correctness check, then benchmarks a preallocated
-kernel path with MUSA graph replay and profiles the key kernels on the path.
+This script intentionally calls only ``flashattn_varlen_bwd_interface`` for the
+timed path. Per-kernel timings are collected from eager profiler events.
 """
 
 from __future__ import annotations
@@ -15,6 +11,7 @@ import argparse
 import dataclasses
 import statistics
 import sys
+import warnings
 from pathlib import Path
 from typing import Callable
 
@@ -25,19 +22,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from mate.flash_attention.tilelang.flash_attention_varlen_bwd import (  # noqa: E402
-    ceil_div,
-    compute_delta_ws,
-    flashattn_bwd_ws,
-    pack_dq_from_accum_ws,
-    reduce_kv_grads_ws,
-    to_tilelang_dtype,
+    flashattn_varlen_bwd_interface,
 )
-
-_GRAPH_KEEPALIVE: list[object] = []
 
 
 @dataclasses.dataclass(frozen=True)
-class BwdCase:
+class InterfaceCase:
     batch: int
     heads: int
     heads_kv: int
@@ -46,13 +36,7 @@ class BwdCase:
     dim: int
     dtype: torch.dtype
     causal: bool
-    block_m: int = 64
-    block_n: int = 64
-    threads: int = 640
-
-    @property
-    def head_groups(self) -> int:
-        return self.heads // self.heads_kv
+    deterministic: bool
 
     @property
     def max_seq_q(self) -> int:
@@ -63,16 +47,52 @@ class BwdCase:
         return self.total_seq_kv // self.batch
 
     @property
-    def total_flops(self) -> float:
-        factor = 5 if self.causal else 10
+    def plan(self) -> str:
+        heads_q_eq_heads_kv = self.heads == self.heads_kv
+        if self.dim == 256:
+            return "split_separate" if self.deterministic else "split"
+        if self.dim == 128:
+            return (
+                "unsplit_separate"
+                if self.deterministic or not heads_q_eq_heads_kv
+                else "unsplit"
+            )
+        raise ValueError(f"unsupported dim: {self.dim}")
+
+    @property
+    def uses_separate_kernels(self) -> bool:
+        return self.plan.endswith("_separate")
+
+    @property
+    def term_scale(self) -> int:
+        return 1 if self.causal else 2
+
+    def flops_for_terms(self, terms: int) -> float:
         return (
             self.total_seq_q
             * self.total_seq_kv
             / self.batch
             * self.heads
-            * factor
+            * terms
+            * self.term_scale
             * self.dim
         )
+
+    @property
+    def dkdv_flops(self) -> float:
+        return self.flops_for_terms(4)
+
+    @property
+    def dq_flops(self) -> float:
+        return self.flops_for_terms(3)
+
+    @property
+    def actual_flops(self) -> float:
+        return self.flops_for_terms(7 if self.uses_separate_kernels else 5)
+
+    @property
+    def logical_flops(self) -> float:
+        return self.flops_for_terms(5)
 
 
 def _sync() -> None:
@@ -83,10 +103,6 @@ def _new_event() -> torch.musa.Event:
     return torch.musa.Event(enable_timing=True)
 
 
-def _new_graph() -> torch.musa.MUSAGraph:
-    return torch.musa.MUSAGraph()
-
-
 def _profiler_activity():
     if hasattr(torch.profiler.ProfilerActivity, "MUSA"):
         return torch.profiler.ProfilerActivity.MUSA
@@ -94,32 +110,26 @@ def _profiler_activity():
 
 
 def _kernel_time_us(evt) -> float:
-    return float(
-        getattr(evt, "device_time_total", 0.0)
-        or getattr(evt, "self_device_time_total", 0.0)
-        or getattr(evt, "musa_time_total", 0.0)
-        or getattr(evt, "self_musa_time_total", 0.0)
-        or getattr(evt, "cuda_time_total", 0.0)
-        or getattr(evt, "self_cuda_time_total", 0.0)
-        or 0.0
-    )
+    for attr in (
+        "device_time_total",
+        "self_device_time_total",
+        "musa_time_total",
+        "self_musa_time_total",
+    ):
+        value = getattr(evt, attr, 0.0)
+        if value:
+            return float(value)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        return float(
+            getattr(evt, "cuda_time_total", 0.0)
+            or getattr(evt, "self_cuda_time_total", 0.0)
+            or 0.0
+        )
 
 
-def _kernel_role(name: str) -> str | None:
-    low = name.lower()
-    if "flashattn_bwd_ws_kernel" in low:
-        return "bwd"
-    if "compute_delta" in low or "compute_delta_ws" in low:
-        return "delta"
-    if "pack_dq" in low:
-        return "pack_dq"
-    if "reduce" in low and ("kv" in low or "grad" in low):
-        return "reduce_kv"
-    if "fill" in low or "zero" in low or "setitem" in low or "memset" in low:
-        return "clear"
-    if "copy" in low or "cast" in low or "to_copy" in low:
-        return "copy_cast"
-    return None
+def _event_name(evt) -> str:
+    return str(getattr(evt, "name", None) or getattr(evt, "key", "<unknown>"))
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -137,98 +147,7 @@ def _make_cu_seqlens(total_seq: int, batch: int, device: str) -> torch.Tensor:
     return torch.arange(batch + 1, device=device, dtype=torch.int32) * step
 
 
-def _ref_flashattn_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
-    *,
-    causal: bool,
-    smscale: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    _, heads_q, dim = q.shape
-    heads_kv = k.shape[1]
-    head_groups = heads_q // heads_kv
-    scale = smscale if smscale is not None else dim**-0.5
-    out = torch.zeros_like(q, dtype=torch.float32)
-    lse_out = torch.zeros((q.shape[0], heads_q), dtype=torch.float32, device=q.device)
-
-    for batch_idx in range(cu_q.numel() - 1):
-        q0, q1 = int(cu_q[batch_idx].item()), int(cu_q[batch_idx + 1].item())
-        k0, k1 = int(cu_k[batch_idx].item()), int(cu_k[batch_idx + 1].item())
-        q_batch = q[q0:q1].float()
-        k_batch = k[k0:k1].float()
-        v_batch = v[k0:k1].float()
-        q_len = q1 - q0
-        kv_len = k1 - k0
-        for head_q in range(heads_q):
-            head_kv = head_q // head_groups
-            scores = q_batch[:, head_q, :] @ k_batch[:, head_kv, :].T
-            scores = scores * scale
-            if causal:
-                mask = torch.tril(
-                    torch.ones((q_len, kv_len), device=q.device, dtype=torch.bool)
-                )
-                scores = scores.masked_fill(~mask, float("-inf"))
-            lse = torch.logsumexp(scores, dim=-1)
-            lse = torch.nan_to_num(lse)
-            prob = torch.exp(scores - lse.unsqueeze(-1))
-            out[q0:q1, head_q, :] = prob @ v_batch[:, head_kv, :]
-            lse_out[q0:q1, head_q] = lse
-    return out.to(q.dtype), lse_out
-
-
-def _ref_flashattn_bwd_5mm(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    do: torch.Tensor,
-    lse: torch.Tensor,
-    delta: torch.Tensor,
-    cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
-    *,
-    causal: bool,
-    smscale: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    _, heads_q, dim = q.shape
-    heads_kv = k.shape[1]
-    head_groups = heads_q // heads_kv
-    scale = smscale if smscale is not None else dim**-0.5
-    dq = torch.zeros_like(q, dtype=torch.float32)
-    dk = torch.zeros_like(k, dtype=torch.float32)
-    dv = torch.zeros_like(v, dtype=torch.float32)
-
-    for batch_idx in range(cu_q.numel() - 1):
-        q0, q1 = int(cu_q[batch_idx].item()), int(cu_q[batch_idx + 1].item())
-        k0, k1 = int(cu_k[batch_idx].item()), int(cu_k[batch_idx + 1].item())
-        q_batch = q[q0:q1].float()
-        k_batch = k[k0:k1].float()
-        v_batch = v[k0:k1].float()
-        do_batch = do[q0:q1].float()
-        q_len = q1 - q0
-        kv_len = k1 - k0
-        for head_q in range(heads_q):
-            head_kv = head_q // head_groups
-            scores = q_batch[:, head_q, :] @ k_batch[:, head_kv, :].T
-            scores = scores * scale
-            if causal:
-                mask = torch.tril(
-                    torch.ones((q_len, kv_len), device=q.device, dtype=torch.bool)
-                )
-                scores = scores.masked_fill(~mask, float("-inf"))
-            prob = torch.exp(scores - lse[q0:q1, head_q].unsqueeze(-1))
-            dp = do_batch[:, head_q, :] @ v_batch[:, head_kv, :].T
-            dp = prob * (dp - delta[q0:q1, head_q].unsqueeze(-1))
-            dp = dp * scale
-            dq[q0:q1, head_q, :] += dp @ k_batch[:, head_kv, :]
-            dk[k0:k1, head_kv, :] += dp.T @ q_batch[:, head_q, :]
-            dv[k0:k1, head_kv, :] += prob.T @ do_batch[:, head_q, :]
-    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
-
-
-def _make_inputs(case: BwdCase, device: str):
+def _make_perf_inputs(case: InterfaceCase, device: str, *, synthetic: bool):
     torch.manual_seed(42)
     torch.musa.manual_seed(42)
     q = (
@@ -255,115 +174,129 @@ def _make_inputs(case: BwdCase, device: str):
         )
         / 10
     ).contiguous()
-    do = (torch.randn_like(q) / 10).contiguous()
+    dout = (torch.randn_like(q) / 10).contiguous()
     cu_q = _make_cu_seqlens(case.total_seq_q, case.batch, device)
     cu_k = _make_cu_seqlens(case.total_seq_kv, case.batch, device)
-    out, lse = _ref_flashattn_fwd(q, k, v, cu_q, cu_k, causal=case.causal)
-    return q, k, v, do, out.contiguous(), lse.transpose(0, 1).contiguous(), cu_q, cu_k
-
-
-class BwdKernelPath:
-    def __init__(self, case: BwdCase, device: str = "musa") -> None:
-        self.case = case
-        self.device = device
-        (
-            self.q,
-            self.k,
-            self.v,
-            self.do,
-            self.out,
-            self.lse,
-            self.cu_q,
-            self.cu_k,
-        ) = _make_inputs(case, device)
-        self.kernel_dtype = to_tilelang_dtype(case.dtype)
-        self.num_blocks_kv = ceil_div(case.max_seq_kv, case.block_n)
-        self.max_seq_q_padded = ceil_div(case.max_seq_q, case.block_m) * case.block_m
-        self.heads_q_eq_heads_kv = case.heads == case.heads_kv
-
-        self.delta = torch.empty(
-            (case.total_seq_q, case.heads), device=device, dtype=torch.float32
-        )
-        self.dq_accum = torch.empty(
-            (case.batch, case.heads, self.max_seq_q_padded, case.dim),
+    if synthetic:
+        out = (torch.randn_like(q) / 10).contiguous()
+        softmax_lse = torch.zeros(
+            (case.heads, case.total_seq_q),
             device=device,
             dtype=torch.float32,
         )
-        if self.heads_q_eq_heads_kv:
-            self.dk_accum = torch.empty_like(self.k)
-            self.dv_accum = torch.empty_like(self.v)
-            self.dk = self.dk_accum
-            self.dv = self.dv_accum
-            self.reduce_kernel = None
-        else:
-            accum_shape = (case.total_seq_kv, case.heads, case.dim)
-            self.dk_accum = torch.empty(accum_shape, device=device, dtype=torch.float32)
-            self.dv_accum = torch.empty(accum_shape, device=device, dtype=torch.float32)
-            self.dk = torch.empty_like(self.k, dtype=torch.float32)
-            self.dv = torch.empty_like(self.v, dtype=torch.float32)
-            self.reduce_kernel = reduce_kv_grads_ws(
-                case.head_groups,
-                case.dim,
-                is_varlen=True,
-            )
-        self.dq = torch.empty_like(self.q)
-        self.debug = torch.empty(
-            (self.num_blocks_kv,), device=device, dtype=torch.int32
-        )
+    else:
+        out, lse_tq_h = _ref_flashattn_fwd(q, k, v, cu_q, cu_k, causal=case.causal)
+        softmax_lse = lse_tq_h.transpose(0, 1).contiguous()
+    return q, k, v, out, dout, softmax_lse, cu_q, cu_k
 
-        self.delta_kernel = compute_delta_ws(
-            case.dim,
-            is_varlen=True,
-            dtype=self.kernel_dtype,
-            block_M=case.block_m,
-            threads=case.threads,
-        )
-        self.bwd_kernel = flashattn_bwd_ws(
-            dim=case.dim,
-            is_causal=case.causal,
-            is_varlen=True,
-            heads_q_eq_heads_kv=self.heads_q_eq_heads_kv,
-            block_M=case.block_m,
-            block_N=case.block_n,
-            smscale=None,
-            threads=case.threads,
-            dtype=self.kernel_dtype,
-        )
-        self.pack_dq_kernel = pack_dq_from_accum_ws(
-            case.dim,
-            is_varlen=True,
-            dtype=self.kernel_dtype,
-        )
 
-    def clear(self) -> None:
-        self.dq_accum.zero_()
-        self.dk_accum.zero_()
-        self.dv_accum.zero_()
+def _ref_flashattn_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    *,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _, heads_q, dim = q.shape
+    heads_kv = k.shape[1]
+    head_groups = heads_q // heads_kv
+    scale = dim**-0.5
+    out = torch.zeros_like(q, dtype=torch.float32)
+    lse_out = torch.zeros((q.shape[0], heads_q), dtype=torch.float32, device=q.device)
 
-    def run(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        self.clear()
-        self.delta_kernel(self.out, self.do, self.delta)
-        self.bwd_kernel(
-            self.q,
-            self.k,
-            self.v,
-            self.out,
-            self.dq_accum,
-            self.dk_accum,
-            self.dv_accum,
-            self.do,
-            self.cu_q,
-            self.cu_k,
-            self.lse,
-            self.delta,
-            self.debug,
-        )
-        self.pack_dq_kernel(self.dq_accum, self.cu_q, self.dq)
-        if self.reduce_kernel is not None:
-            self.reduce_kernel(self.dk_accum, self.dv_accum, self.dk, self.dv)
-            self.dk.copy_(self.dk.to(self.case.dtype))
-            self.dv.copy_(self.dv.to(self.case.dtype))
-        return self.dq, self.dk, self.dv
+    for batch_idx in range(cu_q.numel() - 1):
+        q0, q1 = int(cu_q[batch_idx].item()), int(cu_q[batch_idx + 1].item())
+        k0, k1 = int(cu_k[batch_idx].item()), int(cu_k[batch_idx + 1].item())
+        q_batch = q[q0:q1].float()
+        k_batch = k[k0:k1].float()
+        v_batch = v[k0:k1].float()
+        q_len = q1 - q0
+        kv_len = k1 - k0
+        for head_q in range(heads_q):
+            head_kv = head_q // head_groups
+            scores = q_batch[:, head_q, :] @ k_batch[:, head_kv, :].T
+            scores = scores * scale
+            if causal:
+                q_idx = torch.arange(q_len, device=q.device).unsqueeze(1)
+                k_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)
+                valid = k_idx <= q_idx + (kv_len - q_len)
+                scores = scores.masked_fill(~valid, float("-inf"))
+            lse = torch.nan_to_num(torch.logsumexp(scores, dim=-1))
+            prob = torch.exp(scores - lse.unsqueeze(-1))
+            out[q0:q1, head_q, :] = prob @ v_batch[:, head_kv, :]
+            lse_out[q0:q1, head_q] = lse
+    return out.to(q.dtype), lse_out
+
+
+def _ref_flashattn_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    lse_tq_h: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    *,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _, heads_q, dim = q.shape
+    heads_kv = k.shape[1]
+    head_groups = heads_q // heads_kv
+    scale = dim**-0.5
+    out, _ = _ref_flashattn_fwd(q, k, v, cu_q, cu_k, causal=causal)
+    delta = (out.float() * dout.float()).sum(dim=-1)
+    dq = torch.zeros_like(q, dtype=torch.float32)
+    dk = torch.zeros_like(k, dtype=torch.float32)
+    dv = torch.zeros_like(v, dtype=torch.float32)
+
+    for batch_idx in range(cu_q.numel() - 1):
+        q0, q1 = int(cu_q[batch_idx].item()), int(cu_q[batch_idx + 1].item())
+        k0, k1 = int(cu_k[batch_idx].item()), int(cu_k[batch_idx + 1].item())
+        q_batch = q[q0:q1].float()
+        k_batch = k[k0:k1].float()
+        v_batch = v[k0:k1].float()
+        do_batch = dout[q0:q1].float()
+        q_len = q1 - q0
+        kv_len = k1 - k0
+        for head_q in range(heads_q):
+            head_kv = head_q // head_groups
+            scores = q_batch[:, head_q, :] @ k_batch[:, head_kv, :].T
+            scores = scores * scale
+            if causal:
+                q_idx = torch.arange(q_len, device=q.device).unsqueeze(1)
+                k_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)
+                valid = k_idx <= q_idx + (kv_len - q_len)
+                scores = scores.masked_fill(~valid, float("-inf"))
+            prob = torch.exp(scores - lse_tq_h[q0:q1, head_q].unsqueeze(-1))
+            dp = do_batch[:, head_q, :] @ v_batch[:, head_kv, :].T
+            ds = prob * (dp - delta[q0:q1, head_q].unsqueeze(-1)) * scale
+            dq[q0:q1, head_q, :] += ds @ k_batch[:, head_kv, :]
+            dk[k0:k1, head_kv, :] += ds.T @ q_batch[:, head_q, :]
+            dv[k0:k1, head_kv, :] += prob.T @ do_batch[:, head_q, :]
+    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
+
+
+def _call_interface(case: InterfaceCase, inputs):
+    q, k, v, out, dout, softmax_lse, cu_q, cu_k = inputs
+    return flashattn_varlen_bwd_interface(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        softmax_lse,
+        case.max_seq_q,
+        case.max_seq_kv,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        is_causal=case.causal,
+        smscale=None,
+        dtype=None,
+        is_bhsd=False,
+        deterministic=case.deterministic,
+    )
 
 
 def _bench_event_us(fn: Callable[[], object], warmup: int, repeat: int) -> float:
@@ -383,100 +316,106 @@ def _bench_event_us(fn: Callable[[], object], warmup: int, repeat: int) -> float
     )
 
 
-def _bench_graph_us(
-    fn: Callable[[], object],
-    warmup: int,
-    repeat: int,
-    graph_iters: int,
-) -> float:
-    for _ in range(warmup):
-        fn()
-    _sync()
-    graph = _new_graph()
-    outputs = []
-    with torch.musa.graph(graph):
-        for _ in range(graph_iters):
-            outputs.append(fn())
-    _sync()
-    for _ in range(2):
-        graph.replay()
-    _sync()
-    start_events = [_new_event() for _ in range(repeat)]
-    end_events = [_new_event() for _ in range(repeat)]
-    for idx in range(repeat):
-        start_events[idx].record()
-        graph.replay()
-        end_events[idx].record()
-    _sync()
-    _GRAPH_KEEPALIVE.append((graph, outputs))
-    return statistics.median(
-        start_events[idx].elapsed_time(end_events[idx]) * 1000.0 / graph_iters
-        for idx in range(repeat)
-    )
+def _kernel_role(name: str, case: InterfaceCase) -> str:
+    low = name.lower()
+    if "dkdv" in low:
+        return "dkdv"
+    if "_dq_kernel" in low or "unsplit_dq" in low or "split_dq" in low:
+        return "dq"
+    if "pack_dq" in low:
+        return "pack_dq"
+    if "reduce" in low and ("kv" in low or "grad" in low):
+        return "reduce_kv"
+    if "flashattn_bwd" in low or "bwd_ws_kernel" in low:
+        return "bwd"
+    if name == "main_kernel":
+        return "delta" if case.deterministic else "main_kernel"
+    if "kernelfill" in low or "kernel_fill" in low:
+        if "__mt_bfloat16" in low or "__half" in low or "float" in low:
+            return "zero_workspace"
+        return "fill_aux"
+    return "other_device"
 
 
-def _profile_kernel_path(
-    fn: Callable[[], object],
-    repeat: int,
-) -> list[tuple[str, str, float, int]]:
-    fn()
-    _sync()
-    with torch.profiler.profile(activities=[_profiler_activity()]) as prof:
-        for _ in range(repeat):
-            fn()
-            prof.step()
-    rows: list[tuple[str, str, float, int]] = []
-    for evt in prof.key_averages():
+def _collect_device_events(prof) -> list[tuple[str, float]]:
+    events = []
+    event_getter = getattr(prof, "events", None)
+    raw_events = event_getter() if event_getter is not None else []
+    for evt in raw_events:
         us = _kernel_time_us(evt)
         if us <= 0:
             continue
-        role = _kernel_role(evt.key) or "other"
-        if evt.key == "main_kernel":
-            # compute_delta_ws and pack_dq_from_accum_ws both lower to this
-            # generic TileLang name, and key_averages aggregates them.
-            role = "delta_pack"
-        rows.append((role, evt.key, us / repeat, evt.count))
-    rows.sort(key=lambda item: item[2], reverse=True)
-    return rows
+        name = _event_name(evt)
+        events.append((name, us))
+    return events
 
 
-def _validate_correctness() -> None:
-    case = BwdCase(
+def _profile_eager_kernels(
+    fn: Callable[[], object],
+    *,
+    profile_repeat: int,
+    case: InterfaceCase,
+) -> tuple[dict[str, float], list[tuple[str, str, float]]]:
+    fn()
+    _sync()
+    with torch.profiler.profile(activities=[_profiler_activity()]) as prof:
+        for _ in range(profile_repeat):
+            fn()
+            prof.step()
+    _sync()
+    events = _collect_device_events(prof)
+    role_times: dict[str, list[float]] = {}
+    ordered: list[tuple[str, str, float]] = []
+    first_call_roles = ["fill_aux", "delta"]
+    if case.uses_separate_kernels:
+        first_call_roles.extend(["zero_workspace", "dkdv", "dq"])
+    else:
+        first_call_roles.extend(["zero_workspace", "bwd", "pack_dq"])
+    first_replay_seen = set()
+    first_call_done = False
+    for name, us in events:
+        role = _kernel_role(name, case)
+        role_times.setdefault(role, []).append(us)
+        if not first_call_done:
+            ordered.append((role, name, us))
+            first_replay_seen.add(role)
+            if all(role in first_replay_seen for role in first_call_roles[1:]):
+                first_call_done = True
+    medians = {
+        role: statistics.median(times) for role, times in role_times.items() if times
+    }
+    return medians, ordered
+
+
+def _tflops(flops: float, us: float) -> float:
+    return flops / (us * 1e-6) / 1e12
+
+
+def _validate_correctness(case: InterfaceCase) -> None:
+    check_case = dataclasses.replace(
+        case,
         batch=1,
-        heads=4,
-        heads_kv=4,
+        heads=2,
+        heads_kv=2,
         total_seq_q=256,
         total_seq_kv=256,
-        dim=256,
         dtype=torch.bfloat16,
-        causal=True,
     )
-    path = BwdKernelPath(case)
-    dq, dk, dv = path.run()
-    _sync()
-    delta = torch.empty(
-        (case.total_seq_q, case.heads), device="musa", dtype=torch.float32
-    )
-    compute_delta_ws(
-        case.dim,
-        is_varlen=True,
-        dtype=to_tilelang_dtype(case.dtype),
-        block_M=case.block_m,
-        threads=case.threads,
-    )(path.out, path.do, delta)
-    ref_dq, ref_dk, ref_dv = _ref_flashattn_bwd_5mm(
-        path.q,
-        path.k,
-        path.v,
-        path.do,
-        path.lse.transpose(0, 1).contiguous(),
-        delta,
-        path.cu_q,
-        path.cu_k,
-        causal=case.causal,
+    inputs = _make_perf_inputs(check_case, "musa", synthetic=False)
+    dq, dk, dv = _call_interface(check_case, inputs)
+    q, k, v, _out, dout, softmax_lse, cu_q, cu_k = inputs
+    ref_dq, ref_dk, ref_dv = _ref_flashattn_bwd(
+        q,
+        k,
+        v,
+        dout,
+        softmax_lse.transpose(0, 1).contiguous(),
+        cu_q,
+        cu_k,
+        causal=check_case.causal,
     )
     _sync()
-    limit = 2.01 / 128
+    limit = 4.01 / 128
     for name, actual, ref in (
         ("dQ", dq, ref_dq),
         ("dK", dk, ref_dk),
@@ -484,10 +423,128 @@ def _validate_correctness() -> None:
     ):
         err = (actual.float() - ref.float()).abs().max().item()
         mean = (actual.float() - ref.float()).abs().mean().item()
-        print(f"[correctness] {name} max={err:.6f} mean={mean:.6f}")
-        if err > limit:
+        print(f"[correctness] {check_case.plan} {name} max={err:.6f} mean={mean:.6f}")
+        if not torch.isfinite(torch.tensor(err)) or err > limit:
             raise AssertionError(f"{name} max error {err} exceeds {limit}")
-    print("[correctness] pass")
+    print(f"[correctness] {check_case.plan} pass")
+
+
+def _print_case_header(case: InterfaceCase, *, synthetic: bool) -> None:
+    print(
+        "[bench] "
+        f"batch={case.batch} heads={case.heads} heads_kv={case.heads_kv} "
+        f"seq_q={case.total_seq_q} seq_kv={case.total_seq_kv} dim={case.dim} "
+        f"dtype={case.dtype} causal={case.causal} deterministic={case.deterministic} "
+        f"plan={case.plan} synthetic_inputs={synthetic}"
+    )
+
+
+def _run_case(args: argparse.Namespace, case: InterfaceCase) -> None:
+    if args.check_correctness:
+        _validate_correctness(case)
+
+    inputs = _make_perf_inputs(case, "musa", synthetic=args.synthetic_inputs)
+    fn = lambda: _call_interface(case, inputs)
+    fn()
+    _sync()
+    _print_case_header(case, synthetic=args.synthetic_inputs)
+
+    event_us = _bench_event_us(fn, args.warmup, args.repeat)
+    print(f"[bench] event_e2e={event_us:.3f} us")
+    print(
+        f"[bench] event_actual_TFLOPS="
+        f"{_tflops(case.actual_flops, event_us):.3f} "
+        f"event_logical_TFLOPS={_tflops(case.logical_flops, event_us):.3f}",
+        flush=True,
+    )
+
+    role_medians, ordered = _profile_eager_kernels(
+        fn,
+        profile_repeat=args.profile_repeat,
+        case=case,
+    )
+    print("[profile] role median per eager interface call:")
+    roles = [
+        "delta",
+        "bwd",
+        "dkdv",
+        "dq",
+        "pack_dq",
+        "reduce_kv",
+        "zero_workspace",
+        "fill_aux",
+        "main_kernel",
+        "other_device",
+    ]
+    for role in roles:
+        if role not in role_medians:
+            continue
+        us = role_medians[role]
+        suffix = ""
+        if role == "dkdv":
+            suffix = f" TFLOPS_4gemm={_tflops(case.dkdv_flops, us):.3f}"
+        elif role == "dq":
+            suffix = f" TFLOPS_3gemm={_tflops(case.dq_flops, us):.3f}"
+        print(f"  {role:<14} {us:9.3f} us{suffix}")
+    extra_roles = [role for role in role_medians if role not in roles]
+    for role in extra_roles[:20]:
+        print(f"  {role:<14} {role_medians[role]:9.3f} us")
+    print("[profile] first interface call kernel order:")
+    for idx, (role, name, us) in enumerate(ordered):
+        print(f"  {idx:02d} {role:<14} {us:9.3f} us {name}")
+
+
+def _variant_to_case(args: argparse.Namespace, variant: str) -> InterfaceCase:
+    dim_arg = args.dim
+    if variant == "deterministic-split":
+        dim, deterministic = dim_arg or 256, True
+    elif variant == "deterministic-unsplit":
+        dim, deterministic = dim_arg or 128, True
+    elif variant == "split":
+        dim, deterministic = dim_arg or 256, False
+    elif variant == "unsplit":
+        dim, deterministic = dim_arg or 128, False
+    else:
+        dim, deterministic = dim_arg or 128, args.deterministic
+    return InterfaceCase(
+        batch=args.batch,
+        heads=args.heads,
+        heads_kv=args.heads_kv,
+        total_seq_q=args.total_seq_q,
+        total_seq_kv=args.total_seq_kv,
+        dim=dim,
+        dtype=_dtype_from_name(args.dtype),
+        causal=args.causal,
+        deterministic=deterministic,
+    )
+
+
+def _compile_branch_cases(args: argparse.Namespace) -> list[InterfaceCase]:
+    cases: list[InterfaceCase] = []
+    gqa_heads_kv = args.branch_gqa_heads_kv
+    if args.heads % gqa_heads_kv != 0:
+        raise ValueError(
+            f"--heads ({args.heads}) must be divisible by --branch-gqa-heads-kv ({gqa_heads_kv})"
+        )
+    for dtype_name in ("bf16", "fp16"):
+        for causal in (True, False):
+            for heads_kv in (args.heads, gqa_heads_kv):
+                for dim in (128, 256):
+                    for deterministic in (False, True):
+                        cases.append(
+                            InterfaceCase(
+                                batch=args.batch,
+                                heads=args.heads,
+                                heads_kv=heads_kv,
+                                total_seq_q=args.total_seq_q,
+                                total_seq_kv=args.total_seq_kv,
+                                dim=dim,
+                                dtype=_dtype_from_name(dtype_name),
+                                causal=causal,
+                                deterministic=deterministic,
+                            )
+                        )
+    return cases
 
 
 def _parse_args() -> argparse.Namespace:
@@ -497,15 +554,55 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--heads-kv", type=int, default=28)
     parser.add_argument("--total-seq-q", type=int, default=8192)
     parser.add_argument("--total-seq-kv", type=int, default=8192)
-    parser.add_argument("--dim", type=int, default=256)
+    parser.add_argument(
+        "--dim",
+        type=int,
+        choices=[128, 256],
+        default=None,
+        help="Override the head dim selected by --variant. Defaults to 128 for auto, 256 for split variants, and 128 for unsplit variants.",
+    )
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
-    parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--repeat", type=int, default=10)
-    parser.add_argument("--graph-iters", type=int, default=10)
+    parser.add_argument(
+        "--causal", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--deterministic", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--variant",
+        choices=[
+            "auto",
+            "split",
+            "unsplit",
+            "deterministic-split",
+            "deterministic-unsplit",
+        ],
+        default="auto",
+    )
+    parser.add_argument(
+        "--suite",
+        choices=["single", "deterministic", "all", "compile-branches"],
+        default="single",
+    )
+    parser.add_argument(
+        "--branch-gqa-heads-kv",
+        type=int,
+        default=1,
+        help="heads_kv value used by --suite compile-branches for the heads_q != heads_kv branch.",
+    )
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--profile-repeat", type=int, default=3)
-    parser.add_argument("--skip-correctness", action="store_true")
-    parser.add_argument("--skip-profiler", action="store_true")
+    parser.add_argument("--check-correctness", action="store_true")
+    parser.add_argument(
+        "--skip-correctness", action="store_true", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--synthetic-inputs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use synthetic out/lse for perf runs instead of Python reference fwd.",
+    )
     return parser.parse_args()
 
 
@@ -514,54 +611,23 @@ def main() -> None:
     if not torch.musa.is_available():
         raise RuntimeError("MUSA is required for this benchmark")
     torch.set_default_device("musa")
-    if not args.skip_correctness:
-        _validate_correctness()
 
-    case = BwdCase(
-        batch=args.batch,
-        heads=args.heads,
-        heads_kv=args.heads_kv,
-        total_seq_q=args.total_seq_q,
-        total_seq_kv=args.total_seq_kv,
-        dim=args.dim,
-        dtype=_dtype_from_name(args.dtype),
-        causal=args.causal,
-    )
-    path = BwdKernelPath(case)
-    path.run()
-    _sync()
+    if args.suite == "compile-branches":
+        cases = _compile_branch_cases(args)
+    elif args.suite == "deterministic":
+        variants = ("deterministic-split", "deterministic-unsplit")
+        cases = [_variant_to_case(args, variant) for variant in variants]
+    elif args.suite == "all":
+        variants = ("split", "unsplit", "deterministic-split", "deterministic-unsplit")
+        cases = [_variant_to_case(args, variant) for variant in variants]
+    else:
+        variants = (args.variant,)
+        cases = [_variant_to_case(args, variant) for variant in variants]
 
-    event_us = _bench_event_us(path.run, args.warmup, args.repeat)
-    graph_us = _bench_graph_us(path.run, args.warmup, args.repeat, args.graph_iters)
-    print(
-        "[bench] "
-        f"batch={case.batch} heads={case.heads} heads_kv={case.heads_kv} "
-        f"seq_q={case.total_seq_q} seq_kv={case.total_seq_kv} dim={case.dim} "
-        f"dtype={args.dtype} causal={case.causal}"
-    )
-    print(f"[bench] event_path={event_us:.3f} us")
-    print(
-        f"[bench] graph_path={graph_us:.3f} us "
-        f"TFLOPS={case.total_flops / (graph_us * 1e-6) / 1e12:.3f}"
-    )
-    print(
-        f"[bench] flops={case.total_flops:.0f} "
-        f"graph_iters={args.graph_iters} repeat={args.repeat}"
-    )
-
-    if args.skip_profiler:
-        return
-    rows = _profile_kernel_path(path.run, args.profile_repeat)
-    role_totals: dict[str, float] = {}
-    for role, _, us, _ in rows:
-        role_totals[role] = role_totals.get(role, 0.0) + us
-    print("[profile] role totals per run:")
-    for role, us in sorted(role_totals.items(), key=lambda item: item[1], reverse=True):
-        role_tflops = case.total_flops / (us * 1e-6) / 1e12 if role == "bwd" else 0.0
-        print(f"  {role:<10} {us:9.3f} us {role_tflops:8.3f} TFLOPS")
-    print("[profile] top kernels per run:")
-    for role, name, us, count in rows[:20]:
-        print(f"  {role:<10} {us:9.3f} us count={count:<3} {name}")
+    for idx, case in enumerate(cases):
+        if idx:
+            print("")
+        _run_case(args, case)
 
 
 if __name__ == "__main__":

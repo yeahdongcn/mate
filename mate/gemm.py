@@ -1,4 +1,5 @@
 import functools
+from enum import Enum
 from typing import Literal, Optional, Tuple, cast
 
 import torch
@@ -18,6 +19,37 @@ from mate.utils import ceil_div
 @functools.cache
 def _get_module():
     return get_gemm_ops_module()
+
+
+class GemmMixedDType(str, Enum):
+    S4FP8 = "s4fp8"
+
+
+def _resolve_gemm_mixed_dtype(
+    mixed_dtype: GemmMixedDType | str,
+) -> GemmMixedDType:
+    if not isinstance(mixed_dtype, GemmMixedDType):
+        try:
+            mixed_dtype = GemmMixedDType(mixed_dtype)
+        except ValueError as exc:
+            allowed = [item.value for item in GemmMixedDType]
+            raise ValueError(f"mixed_dtype must be one of {allowed}") from exc
+
+    return mixed_dtype
+
+
+def _resolve_moe_gemm_quant_recipe(
+    name: str,
+    quant_recipe: object,
+) -> Tuple[int, int]:
+    if (
+        not isinstance(quant_recipe, tuple)
+        or len(quant_recipe) != 2
+        or any(type(item) is not int for item in quant_recipe)
+    ):
+        raise TypeError(f"{name} must be a tuple of two int values")
+
+    return cast(Tuple[int, int], quant_recipe)
 
 
 @mate_api
@@ -283,15 +315,13 @@ def ragged_m_moe_gemm_8bit(
         **fp8_tensor** has shape ``(num_expert, out_hidden_size, hidden_size)`` and should be of fp8 (e4m3/e5m2) type.
         **scale_tensor** has shape ``(num_expert, out_hidden_size // scale_granularity_n, hidden_size // scale_granularity_k)`` and should be of fp32 type.
     ragged_tokens_info : Tensor
-        Tensor indicating which expert each token belongs to, with shape ``(total_tokens,)``.
-        Values represent expert indices, with -1 for unused positions.
-            If gemm_mode is `per_token`:
-            Tensor indicating which expert each token belongs to, with shape ``(total_tokens,)``.
-            Values represent expert indices, with -1 for unused positions.
-        If gemm_mode is `psum_expert`
-            Tensor with shape `(num_expert, )`, indicating how many tokens that first few experts have.
-        If gemm_mode is `per_expert`
-            Tensor with shape `(num_expert, )`, indicating how many tokens that every expert has.
+        Metadata tensor whose meaning depends on ``gemm_mode``.
+        For ``per_token``, it has shape ``(total_tokens,)`` and stores the
+        expert index for each token, with ``-1`` for unused positions.
+        For ``psum_expert``, it has shape ``(num_expert,)`` and stores how many
+        tokens the leading experts have in prefix-sum form.
+        For ``per_expert``, it has shape ``(num_expert,)`` and stores the token
+        count for each expert.
     out : Tensor
         Output tensor with shape ``(total_tokens, out_hidden_size)``.
     major_a_mode : Optional[str]
@@ -439,7 +469,9 @@ def masked_moe_gemm_8bit(
     enable_overlap : Optional[bool]
         Whether to enable Single-Batch Overlap (SBO). Default is False.
     signal : Optional[Tensor]
-        Signal tensor with shape ``(num_expert * ceil_div(max_m, 64))``for SBO. Required if enable_overlap is True. If None, a new tensor will be created if needed.
+        Signal tensor with shape ``(num_expert * ceil_div(max_m, 64))`` for
+        SBO. Required if ``enable_overlap`` is ``True``. If ``None``, a new
+        tensor is created when needed.
 
     Returns
     -------
@@ -512,6 +544,252 @@ def masked_moe_gemm_8bit(
         out,
         expect_tokens,
         signal,
+    )
+
+    return (out, signal, res[0], res[1]) if enable_overlap else out
+
+
+@mate_api
+def ragged_moe_gemm_mixed_dtype(
+    input_a: Tuple[torch.Tensor, torch.Tensor],
+    input_b: Tuple[torch.Tensor, torch.Tensor],
+    ragged_tokens_info: torch.Tensor,
+    out: torch.Tensor,
+    alignment_m: Optional[int] = None,
+    *,
+    mixed_dtype: GemmMixedDType | str,
+    backend: Optional[Literal["auto", "mubin"]] = "auto",
+    a_quant_recipe: Tuple[int, int],
+    b_quant_recipe: Tuple[int, int],
+):
+    """
+    Perform mixed-dtype GEMM operation for MoE (Mixture of Experts) with ragged tensor inputs.
+
+    This function computes matrix multiplication between mixed-dtype tensors for MoE models
+    where different experts may have variable numbers of tokens assigned to them.
+    Currently, only ``GemmMixedDType.S4FP8`` is supported, where S4 refers to
+    signed int4 weights for input B and FP8 refers to fp8 activations for input A.
+    The quantization recipes describe quantization block sizes for input A and
+    input B separately, and must be provided explicitly.
+
+    Parameters
+    ----------
+    input_a : Tuple[Tensor, Tensor]
+        Tuple containing (activation_tensor, scale_tensor) for input A.
+        **activation_tensor** has shape ``(total_tokens, hidden_size)``. Its dtype
+        is selected by ``mixed_dtype``. For ``GemmMixedDType.S4FP8``, it should
+        be of fp8 (e4m3/e5m2) type.
+        **scale_tensor** shape and dtype are selected by ``a_quant_recipe``. For
+        ``a_quant_recipe=(1, -1)``, it has shape ``(total_tokens,)``.
+    input_b : Tuple[Tensor, Tensor]
+        Tuple containing (weight_tensor, scale_tensor) for input B.
+        **weight_tensor** storage shape, dtype, and layout are selected by
+        ``mixed_dtype``.
+        **scale_tensor** shape and dtype are selected by ``b_quant_recipe``. For
+        ``b_quant_recipe=(1, 128)``, it has shape ``(num_expert,
+        out_hidden_size, ceil_div(hidden_size, 128))``.
+    ragged_tokens_info : Tensor
+        Tensor indicating which expert each token belongs to, with shape ``(total_tokens,)``.
+        Values represent expert indices, with ``-1`` for unused positions.
+    out : Tensor
+        Output tensor with shape ``(total_tokens, out_hidden_size)``.
+        Should be of fp16 or bf16 type.
+    alignment_m : Optional[int]
+        Alignment requirement for total_tokens (m) dimension. Must be 128 or 256.
+        Default is 128.
+    mixed_dtype : GemmMixedDType or str
+        Mixed dtype selector for input A and input B. Must be provided explicitly.
+        ``GemmMixedDType.S4FP8`` and ``"s4fp8"`` mean signed int4 weights for
+        input B and fp8 activations for input A.
+    backend : Optional[str]
+        Backend selector. Only ``"auto"`` and ``"mubin"`` are supported.
+    a_quant_recipe : Tuple[int, int]
+        Quantization block-size recipe for input A. The tuple is interpreted as
+        ``(m, k)``. ``-1`` means the corresponding axis is not split into
+        smaller quantization blocks. Currently, only ``(1, -1)`` is supported
+        for ``GemmMixedDType.S4FP8``.
+    b_quant_recipe : Tuple[int, int]
+        Quantization block-size recipe for input B. The tuple is interpreted as
+        ``(n, k)``. ``-1`` means the corresponding axis is not split into
+        smaller quantization blocks. Currently, only ``(1, 128)`` is supported
+        for ``GemmMixedDType.S4FP8``.
+
+    Returns
+    -------
+    Tensor
+        Result tensor with shape ``(total_tokens, out_hidden_size)`` containing the GEMM output in fp16 or bf16 data type.
+
+    """
+    if alignment_m is None:
+        alignment_m = 128
+
+    backend = cast(
+        Literal["auto", "mubin"],
+        resolve_backend(backend, supported=("mubin",), default="auto"),
+    )
+    if backend == "auto":
+        backend = "mubin"
+    mixed_dtype = _resolve_gemm_mixed_dtype(mixed_dtype)
+    a_quant_recipe = _resolve_moe_gemm_quant_recipe("a_quant_recipe", a_quant_recipe)
+    b_quant_recipe = _resolve_moe_gemm_quant_recipe("b_quant_recipe", b_quant_recipe)
+    if not (
+        mixed_dtype == GemmMixedDType.S4FP8
+        and a_quant_recipe == (1, -1)
+        and b_quant_recipe == (1, 128)
+        and backend == "mubin"
+    ):
+        raise NotImplementedError(
+            f"mixed_dtype={mixed_dtype.value}, a_quant_recipe={a_quant_recipe}, "
+            f"b_quant_recipe={b_quant_recipe}, backend={backend} is not supported"
+        )
+
+    packed_b, scale_b = input_b
+    _get_module().get_function("ragged_moe_gemm_mixed_dtype")(
+        input_a,
+        packed_b,
+        scale_b,
+        ragged_tokens_info,
+        out,
+        alignment_m,
+        a_quant_recipe,
+        b_quant_recipe,
+    )
+    return out
+
+
+@mate_api
+def masked_moe_gemm_mixed_dtype(
+    input_a: Tuple[torch.Tensor, torch.Tensor],
+    input_b: Tuple[torch.Tensor, torch.Tensor],
+    masked_tokens_info: torch.Tensor,
+    out: torch.Tensor,
+    expect_tokens: Optional[int] = None,
+    enable_overlap: bool = False,
+    signal: Optional[torch.Tensor] = None,
+    *,
+    mixed_dtype: GemmMixedDType | str,
+    backend: Optional[Literal["auto", "mubin"]] = "auto",
+    a_quant_recipe: Tuple[int, int],
+    b_quant_recipe: Tuple[int, int],
+):
+    """
+    Perform mixed-dtype GEMM operation for MoE (Mixture of Experts) with masked tensor inputs.
+
+    This function computes matrix multiplication between mixed-dtype tensors for MoE models
+    where different experts may have variable numbers of tokens, using a mask to indicate
+    the actual number of tokens per expert. Currently, only ``GemmMixedDType.S4FP8`` is
+    supported, where S4 refers to signed int4 weights for input B and FP8 refers to
+    fp8 activations for input A.
+    The quantization recipes describe quantization block sizes for input A and
+    input B separately, and must be provided explicitly.
+
+    Parameters
+    ----------
+    input_a : Tuple[Tensor, Tensor]
+        Tuple containing (activation_tensor, scale_tensor) for input A.
+        **activation_tensor** has shape ``(num_expert, max_tokens, hidden_size)``.
+        Its dtype is selected by ``mixed_dtype``. For ``GemmMixedDType.S4FP8``,
+        it should be of fp8 (e4m3/e5m2) type.
+        **scale_tensor** shape and dtype are selected by ``a_quant_recipe``. For
+        ``a_quant_recipe=(1, -1)``, it has shape ``(num_expert, max_tokens)``.
+    input_b : Tuple[Tensor, Tensor]
+        Tuple containing (weight_tensor, scale_tensor) for input B.
+        **weight_tensor** storage shape, dtype, and layout are selected by
+        ``mixed_dtype``.
+        **scale_tensor** shape and dtype are selected by ``b_quant_recipe``. For
+        ``b_quant_recipe=(1, 128)``, it has shape ``(num_expert,
+        out_hidden_size, ceil_div(hidden_size, 128))``.
+    masked_tokens_info : Tensor
+        Tensor indicating the actual number of tokens for each expert, with shape ``(num_expert,)``.
+        Values represent token counts for each expert.
+    out : Tensor
+        Output tensor with shape ``(num_expert, max_tokens, out_hidden_size)``.
+        Should be of fp16 or bf16 type.
+    expect_tokens : Optional[int]
+        Expected number of tokens. If None, defaults to 0.
+    enable_overlap : Optional[bool]
+        Whether to enable Single-Batch Overlap (SBO). Default is False.
+    signal : Optional[Tensor]
+        Signal tensor with shape ``(num_expert * ceil_div(max_m, 64))`` for
+        SBO. Required if ``enable_overlap`` is ``True``. If ``None``, a new
+        tensor is created when needed.
+    mixed_dtype : GemmMixedDType or str
+        Mixed dtype selector for input A and input B. Must be provided explicitly.
+        ``GemmMixedDType.S4FP8`` and ``"s4fp8"`` mean signed int4 weights for
+        input B and fp8 activations for input A.
+    backend : Optional[str]
+        Backend selector. Only ``"auto"`` and ``"mubin"`` are supported.
+    a_quant_recipe : Tuple[int, int]
+        Quantization block-size recipe for input A. The tuple is interpreted as
+        ``(m, k)``. ``-1`` means the corresponding axis is not split into
+        smaller quantization blocks. Currently, only ``(1, -1)`` is supported
+        for ``GemmMixedDType.S4FP8``.
+    b_quant_recipe : Tuple[int, int]
+        Quantization block-size recipe for input B. The tuple is interpreted as
+        ``(n, k)``. ``-1`` means the corresponding axis is not split into
+        smaller quantization blocks. Currently, only ``(1, 128)`` is supported
+        for ``GemmMixedDType.S4FP8``.
+
+    Returns
+    -------
+    Union[Tensor, Tuple[Tensor, Tensor, int, int]]
+        If ``enable_overlap`` is ``False``, returns result tensor with shape ``(num_expert, max_tokens, out_hidden_size)``.
+        If ``enable_overlap`` is ``True``, returns a tuple containing:
+
+            - result tensor with shape ``(num_expert, max_tokens, out_hidden_size)``
+            - signal tensor
+            - block_m int
+            - threshold int
+
+    """
+    if expect_tokens is None:
+        expect_tokens = 0
+
+    backend = cast(
+        Literal["auto", "mubin"],
+        resolve_backend(backend, supported=("mubin",), default="auto"),
+    )
+    if backend == "auto":
+        backend = "mubin"
+    mixed_dtype = _resolve_gemm_mixed_dtype(mixed_dtype)
+    a_quant_recipe = _resolve_moe_gemm_quant_recipe("a_quant_recipe", a_quant_recipe)
+    b_quant_recipe = _resolve_moe_gemm_quant_recipe("b_quant_recipe", b_quant_recipe)
+    if not (
+        mixed_dtype == GemmMixedDType.S4FP8
+        and a_quant_recipe == (1, -1)
+        and b_quant_recipe == (1, 128)
+        and backend == "mubin"
+    ):
+        raise NotImplementedError(
+            f"mixed_dtype={mixed_dtype.value}, a_quant_recipe={a_quant_recipe}, "
+            f"b_quant_recipe={b_quant_recipe}, backend={backend} is not supported"
+        )
+
+    if not enable_overlap:
+        signal = None
+
+    if enable_overlap and signal is None:
+        tile_signal = 64
+        a, _ = input_a
+        expert_sz = a.size(0)
+        max_m = a.size(1)
+        signal = torch.zeros(
+            expert_sz * ceil_div(max_m, tile_signal),
+            dtype=torch.int32,
+            device=a.device,
+        )
+
+    packed_b, scale_b = input_b
+    res = _get_module().get_function("masked_moe_gemm_mixed_dtype")(
+        input_a,
+        packed_b,
+        scale_b,
+        masked_tokens_info,
+        out,
+        expect_tokens,
+        signal,
+        a_quant_recipe,
+        b_quant_recipe,
     )
 
     return (out, signal, res[0], res[1]) if enable_overlap else out

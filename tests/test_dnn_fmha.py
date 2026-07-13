@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch_musa  # noqa: F401
 from mate import flash_attn_varlen_func
-from typing import Optional  # noqa: F401
+from typing import NamedTuple, Optional  # noqa: F401
 from mate.testing import supported_musa_compute_capability
 
 
@@ -89,6 +89,13 @@ def clone_with_grad(t: torch.Tensor) -> torch.Tensor:
     return t.clone().detach().requires_grad_(True)
 
 
+class FmhaRunResult(NamedTuple):
+    out: torch.Tensor
+    dq: torch.Tensor
+    dk: torch.Tensor
+    dv: torch.Tensor
+
+
 def strided_last_dim_tensor(
     shape: tuple[int, ...],
     *,
@@ -148,6 +155,142 @@ def fa_error_limit(
     return multiplier * pt_err + atol_floor
 
 
+def _detach_result(
+    out: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+) -> FmhaRunResult:
+    return FmhaRunResult(
+        out.detach().clone(),
+        dq.detach().clone(),
+        dk.detach().clone(),
+        dv.detach().clone(),
+    )
+
+
+def _run_fmha_case(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    grad_out: torch.Tensor,
+    *,
+    cu_query_lens: Optional[torch.Tensor],
+    cu_kv_lens: Optional[torch.Tensor],
+    max_query_len: Optional[int],
+    max_kv_len: Optional[int],
+    is_causal: bool,
+    deterministic: bool,
+) -> FmhaRunResult:
+    q_fa, k_fa, v_fa = map(clone_with_grad, (query, key_cache, value_cache))
+    out_fa = flash_attn_varlen_func(
+        q=q_fa,
+        k=k_fa,
+        v=v_fa,
+        cu_seqlens_q=cu_query_lens,
+        cu_seqlens_k=cu_kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        causal=is_causal,
+        deterministic=deterministic,
+    )
+    out_fa.backward(gradient=grad_out.detach().clone())
+    torch.musa.synchronize()
+    return _detach_result(out_fa, q_fa.grad, k_fa.grad, v_fa.grad)
+
+
+def _assert_bitwise_equal(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    name: str,
+    iteration: int,
+) -> None:
+    if torch.equal(actual, expected):
+        return
+    max_abs = (actual.float() - expected.float()).abs().max().item()
+    raise AssertionError(
+        f"{name} changed at DNN FMHA stress iteration {iteration}: "
+        f"max_abs_diff={max_abs}"
+    )
+
+
+def _stress_dnn_fmha_case(
+    pytestconfig: pytest.Config,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    grad_out: torch.Tensor,
+    *,
+    cu_query_lens: Optional[torch.Tensor],
+    cu_kv_lens: Optional[torch.Tensor],
+    max_query_len: Optional[int],
+    max_kv_len: Optional[int],
+    is_causal: bool,
+    deterministic: bool,
+    ref_result: FmhaRunResult,
+    pt_result: FmhaRunResult,
+) -> None:
+    iterations = pytestconfig.getoption("dnn_fmha_stress_iters")
+    if iterations < 0:
+        raise pytest.UsageError("--dnn-fmha-stress-iters must be >= 0")
+    if iterations <= 0:
+        return
+    mode = pytestconfig.getoption("dnn_fmha_stress_mode")
+    progress_interval = pytestconfig.getoption("dnn_fmha_stress_progress_interval")
+    if progress_interval < 0:
+        raise pytest.UsageError("--dnn-fmha-stress-progress-interval must be >= 0")
+    baseline: Optional[FmhaRunResult] = None
+
+    for iteration in range(1, iterations + 1):
+        try:
+            current = _run_fmha_case(
+                query,
+                key_cache,
+                value_cache,
+                grad_out,
+                cu_query_lens=cu_query_lens,
+                cu_kv_lens=cu_kv_lens,
+                max_query_len=max_query_len,
+                max_kv_len=max_kv_len,
+                is_causal=is_causal,
+                deterministic=deterministic,
+            )
+        except Exception as exc:
+            layout = "varlen" if cu_query_lens is not None else "bshd"
+            raise RuntimeError(
+                "DNN FMHA stress failed "
+                f"at iteration {iteration}/{iterations}, "
+                f"mode={mode}, layout={layout}, causal={is_causal}, "
+                f"deterministic={deterministic}"
+            ) from exc
+        if progress_interval and iteration % progress_interval == 0:
+            print(
+                f"DNN FMHA stress progress: iteration {iteration}/{iterations}, "
+                f"mode={mode}, deterministic={deterministic}",
+                flush=True,
+            )
+        if mode == "kernel-only":
+            continue
+
+        if not deterministic:
+            assert_fa_error_within_pt(
+                current.dq,
+                ref_result.dq,
+                pt_result.dq,
+                f"dq stress iter {iteration}",
+            )
+
+        if baseline is None:
+            baseline = current
+            continue
+
+        _assert_bitwise_equal(current.out, baseline.out, "out", iteration)
+        _assert_bitwise_equal(current.dk, baseline.dk, "dk", iteration)
+        _assert_bitwise_equal(current.dv, baseline.dv, "dv", iteration)
+        if deterministic:
+            _assert_bitwise_equal(current.dq, baseline.dq, "dq", iteration)
+
+
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize(
     "seq_lens",
@@ -169,6 +312,7 @@ def fa_error_limit(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("is_causal", [True, False])
 @pytest.mark.parametrize("is_varlen", [True])
+@pytest.mark.parametrize("deterministic", [True, False])
 def test_varlen_fast_attn(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
@@ -176,10 +320,16 @@ def test_varlen_fast_attn(
     dtype: torch.dtype,
     is_causal: bool,
     is_varlen: bool,
+    deterministic: bool,
+    pytestconfig: pytest.Config,
 ) -> None:
     torch.set_default_device("musa")
     torch.manual_seed(42)
     torch.musa.manual_seed(42)
+    if deterministic and head_size == (192, 128):
+        pytest.skip(
+            "deterministic TileLang backward does not support head_size=(192, 128)"
+        )
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
     num_query_heads = num_heads[0]
@@ -230,6 +380,7 @@ def test_varlen_fast_attn(
         max_seqlen_q=max_query_len,
         max_seqlen_k=max_kv_len,
         causal=is_causal,
+        deterministic=deterministic,
     )
 
     ref_output, _ = ref_attn(
@@ -279,269 +430,83 @@ def test_varlen_fast_attn(
     assert_fa_error_within_pt(dv_fa, dv_t, dv_pt, "dv")
     assert_fa_error_within_pt(dq_fa, dq_t, dq_pt, "dq")
 
-
-@supported_musa_compute_capability([31])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_varlen_fast_attn_gqa_dkv_stability(dtype: torch.dtype) -> None:
-    pytest.importorskip("tilelang")
-    from mate.flash_attention.tilelang.flash_attention_varlen_bwd import (
-        ceil_div,
-        compute_delta_ws,
-        flashattn_bwd_ws,
-        reduce_kv_grads_ws,
-        to_tilelang_dtype,
+    _stress_dnn_fmha_case(
+        pytestconfig,
+        query,
+        key_cache,
+        value_cache,
+        grad_out,
+        cu_query_lens=cu_query_lens,
+        cu_kv_lens=cu_kv_lens,
+        max_query_len=max_query_len,
+        max_kv_len=max_kv_len,
+        is_causal=is_causal,
+        deterministic=deterministic,
+        ref_result=_detach_result(ref_output, dq_t, dk_t, dv_t),
+        pt_result=_detach_result(pt_output, dq_pt, dk_pt, dv_pt),
     )
 
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("seq_lens", [[(511, 511)], [(63, 63)]])
+@pytest.mark.parametrize("num_heads", [(6, 1), (6, 6)])
+@pytest.mark.parametrize("head_size", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_causal", [True, False])
+@pytest.mark.parametrize("is_varlen", [False])
+@pytest.mark.parametrize("deterministic", [True, False])
+def test_bshd_fast_attn(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: tuple[int, int],
+    dtype: torch.dtype,
+    is_causal: bool,
+    is_varlen: bool,
+    deterministic: bool,
+    pytestconfig: pytest.Config,
+) -> None:
     torch.set_default_device("musa")
     torch.manual_seed(42)
     torch.musa.manual_seed(42)
-    seq_lens = [
-        (512, 512),
-        (511, 511),
-        (384, 384),
-        (257, 257),
-        (128, 128),
-        (65, 65),
-        (320, 320),
-        (192, 192),
-    ]
+    if deterministic and head_size == (192, 128):
+        pytest.skip(
+            "deterministic TileLang backward does not support head_size=(192, 128)"
+        )
+    if head_size == (192, 128):
+        pytest.skip("non-varlen DNN fallback backward is not covered here")
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
-    cu_q = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
-        dim=0, dtype=torch.int32
-    )
-    cu_k = torch.tensor([0] + kv_lens, dtype=torch.int32).cumsum(
-        dim=0, dtype=torch.int32
-    )
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)
-    num_query_heads, num_kv_heads, head_dim = 6, 1, 256
-    scale = head_dim**-0.5
+    head_size_qk = head_size[0]
+    head_size_v = head_size[1]
+    scale = head_size_qk**-0.5
 
-    q = torch.randn(
-        (sum(query_lens), num_query_heads, head_dim),
+    batch = len(seq_lens)
+    assert len(set(query_lens)) == 1
+    assert len(set(kv_lens)) == 1
+    query = torch.randn(
+        (batch, max_query_len, num_query_heads, head_size_qk),
         dtype=dtype,
         requires_grad=True,
     )
-    k = torch.randn(
-        (sum(kv_lens), num_kv_heads, head_dim),
+    key_cache = torch.randn(
+        (batch, max_kv_len, num_kv_heads, head_size_qk),
         dtype=dtype,
         requires_grad=True,
     )
-    v = torch.randn(
-        (sum(kv_lens), num_kv_heads, head_dim),
-        dtype=dtype,
-        requires_grad=True,
-    )
-    q_t, k_t, v_t = map(clone_with_grad, (q, k, v))
-    q_pt, k_pt, v_pt = map(clone_with_grad, (q, k, v))
-
-    ref_output, _ = ref_attn(
-        q_t,
-        k_t,
-        v_t,
-        cu_q,
-        cu_k,
-        max_query_len,
-        max_kv_len,
-        is_causal=False,
-        is_varlen=True,
-        scale=scale,
-        upcast=True,
-    )
-    pt_output, _ = ref_attn(
-        q_pt,
-        k_pt,
-        v_pt,
-        cu_q,
-        cu_k,
-        max_query_len,
-        max_kv_len,
-        is_causal=False,
-        is_varlen=True,
-        scale=scale,
-        upcast=False,
-        reorder_ops=True,
-    )
-    grad_out = torch.randn_like(ref_output)
-    ref_output.backward(gradient=grad_out, retain_graph=True)
-    pt_output.backward(gradient=grad_out, retain_graph=True)
-    q_static = q.detach()
-    k_static = k.detach()
-    v_static = v.detach()
-    dk_limit = fa_error_limit(k_t.grad, k_pt.grad)
-    dv_limit = fa_error_limit(v_t.grad, v_pt.grad)
-    kernel_dtype = to_tilelang_dtype(dtype)
-    max_seq_q_padded = ceil_div(max_query_len, 64) * 64
-    num_blocks_kv = ceil_div(max_kv_len, 64)
-    delta_kernel = compute_delta_ws(
-        head_dim,
-        is_varlen=True,
-        dtype=kernel_dtype,
-        block_M=64,
-        threads=640,
-    )
-    bwd_kernel = flashattn_bwd_ws(
-        dim=head_dim,
-        is_causal=False,
-        is_varlen=True,
-        heads_q_eq_heads_kv=False,
-        block_M=64,
-        block_N=64,
-        smscale=scale,
-        threads=640,
-        dtype=kernel_dtype,
-    )
-    reduce_kernel = reduce_kv_grads_ws(
-        num_query_heads // num_kv_heads,
-        head_dim,
-        is_varlen=True,
-    )
-
-    dK_accum_results: list[torch.Tensor] = []
-    dV_accum_results: list[torch.Tensor] = []
-    dk_results: list[torch.Tensor] = []
-    dv_results: list[torch.Tensor] = []
-    repeat = 8
-    for _ in range(repeat):
-        with torch.no_grad():
-            out_fa, softmax_lse = flash_attn_varlen_func(
-                q=q_static,
-                k=k_static,
-                v=v_static,
-                cu_seqlens_q=cu_q,
-                cu_seqlens_k=cu_k,
-                max_seqlen_q=max_query_len,
-                max_seqlen_k=max_kv_len,
-                causal=False,
-                return_softmax_lse=True,
-            )
-
-        delta = torch.empty(
-            (q_static.shape[0], num_query_heads),
-            device=q_static.device,
-            dtype=torch.float32,
-        )
-        delta_kernel(out_fa, grad_out, delta)
-        dQ_accum = torch.zeros(
-            (len(seq_lens), num_query_heads, max_seq_q_padded, head_dim),
-            dtype=torch.float32,
-            device=q_static.device,
-        )
-        dK_accum = torch.zeros(
-            (k_static.shape[0], num_query_heads, head_dim),
-            dtype=torch.float32,
-            device=k_static.device,
-        )
-        dV_accum = torch.zeros(
-            (v_static.shape[0], num_query_heads, head_dim),
-            dtype=torch.float32,
-            device=v_static.device,
-        )
-        debug = torch.empty((num_blocks_kv,), device=q_static.device, dtype=torch.int32)
-        bwd_kernel(
-            q_static,
-            k_static,
-            v_static,
-            out_fa,
-            dQ_accum,
-            dK_accum,
-            dV_accum,
-            grad_out,
-            cu_q,
-            cu_k,
-            softmax_lse,
-            delta,
-            debug,
-        )
-        torch.musa.synchronize()
-        dK_accum_results.append(dK_accum.detach().clone())
-        dV_accum_results.append(dV_accum.detach().clone())
-        dk = torch.empty(k_static.shape, dtype=torch.float32, device=k_static.device)
-        dv = torch.empty(v_static.shape, dtype=torch.float32, device=v_static.device)
-        reduce_kernel(dK_accum, dV_accum, dk, dv)
-        torch.musa.synchronize()
-        dk_results.append(dk.to(dtype))
-        dv_results.append(dv.to(dtype))
-
-    base_dK_accum = dK_accum_results[0]
-    base_dV_accum = dV_accum_results[0]
-    base_dk = dk_results[0]
-    base_dv = dv_results[0]
-    for i, (dK_accum, dV_accum, dk, dv) in enumerate(
-        zip(dK_accum_results, dV_accum_results, dk_results, dv_results)
-    ):
-        dK_accum_stable_err = (dK_accum - base_dK_accum).abs().max().item()
-        dV_accum_stable_err = (dV_accum - base_dV_accum).abs().max().item()
-        dk_ref_err = (dk - k_t.grad).abs().max().item()
-        dv_ref_err = (dv - v_t.grad).abs().max().item()
-        dk_stable_err = (dk - base_dk).abs().max().item()
-        dv_stable_err = (dv - base_dv).abs().max().item()
-        assert dK_accum_stable_err == 0.0, (
-            f"run {i} dK_accum is not stable across repeated identical inputs; "
-            f"max drift from run 0 is {dK_accum_stable_err}"
-        )
-        assert dV_accum_stable_err == 0.0, (
-            f"run {i} dV_accum is not stable across repeated identical inputs; "
-            f"max drift from run 0 is {dV_accum_stable_err}"
-        )
-        assert dk_ref_err <= dk_limit, (
-            f"run {i} dk max error {dk_ref_err} exceeds reference limit {dk_limit}; "
-            f"max drift from run 0 is {dk_stable_err}"
-        )
-        assert dv_ref_err <= dv_limit, (
-            f"run {i} dv max error {dv_ref_err} exceeds reference limit {dv_limit}; "
-            f"max drift from run 0 is {dv_stable_err}"
-        )
-        assert dk_stable_err == 0.0, (
-            f"run {i} dk is not stable across repeated identical inputs; "
-            f"max drift from run 0 is {dk_stable_err}"
-        )
-        assert dv_stable_err == 0.0, (
-            f"run {i} dv is not stable across repeated identical inputs; "
-            f"max drift from run 0 is {dv_stable_err}"
-        )
-
-
-@supported_musa_compute_capability([31])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize("num_query_heads,num_kv_heads", [(4, 2), (2, 2)])
-def test_flash_attn_bwd_non_varlen_bshd_fa3_api(
-    dtype: torch.dtype,
-    is_causal: bool,
-    num_query_heads: int,
-    num_kv_heads: int,
-) -> None:
-    pytest.importorskip("tilelang")
-    torch.manual_seed(1)
-    torch.musa.manual_seed(1)
-    device = "musa"
-    batch, seqlen_q, seqlen_k = 2, 16, 16
-    head_dim = 256
-    scale = head_dim**-0.5
-
-    q_fa = strided_last_dim_tensor(
-        (batch, seqlen_q, num_query_heads, head_dim),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    k_fa = strided_last_dim_tensor(
-        (batch, seqlen_k, num_kv_heads, head_dim),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    v_fa = strided_last_dim_tensor(
-        (batch, seqlen_k, num_kv_heads, head_dim),
-        device=device,
+    value_cache = torch.randn(
+        (batch, max_kv_len, num_kv_heads, head_size_v),
         dtype=dtype,
         requires_grad=True,
     )
 
-    q_t, k_t, v_t = map(clone_with_grad, (q_fa, k_fa, v_fa))
-    q_pt, k_pt, v_pt = map(clone_with_grad, (q_fa, k_fa, v_fa))
+    q_fa, k_fa, v_fa = map(clone_with_grad, (query, key_cache, value_cache))
+    q_t, k_t, v_t = map(clone_with_grad, (query, key_cache, value_cache))
+    q_pt, k_pt, v_pt = map(clone_with_grad, (query, key_cache, value_cache))
 
     out_fa = flash_attn_varlen_func(
         q=q_fa,
@@ -552,133 +517,68 @@ def test_flash_attn_bwd_non_varlen_bshd_fa3_api(
         max_seqlen_q=None,
         max_seqlen_k=None,
         causal=is_causal,
-        softmax_scale=scale,
-        backend="mutlass",
+        deterministic=deterministic,
     )
+
     ref_output, _ = ref_attn(
-        q_t,
-        k_t,
-        v_t,
-        None,
-        None,
-        seqlen_q,
-        seqlen_k,
+        query=q_t,
+        key_cache=k_t,
+        value_cache=v_t,
+        cu_query_lens=None,
+        cu_kv_lens=None,
+        max_query_len=max_query_len,
+        max_kv_len=max_kv_len,
         is_causal=is_causal,
-        is_varlen=False,
+        is_varlen=is_varlen,
         scale=scale,
         upcast=True,
     )
     pt_output, _ = ref_attn(
-        q_pt,
-        k_pt,
-        v_pt,
-        None,
-        None,
-        seqlen_q,
-        seqlen_k,
+        query=q_pt,
+        key_cache=k_pt,
+        value_cache=v_pt,
+        cu_query_lens=None,
+        cu_kv_lens=None,
+        max_query_len=max_query_len,
+        max_kv_len=max_kv_len,
         is_causal=is_causal,
-        is_varlen=False,
+        is_varlen=is_varlen,
         scale=scale,
         upcast=False,
         reorder_ops=True,
     )
+    grad_out = torch.randn_like(out_fa)
 
-    grad_out = copy_to_strided_last_dim(torch.randn_like(out_fa))
-    out_fa.backward(gradient=grad_out, retain_graph=True)
-    ref_output.backward(gradient=grad_out, retain_graph=True)
-    pt_output.backward(gradient=grad_out, retain_graph=True)
+    grad_fa = clone_with_grad(grad_out)
+    grad_t = clone_with_grad(grad_out)
+    grad_pt = clone_with_grad(grad_out)
+
+    out_fa.backward(gradient=grad_fa, retain_graph=True)
+    dq_fa, dk_fa, dv_fa = q_fa.grad, k_fa.grad, v_fa.grad
+
+    ref_output.backward(gradient=grad_t, retain_graph=True)
+    dq_t, dk_t, dv_t = q_t.grad, k_t.grad, v_t.grad
+
+    pt_output.backward(gradient=grad_pt, retain_graph=True)
+    dq_pt, dk_pt, dv_pt = q_pt.grad, k_pt.grad, v_pt.grad
 
     assert_fa_error_within_pt(out_fa, ref_output, pt_output, "out")
-    assert_fa_error_within_pt(q_fa.grad, q_t.grad, q_pt.grad, "dq")
-    assert_fa_error_within_pt(k_fa.grad, k_t.grad, k_pt.grad, "dk")
-    assert_fa_error_within_pt(v_fa.grad, v_t.grad, v_pt.grad, "dv")
+    assert_fa_error_within_pt(dk_fa, dk_t, dk_pt, "dk")
+    assert_fa_error_within_pt(dv_fa, dv_t, dv_pt, "dv")
+    assert_fa_error_within_pt(dq_fa, dq_t, dq_pt, "dq")
 
-
-@supported_musa_compute_capability([31])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("is_causal", [False, True])
-def test_flash_attn_bwd_varlen_strided_inputs_fa3_api(
-    dtype: torch.dtype,
-    is_causal: bool,
-) -> None:
-    pytest.importorskip("tilelang")
-    torch.manual_seed(3)
-    torch.musa.manual_seed(3)
-    device = "musa"
-    cu_q = torch.tensor([0, 9, 25], dtype=torch.int32, device=device)
-    cu_k = torch.tensor([0, 11, 27], dtype=torch.int32, device=device)
-    total_q, total_k = int(cu_q[-1].item()), int(cu_k[-1].item())
-    max_seqlen_q, max_seqlen_k = 16, 16
-    num_query_heads, num_kv_heads, head_dim = 2, 2, 256
-    scale = head_dim**-0.5
-
-    q_fa = strided_last_dim_tensor(
-        (total_q, num_query_heads, head_dim),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    k_fa = strided_last_dim_tensor(
-        (total_k, num_kv_heads, head_dim),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    v_fa = strided_last_dim_tensor(
-        (total_k, num_kv_heads, head_dim),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    q_t, k_t, v_t = map(clone_with_grad, (q_fa, k_fa, v_fa))
-    q_pt, k_pt, v_pt = map(clone_with_grad, (q_fa, k_fa, v_fa))
-
-    out_fa = flash_attn_varlen_func(
-        q=q_fa,
-        k=k_fa,
-        v=v_fa,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        causal=is_causal,
-        softmax_scale=scale,
-        backend="mutlass",
-    )
-    out_ref, _ = ref_attn(
-        q_t,
-        k_t,
-        v_t,
-        cu_q,
-        cu_k,
-        max_seqlen_q,
-        max_seqlen_k,
+    _stress_dnn_fmha_case(
+        pytestconfig,
+        query,
+        key_cache,
+        value_cache,
+        grad_out,
+        cu_query_lens=None,
+        cu_kv_lens=None,
+        max_query_len=None,
+        max_kv_len=None,
         is_causal=is_causal,
-        is_varlen=True,
-        scale=scale,
-        upcast=True,
+        deterministic=deterministic,
+        ref_result=_detach_result(ref_output, dq_t, dk_t, dv_t),
+        pt_result=_detach_result(pt_output, dq_pt, dk_pt, dv_pt),
     )
-    pt_output, _ = ref_attn(
-        q_pt,
-        k_pt,
-        v_pt,
-        cu_q,
-        cu_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        is_causal=is_causal,
-        is_varlen=True,
-        scale=scale,
-        upcast=False,
-        reorder_ops=True,
-    )
-    dout = copy_to_strided_last_dim(torch.randn_like(out_fa))
-    out_fa.backward(gradient=dout)
-    out_ref.backward(gradient=dout)
-    pt_output.backward(gradient=dout)
-    torch.musa.synchronize()
-
-    assert_fa_error_within_pt(out_fa, out_ref, pt_output, "out")
-    assert_fa_error_within_pt(q_fa.grad, q_t.grad, q_pt.grad, "dq")
-    assert_fa_error_within_pt(k_fa.grad, k_t.grad, k_pt.grad, "dk")
-    assert_fa_error_within_pt(v_fa.grad, v_t.grad, v_pt.grad, "dv")

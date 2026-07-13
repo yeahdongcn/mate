@@ -86,8 +86,10 @@ struct FmhaFwdKernelWarpSpecialized {
     uint8_t PipelineVt[MainloopPipelineVt::NumBarriers];
     uint8_t PipelineKNew[MainloopPipelineKVNew::NumBarriers];
     uint8_t PipelineVNew[MainloopPipelineKVNew::NumBarriers];
-    uint8_t ConsumerSync[1];
   };
+  static_assert(sizeof(BarrierStorage) + mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount <=
+                    mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers,
+                "FMHA async barrier storage exceeds hardware limit");
 
   struct Arguments {
     typename CollectiveMainloop::Arguments mainloop;
@@ -155,8 +157,8 @@ struct FmhaFwdKernelWarpSpecialized {
       pipeline_params_q.num_consumers     = NumQKMmaWarps;
     }
     MainloopPipelineQ      pipeline_q(pipeline_params_q, reinterpret_cast<uint64_t>(&barrier_storage->PipelineQ));
-    MainloopPipelineQState mainloop_pipe_q_producer_state;
-    // MainloopPipelineQState mainloop_pipe_q_producer_state = mutlass::make_producer_start_state<MainloopPipelineQ>();
+    MainloopPipelineQState mainloop_pipe_q_producer_state =
+        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineQ>();
     MainloopPipelineQState mainloop_pipe_q_consumer_state;
 
     MainloopPipelineQvParams pipeline_params_qv;
@@ -169,7 +171,8 @@ struct FmhaFwdKernelWarpSpecialized {
     }
     auto pipeline_qv = conditional_return<HasQv>(
         MainloopPipelineQv(pipeline_params_qv, reinterpret_cast<uint64_t>(&barrier_storage->PipelineQv)), nullptr);
-    MainloopPipelineQvState mainloop_pipe_qv_producer_state;
+    MainloopPipelineQvState mainloop_pipe_qv_producer_state =
+        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineQv>();
     MainloopPipelineQvState mainloop_pipe_qv_consumer_state;
 
     MainloopPipelineKParams pipeline_params_k;
@@ -181,8 +184,8 @@ struct FmhaFwdKernelWarpSpecialized {
       pipeline_params_k.num_consumers     = NumQKMmaWarps;
     }
     MainloopPipelineK      pipeline_k(pipeline_params_k, reinterpret_cast<uint64_t>(&barrier_storage->PipelineK));
-    MainloopPipelineKState mainloop_pipe_k_producer_state;
-    // MainloopPipelineKState mainloop_pipe_k_producer_state = mutlass::make_producer_start_state<MainloopPipelineK>();
+    MainloopPipelineKState mainloop_pipe_k_producer_state =
+        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineK>();
     MainloopPipelineKState mainloop_pipe_k_consumer_state;
 
     MainloopPipelineVParams pipeline_params_v;
@@ -194,8 +197,8 @@ struct FmhaFwdKernelWarpSpecialized {
       pipeline_params_v.num_consumers     = InKernelTranspose ? NumQKMmaWarps + NumTransWarps : NumPVMmaWarps;
     }
     MainloopPipelineV      pipeline_v(pipeline_params_v, reinterpret_cast<uint64_t>(&barrier_storage->PipelineV));
-    MainloopPipelineVState mainloop_pipe_v_producer_state;
-    // MainloopPipelineVState mainloop_pipe_v_producer_state = mutlass::make_producer_start_state<MainloopPipelineV>();
+    MainloopPipelineVState mainloop_pipe_v_producer_state =
+        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineV>();
     MainloopPipelineVState mainloop_pipe_v_consumer_state;
 
     MainloopPipelineVtParams pipeline_params_vt;
@@ -203,7 +206,8 @@ struct FmhaFwdKernelWarpSpecialized {
     pipeline_params_vt.consumer_arv_count = NumPVMmaWarps;
     auto pipeline_vt                      = conditional_return<InKernelTranspose>(
         MainloopPipelineVt(pipeline_params_vt, reinterpret_cast<uint64_t>(&barrier_storage->PipelineVt)), nullptr);
-    MainloopPipelineVtState mainloop_pipe_vt_producer_state;
+    MainloopPipelineVtState mainloop_pipe_vt_producer_state =
+        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineVt>();
     MainloopPipelineVtState mainloop_pipe_vt_consumer_state;
 
     MainloopPipelineKVNewParams pipeline_params_k_new;
@@ -212,9 +216,8 @@ struct FmhaFwdKernelWarpSpecialized {
     uint64_t pipeline_k_new_storage         = reinterpret_cast<uint64_t>(&barrier_storage->PipelineKNew);
     auto     pipeline_k_new =
         conditional_return<IsAppendKV>(MainloopPipelineKVNew(pipeline_params_k_new, pipeline_k_new_storage), nullptr);
-    MainloopPipelineKVNewState mainloop_pipe_kv_new_producer_state;
-    // MainloopPipelineKVNewState mainloop_pipe_kv_new_producer_state =
-    // mutlass::make_producer_start_state<MainloopPipelineKVNew>();
+    MainloopPipelineKVNewState mainloop_pipe_kv_new_producer_state =
+        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineKVNew>();
     MainloopPipelineKVNewState mainloop_pipe_kv_new_consumer_state;
 
     MainloopPipelineKVNewParams pipeline_params_v_new;
@@ -340,13 +343,6 @@ struct FmhaFwdKernelWarpSpecialized {
       }
     } else if (warp_squad_idx == TransWarpSquadIdx) {
       if constexpr (InKernelTranspose) {
-        auto state_v = mainloop_pipe_v_consumer_state;
-        MUTE_UNROLL
-        for (int i = 0; i < StagesV; ++i) {
-          pipeline_v.consumer_release(state_v);
-          ++state_v;
-        }
-
         MUTLASS_PRAGMA_NO_UNROLL
         for (auto work_tile_info = scheduler.get_initial_work(params.scheduler);
              work_tile_info.is_valid(params.scheduler);
@@ -400,53 +396,6 @@ struct FmhaFwdKernelWarpSpecialized {
         }
       }
     } else {
-      // dummy
-      auto state_q = mainloop_pipe_q_consumer_state;
-      auto state_k = mainloop_pipe_k_consumer_state;
-      auto state_v = mainloop_pipe_v_consumer_state;
-
-      auto state_kv_new = mainloop_pipe_kv_new_consumer_state;
-
-      MUTE_UNROLL
-      for (int i = 0; i < StagesQ; ++i) {
-        pipeline_q.consumer_release(state_q);
-        ++state_q;
-      }
-      if constexpr (HasQv) {
-        auto state_qv = mainloop_pipe_qv_consumer_state;
-        MUTE_UNROLL
-        for (int i = 0; i < CollectiveMainloop::StagesQv; ++i) {
-          pipeline_qv.consumer_release(state_qv);
-          ++state_qv;
-        }
-      }
-      MUTE_UNROLL
-      for (int i = 0; i < StagesK; ++i) {
-        pipeline_k.consumer_release(state_k);
-        ++state_k;
-      }
-      MUTE_UNROLL
-      for (int i = 0; i < StagesV; ++i) {
-        pipeline_v.consumer_release(state_v);
-        ++state_v;
-      }
-      if constexpr (InKernelTranspose) {
-        auto state_vt = mainloop_pipe_vt_consumer_state;
-        MUTE_UNROLL
-        for (int i = 0; i < StagesVt; ++i) {
-          pipeline_vt.consumer_release(state_vt);
-          ++state_vt;
-        }
-      }
-      if constexpr (IsAppendKV) {
-        MUTE_UNROLL
-        for (int i = 0; i < StagesK; ++i) {
-          pipeline_k_new.consumer_release(state_kv_new);
-          pipeline_v_new.consumer_release(state_kv_new);
-          ++state_kv_new;
-        }
-      }
-
       // Consumer
       MUTLASS_PRAGMA_NO_UNROLL
       for (auto work_tile_info = scheduler.get_initial_work(params.scheduler);
@@ -498,8 +447,8 @@ struct FmhaFwdKernelWarpSpecialized {
             params.mainloop.cp_rank /* cp_rank */,
             params.mainloop.cp_tot_seqused_k /* cp_tot_seqused_k */};
 
-        barrier_kv.sync();
         if constexpr (IsAppendKV) {
+          barrier_kv.sync();
           bool is_valid_new = mainloop.store_kv_new(params.mainloop,
                                                     pipeline_k_new,
                                                     pipeline_v_new,

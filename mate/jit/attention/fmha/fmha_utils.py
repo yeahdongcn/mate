@@ -4,17 +4,6 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from ... import env as jit_env
 from ....utils import ceil_div
 
-
-@lru_cache
-def _get_fmha_template_env(template_dir: str) -> Environment:
-    return Environment(
-        loader=FileSystemLoader(template_dir),
-        undefined=StrictUndefined,
-        trim_blocks=True,
-        lstrip_blocks=True,
-    )
-
-
 FMHA_EXTRA_CUDA_CFLAGS = [
     "-Od3",
     "-DNDEBUG",
@@ -25,6 +14,16 @@ FMHA_EXTRA_CUDA_CFLAGS = [
     "-mllvm",
     "--num-dwords-of-load-in-mutation=64",
 ]
+
+
+@lru_cache
+def _get_fmha_template_env(template_dir: str) -> Environment:
+    return Environment(
+        loader=FileSystemLoader(template_dir),
+        undefined=StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
 
 
 def get_fmha_template(template_name: str):

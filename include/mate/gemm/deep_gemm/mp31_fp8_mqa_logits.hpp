@@ -606,7 +606,7 @@ struct Mp31Fp8NonPagedMqaLogits {
       Tensor tKsK = thr_mma.partition_A(sK(make_coord(_, kv_group_idx), _, _));
       Tensor tKrK = thr_mma.make_fragment_A(tKsK);
 
-      const auto stride_row = get<0>(params.stride_logits);
+      const int64_t stride_row = get<0>(params.stride_logits);
 
       const uint32_t mp_idx       = (uint32_t)blockIdx.x;
       const uint32_t num_mps      = (uint32_t)gridDim.x;
@@ -684,14 +684,14 @@ struct Mp31Fp8NonPagedMqaLogits {
           pipeline_k.consumer_release(pipe_k_read);
           ++pipe_k_read;
 
-          const int q_block_base  = int(task.q_group_idx) * kBlockQ;
-          const int kv_block_base = int(kv_block_idx) * kBlockKV + sub_warp_offset;
+          const int64_t q_block_base  = static_cast<int64_t>(task.q_group_idx) * kBlockQ;
+          const int64_t kv_block_base = static_cast<int64_t>(kv_block_idx) * kBlockKV + sub_warp_offset;
 
           MUTE_UNROLL
           for (int row_base = 0; row_base + (kBurst - 1) < kRows; row_base += kBurst) {
             MUTE_UNROLL
             for (int ni = 0; ni < kBlockQ; ++ni) {
-              const int q_row = q_block_base + ni;
+              const int64_t q_row = q_block_base + ni;
 
               f4        accv     = f4{0.f, 0.f, 0.f, 0.f};
               const int col_base = ni * J;
@@ -722,7 +722,7 @@ struct Mp31Fp8NonPagedMqaLogits {
 
               float* out_row = params.ptr_logits + q_row * stride_row;
 
-              const int kv_base = kv_block_base + base_v_offset + row_base * kKVPack;
+              const int64_t kv_base = kv_block_base + base_v_offset + static_cast<int64_t>(row_base) * kKVPack;
 
               const float s0 = sum4[0];
               const float s1 = sum4[1];
@@ -737,12 +737,12 @@ struct Mp31Fp8NonPagedMqaLogits {
                 p[3 * kKVPack] = s3;
               } else {
                 const int32_t ks_row  = __ldg(params.ptr_ks + q_row);
-                const int32_t lc_base = (int32_t)kv_base - ks_row;
+                const int64_t lc_base = kv_base - static_cast<int64_t>(ks_row);
 
-                const int32_t lc0 = lc_base + 0;
-                const int32_t lc1 = lc_base + kKVPack;
-                const int32_t lc2 = lc_base + 2 * kKVPack;
-                const int32_t lc3 = lc_base + 3 * kKVPack;
+                const int64_t lc0 = lc_base + 0;
+                const int64_t lc1 = lc_base + kKVPack;
+                const int64_t lc2 = lc_base + 2 * kKVPack;
+                const int64_t lc3 = lc_base + 3 * kKVPack;
 
                 if (lc0 >= 0 && lc3 < params.max_seq_kv) {
                   float* p       = out_row + lc0;

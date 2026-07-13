@@ -532,9 +532,9 @@ struct Mp31Fp8PagedMqaLogits {
         pipeline_k.consumer_release(pipeline_k_consumer_state);
         ++pipeline_k_consumer_state;
 
-        const int kv_block_base = int(kv_idx + kv_group_idx) * BLOCK_KV + sub_warp_offset;
-        const int stride_row    = get<0>(params.stride_logits);
-        const int J             = int(NumHeads / reduction_target);
+        const int64_t kv_block_base = static_cast<int64_t>(kv_idx + kv_group_idx) * BLOCK_KV + sub_warp_offset;
+        const int64_t stride_row    = get<0>(params.stride_logits);
+        const int     J             = int(NumHeads / reduction_target);
 
         MUTE_UNROLL
         for (int row_base = 0; row_base + (kBurst - 1) < kRows; row_base += kBurst) {
@@ -567,14 +567,15 @@ struct Mp31Fp8PagedMqaLogits {
             accv    = bst4_mul_vv(sc, accv);
             f4 sum4 = warp_group_reduce_sum_f4<reduction_target>(accv);
 
-            float* out_row = params.ptr_logits + (int(q_idx) * NextN + ni) * stride_row;
+            const int64_t row_idx = static_cast<int64_t>(q_idx) * NextN + ni;
+            float*        out_row = params.ptr_logits + row_idx * stride_row;
 
-            const int kv_base = kv_block_base + base_v_offset + row_base * kKVPack;
-            float*    p       = out_row + kv_base;
-            p[0]              = sum4[0];
-            p[1 * kKVPack]    = sum4[1];
-            p[2 * kKVPack]    = sum4[2];
-            p[3 * kKVPack]    = sum4[3];
+            const int64_t kv_base = kv_block_base + base_v_offset + static_cast<int64_t>(row_base) * kKVPack;
+            float*        p       = out_row + kv_base;
+            p[0]                  = sum4[0];
+            p[1 * kKVPack]        = sum4[1];
+            p[2 * kKVPack]        = sum4[2];
+            p[3 * kKVPack]        = sum4[3];
           }
         }
       }

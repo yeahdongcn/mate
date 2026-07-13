@@ -126,7 +126,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
   static constexpr bool IsFP8 =
       mute::is_same_v<Element, mutlass::float_e4m3_t> || mute::is_same_v<Element, mutlass::float_e5m2_t>;
-  static constexpr int MaxOffset = 0;  // IsFP8 ? 8 : 0;
+  static constexpr int MaxOffset = IsFP8 ? 8 : 0;
 
   static constexpr int UsePackGQATMELoad =
       IsPackGQA_ && mutlass::is_pow2<TileHeadRatio>::value && TileM % TileHeadRatio == 0;
@@ -154,6 +154,23 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr int StagesV  = StagesV_;
   static constexpr int StagesVt = StagesV;
   static constexpr int StagesQv = 1;
+
+  static constexpr int MaxBarPerStageRatio = 4;
+
+  static constexpr int AdditionalBarrier = static_cast<int>(FwdNamedBarriers::NumFwdNamedBarriers) +
+                                           static_cast<int>(mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount);
+
+  using BarPerStageRatioHelper = mutlass::Mp31PipelineWarpSpecializedBarrierRatio<MaxBarPerStageRatio,
+                                                                                  AdditionalBarrier,
+                                                                                  StagesQ,
+                                                                                  HasQv ? StagesQv : 0,
+                                                                                  StagesK,
+                                                                                  StagesV,
+                                                                                  InKernelTranspose ? StagesVt : 0,
+                                                                                  2 * (IsAppendKV ? StagesK : 0)>;
+
+  static constexpr int BarPerStageRatio = BarPerStageRatioHelper::value;
+  static_assert(BarPerStageRatio > 0, "FMHA async barrier storage exceeds hardware limit even with BarPerStageRatio=1");
 
   static constexpr int Alignment = 32 / sizeof_bits_v<Element>;
 
@@ -242,17 +259,21 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   using SmemAtomLayoutK =
       decltype(mutlass::gemm::collective::detail::
                    ss_smem_selector_B<TCE::Major::K, Element, typename TiledMmaQK::Atom::MMA_Op, TileShapeQKD>());
+
   using SmemAtomLayoutQv =
       decltype(mutlass::gemm::collective::detail::
                    ss_smem_selector_A<TCE::Major::K, Element, typename TiledMmaQv::Atom::MMA_Op, TileShapeQvD>());
-  using SmemAtomLayoutV =
+  // K-major for dot(Qv, V)
+  using SmemAtomLayoutVMmaQV =
       decltype(mutlass::gemm::collective::detail::
                    ss_smem_selector_B<TCE::Major::K, Element, typename TiledMmaQv::Atom::MMA_Op, TileShapeQvD>());
 
   using SmemAtomLayoutP =
       decltype(mutlass::gemm::collective::detail::
                    ss_smem_selector_A<TCE::Major::K, Element, typename TiledMmaPV::Atom::MMA_Op, TileShapePDV>());
-  using SmemAtomLayoutVt =
+
+  // MN-major for dot(P, V)
+  using SmemAtomLayoutVMmaPV =
       decltype(mutlass::gemm::collective::detail::
                    ss_smem_selector_B<TCE::Major::MN, Element, typename TiledMmaPV::Atom::MMA_Op, TileShapePDV>());
 
@@ -265,19 +286,26 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   using SmemLayoutK         = decltype(tile_to_shape(
       SmemAtomLayoutK{}, make_shape(shape<1>(TileShapeQKD{}), shape<2>(TileShapeQKD{}), Int<StagesK>{})));
   using SmemLayoutP         = decltype(tile_to_shape(SmemAtomLayoutP{}, select<0, 2>(TileShapePDV{})));
-  using SmemLayoutVt        = decltype(tile_to_shape(
-      SmemAtomLayoutVt{}, make_shape(shape<1>(TileShapePDV{}), shape<2>(TileShapePDV{}), Int<StagesVt>{})));
-  using SmemLayoutV         = std::conditional_t<
-              HasQv,
-              decltype(tile_to_shape(SmemAtomLayoutV{},
-                             make_shape(shape<1>(TileShapeQvD{}), shape<2>(TileShapeQvD{}), Int<StagesV>{}))),
-              decltype(tile_to_shape(SmemAtomLayoutVt{},
-                             make_shape(shape<1>(TileShapePDV{}), shape<2>(TileShapePDV{}), Int<StagesV>{})))>;
-  using SmemLayoutVtStore = decltype(composition(
-      SmemLayoutVt{},
-      make_ordered_layout(make_shape(size<1>(SmemLayoutVt{}), size<0>(SmemLayoutVt{}), size<2>(SmemLayoutVt{})),
-                          Step<_2, _1, _3>{})));
 
+  /* For dot(Qv, V), we need K-Major SmemLayout */
+  using SmemLayoutVMmaQV = decltype(tile_to_shape(
+      SmemAtomLayoutVMmaQV{}, make_shape(shape<1>(TileShapeQvD{}), shape<2>(TileShapeQvD{}), Int<StagesV>{})));
+
+  /* For dot(P, V), we need MN-Major SmemLayout */
+  using SmemLayoutVMmaPV = decltype(tile_to_shape(
+      SmemAtomLayoutVMmaPV{}, make_shape(shape<1>(TileShapePDV{}), shape<2>(TileShapePDV{}), Int<StagesV>{})));
+
+  // SmemLayoutV is used for TME Load
+  using SmemLayoutV = std::conditional_t<HasQv, SmemLayoutVMmaQV, SmemLayoutVMmaPV>;
+
+  // Transpose for dot(P, V)
+  using SmemLayoutVStore = decltype(composition(
+      SmemLayoutVMmaPV{},
+      make_ordered_layout(
+          make_shape(size<1>(SmemLayoutVMmaPV{}), size<0>(SmemLayoutVMmaPV{}), size<2>(SmemLayoutVMmaPV{})),
+          Step<_2, _1, _3>{})));
+
+  // Dealing with LSU load V
   using SmemAtomLayoutVLsu = std::conditional_t<
       !IsFP8,
       decltype(mute::MP31::SQMMA::Layout_SL256_SS256_SG32_Atom<get<2>(typename TiledMmaPV::AtomShape_MNK{}),
@@ -288,8 +316,11 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
                                                                get<1>(typename TiledMmaPV::AtomShape_MNK{}),
                                                                Element,
                                                                TCE::Major::K>{})>;
-  using SmemLayoutVLsu                             = decltype(tile_to_shape(
+
+  // Match the stride but without PermuteLoad
+  using SmemLayoutVLsu = decltype(tile_to_shape(
       SmemAtomLayoutVLsu{}, make_shape(shape<2>(TileShapePDV{}), shape<1>(TileShapePDV{}), Int<StagesV>{})));
+
   static constexpr TME::CacheHint TmeQInnerHint    = TME::CacheHint::CACHE_NORMAL;
   static constexpr TME::CacheHint TmeQOuterHint    = TME::CacheHint::CACHE_NORMAL;
   static constexpr TME::CacheHint TmeQvInnerHint   = TME::CacheHint::CACHE_NORMAL;
@@ -303,12 +334,13 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr TME::CacheHint TmeVNewInnerHint = TME::CacheHint::CACHE_NORMAL;
   static constexpr TME::CacheHint TmeVNewOuterHint = TME::CacheHint::CACHE_NORMAL;
 
-  static constexpr int  KLoadVectorBits                 = IsFP8 && TileN == 64 ? 64 : 128;
-  static constexpr int  MmaPvAtomM                      = get<0>(typename TiledMmaPV::AtomShape_MNK{});
-  static constexpr bool NeedsVLsuDestinationRowPairSwap = KLoadVectorBits == 64 && MmaPvAtomM == 32;
+  static constexpr int KLoadVectorBits = IsFP8 && TileN == 64 ? 64 : 128;
+  static constexpr int MmaPvAtomM      = get<0>(typename TiledMmaPV::AtomShape_MNK{});
   using TmeLoadKeyBuilder =
       Mp31FmhaTmeLoadKeyBuilder<Element, SmemLayoutK, StrideQKV, TmeKInnerHint, TmeKOuterHint, KLoadVectorBits>;
-  using TmeLoadVLayout  = std::conditional_t<HasQv, SmemLayoutV, SmemLayoutK>;
+
+  // Only used for dot(Qv, V)
+  using TmeLoadVLayout  = std::conditional_t<HasQv, SmemLayoutVMmaQV, /* We don't need it actually */ SmemLayoutK>;
   using TmeLoadVBuilder = Mp31FmhaTmeLoadKeyBuilder<Element, TmeLoadVLayout, StrideQKV, TmeVInnerHint, TmeVOuterHint>;
 
   static constexpr int FragmentSize    = TmeLoadKeyBuilder::Fragment;
@@ -344,21 +376,18 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       SmemLayoutTMELoadQv{},
       TileShapeQv{}));
   using TME_K       = typename TmeLoadKeyBuilder::TME_K;
-  using TME_Vt      = decltype(make_tme_copy<TmeVInnerHint, TmeVOuterHint>(
+  // V TME TiledCopy for MmaPV
+  using TME_V_ = decltype(make_tme_copy<TmeVInnerHint, TmeVOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)),
                   repeat_like(StrideQKV{}, int32_t(0)),
                   select<1, 0, 2, 3>(StrideQKV{})),
-      take<0, 2>(SmemLayoutVt{})));
-  using TME_V       = std::conditional_t<HasQv, typename TmeLoadVBuilder::TME_K, TME_Vt>;
+      take<0, 2>(SmemLayoutVMmaPV{})));
+  // If HasQv, using TmeBuilder to get a permuted tme load, otherwise using trivial version
+  using TME_V = std::conditional_t<HasQv, typename TmeLoadVBuilder::TME_K, TME_V_>;
   // Append V_new is stored back to the KV cache, so keep it in the store-friendly layout even in Qv mode.
-  using TME_VNewQv = decltype(make_tme_copy<TmeVNewInnerHint, TmeVNewOuterHint>(
-      MP31_TME_LOAD{},
-      make_tensor(
-          make_gmem_ptr(static_cast<Element const*>(nullptr)), repeat_like(StrideQKV{}, int32_t(0)), StrideQKV{}),
-      take<0, 2>(SmemLayoutV{})));
-  using TME_VNew   = std::conditional_t<HasQv, TME_VNewQv, TME_Vt>;
-  using TME_KNew   = decltype(make_tme_copy<TmeKNewInnerHint, TmeKNewOuterHint>(
+  using TME_VNew = TME_V_;
+  using TME_KNew = decltype(make_tme_copy<TmeKNewInnerHint, TmeKNewOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(
           make_gmem_ptr(static_cast<Element const*>(nullptr)), repeat_like(StrideQKV{}, int32_t(0)), StrideQKV{}),
@@ -369,33 +398,32 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   using R2SCopyAtom       = Copy_Atom<UniversalCopy<FragmentTypeR2S>, Element>;
   using R2STiledCopy      = decltype(make_tiled_copy_C(R2SCopyAtom{}, PermuteTiledMmaQK{}));
 
+  // LSU Load Key (Always permuted load)
   using LsuLoadKeyBuilder =
       Mp31FmhaLsuLoadKeyBuilder<Element, TileShapeQKD, SmemAtomLayoutK, NumProducerThreads, StrideQKV, KLoadVectorBits>;
   using GmemTiledCopyK = typename LsuLoadKeyBuilder::GmemTiledCopy;
   using LsuKTile       = typename LsuLoadKeyBuilder::LsuKTile;
   using PermuteTileK   = Tile<Underscore, typename LsuLoadKeyBuilder::PermuteTileN, Underscore>;
   using FragmentTypeK  = typename LsuLoadKeyBuilder::FragmentType;
-  using StrideNoQvV    = decltype(select<1, 0, 2, 3>(StrideQKV{}));
-  using LsuLoadVBuilderQv =
-      Mp31FmhaLsuLoadKeyBuilder<Element, TileShapeQvD, SmemAtomLayoutV, NumProducerThreads, StrideQKV, KLoadVectorBits>;
-  using LsuLoadVBuilderNoQv = Mp31FmhaLsuLoadKeyBuilder<Element,
-                                                        TileShapePDV,
-                                                        SmemAtomLayoutVt,
-                                                        NumProducerThreads,
-                                                        StrideNoQvV,
-                                                        KLoadVectorBits>;
-  using LsuLoadVBuilder     = std::conditional_t<HasQv, LsuLoadVBuilderQv, LsuLoadVBuilderNoQv>;
-  using GmemTiledCopyV      = typename LsuLoadVBuilder::GmemTiledCopy;
-  using LsuVTileNoQv        = decltype(make_tile(make_layout(Shape<Int<HeadDimVO>>{}), Int<TileN>{}));
-  using LsuVTile            = std::conditional_t<HasQv, typename LsuLoadVBuilder::LsuKTile, LsuVTileNoQv>;
 
+  // LSU Value for QV(Always permuted load)
+  using LsuLoadValueBuilder = Mp31FmhaLsuLoadKeyBuilder<Element,
+                                                        TileShapeQvD,
+                                                        SmemAtomLayoutVMmaQV,
+                                                        NumProducerThreads,
+                                                        StrideQKV,
+                                                        KLoadVectorBits>;
+  using GmemTiledCopyV      = typename LsuLoadValueBuilder::GmemTiledCopy;
+  using LsuVTile            = typename LsuLoadValueBuilder::LsuKTile;
+
+  // InKernelTranspose
   using TransTiledCopy =
       decltype(mutlass::gemm::collective::detail::make_simt_tiled_copy<NumTransThreads,
                                                                        Element,
                                                                        FragmentSize,
                                                                        StrideQKV,
-                                                                       size<0>(SmemAtomLayoutVt{}),
-                                                                       size<1>(SmemAtomLayoutVt{}),
+                                                                       size<0>(SmemAtomLayoutVMmaPV{}),
+                                                                       size<1>(SmemAtomLayoutVMmaPV{}),
                                                                        UniversalCopy<FragmentTypeR2S>>());
 
   static constexpr int GmemElemsPerLoad = 128 / sizeof_bits_v<Element>;
@@ -410,21 +438,24 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   using GmemTiledCopyAppendKV = decltype(make_tiled_copy(
       GmemCopyAtomAppendKV{}, GmemLayoutAtomAppendKV{}, Layout<Shape<_1, Int<GmemElemsPerLoad>>>{}));
 
-  using MainloopPipelineQ  = std::conditional_t<!UseTMELoadQ,
-                                                mutlass::Mp31PipelineAsyncWarpsepcialized<StagesQ>,
-                                                mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesQ>>;
-  using MainloopPipelineQv = std::conditional_t<!UseTMELoadQ,
-                                                mutlass::Mp31PipelineAsyncWarpsepcialized<HasQv ? StagesQv : 0>,
-                                                mutlass::Mp31PipelineTmeAsyncWarpsepcialized<HasQv ? StagesQv : 0>>;
-  using MainloopPipelineK  = std::conditional_t<UseLSULoadK,
-                                                mutlass::Mp31PipelineAsyncWarpsepcialized<StagesK>,
-                                                mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesK>>;
-  using MainloopPipelineV  = std::conditional_t<UseLSULoadV,
-                                                mutlass::Mp31PipelineAsyncWarpsepcialized<StagesV>,
-                                                mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesV>>;
-  using MainloopPipelineVt = mutlass::Mp31PipelineAsyncWarpsepcialized<InKernelTranspose ? StagesVt : 0>;
+  using MainloopPipelineQ = std::conditional_t<!UseTMELoadQ,
+                                               mutlass::Mp31PipelineAsyncWarpSpecialized<StagesQ, BarPerStageRatio>,
+                                               mutlass::Mp31PipelineTmeAsyncWarpSpecialized<StagesQ, BarPerStageRatio>>;
+  using MainloopPipelineQv =
+      std::conditional_t<!UseTMELoadQ,
+                         mutlass::Mp31PipelineAsyncWarpSpecialized<HasQv ? StagesQv : 0, BarPerStageRatio>,
+                         mutlass::Mp31PipelineTmeAsyncWarpSpecialized<HasQv ? StagesQv : 0, BarPerStageRatio>>;
+  using MainloopPipelineK = std::conditional_t<UseLSULoadK,
+                                               mutlass::Mp31PipelineAsyncWarpSpecialized<StagesK, BarPerStageRatio>,
+                                               mutlass::Mp31PipelineTmeAsyncWarpSpecialized<StagesK, BarPerStageRatio>>;
+  using MainloopPipelineV = std::conditional_t<UseLSULoadV,
+                                               mutlass::Mp31PipelineAsyncWarpSpecialized<StagesV, BarPerStageRatio>,
+                                               mutlass::Mp31PipelineTmeAsyncWarpSpecialized<StagesV, BarPerStageRatio>>;
+  using MainloopPipelineVt =
+      mutlass::Mp31PipelineAsyncWarpSpecialized<InKernelTranspose ? StagesVt : 0, BarPerStageRatio>;
   using MainloopPipelineKVNew =
-      mutlass::Mp31PipelineTmeAsyncWarpsepcialized<IsAppendKV ? StagesK : 0>;  // Always use TME for new KV
+      mutlass::Mp31PipelineTmeAsyncWarpSpecialized<IsAppendKV ? StagesK : 0,
+                                                   BarPerStageRatio>;  // Always use TME for new KV
 
   using PipelineQState     = typename MainloopPipelineQ::PipelineState;
   using PipelineQvState    = typename MainloopPipelineQv::PipelineState;
@@ -433,13 +464,18 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   using PipelineVtState    = typename MainloopPipelineVt::PipelineState;
   using PipelineKVNewState = typename MainloopPipelineKVNew::PipelineState;
 
+  static_assert(cosize_v<SmemLayoutVMmaQV> == cosize_v<SmemLayoutVMmaPV>,
+                "QV and PV V smem layouts must use the same storage size.");
+  static_assert(size(take<0, 2>(SmemLayoutVMmaQV{})) == size(take<0, 2>(SmemLayoutVMmaPV{})),
+                "QV and PV V smem layouts must use the same TME transaction size.");
+
   struct SharedStorage {
-    mute::array_aligned<Element, cosize_v<SmemLayoutQ>>              smem_q;
-    mute::array_aligned<Element, cosize_v<SmemLayoutK>>              smem_k;
-    mute::array_aligned<Element, cosize_v<SmemLayoutP>>              smem_p;
-    mute::array_aligned<Element, cosize_v<SmemLayoutV>>              smem_v;
-    mute::array_aligned<Element, HasQv ? cosize_v<SmemLayoutQv> : 0> smem_qv;
-    mute::array_aligned<Element, HasQv ? cosize_v<SmemLayoutVt> : 0> smem_vt;
+    mute::array_aligned<Element, cosize_v<SmemLayoutQ>>                  smem_q;
+    mute::array_aligned<Element, cosize_v<SmemLayoutK>>                  smem_k;
+    mute::array_aligned<Element, cosize_v<SmemLayoutP>>                  smem_p;
+    mute::array_aligned<Element, cosize_v<SmemLayoutV>>                  smem_v;
+    mute::array_aligned<Element, HasQv ? cosize_v<SmemLayoutQv> : 0>     smem_qv;
+    mute::array_aligned<Element, HasQv ? cosize_v<SmemLayoutVStore> : 0> smem_vt;
   };
 
   static constexpr int TmeTransactionBytesQ = mutlass::bits_to_bytes(size(SmemLayoutQ{}) * sizeof_bits_v<Element>);
@@ -685,21 +721,22 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     // print(tme_load_K);
     // print("\n");
 
-    auto   shape_Vt    = make_shape(args.headdim_V, get<0>(args.shape_K), get<2>(args.shape_K), get<3>(args.shape_K));
-    Tensor mVt         = make_tensor(make_gmem_ptr(args.ptr_V), shape_Vt, select<1, 0, 2, 3>(args.stride_V));
-    TME_Vt tme_load_Vt = make_tme_copy<TmeVInnerHint, TmeVOuterHint>(MP31_TME_LOAD{}, mVt, take<0, 2>(SmemLayoutVt{}));
-    auto   shape_V     = make_shape(get<0>(args.shape_K), args.headdim_V, get<2>(args.shape_K), get<3>(args.shape_K));
-    Tensor mV          = make_tensor(make_gmem_ptr(args.ptr_V), shape_V, args.stride_V);
-    TME_V  tme_load_V  = [&]() {
+    auto shape_V_gmem = make_shape(get<0>(args.shape_K), args.headdim_V, get<2>(args.shape_K), get<3>(args.shape_K));
+    auto shape_V      = conditional_return<HasQv>(shape_V_gmem, select<1, 0, 2, 3>(shape_V_gmem));
+    auto stride_V     = conditional_return<HasQv>(args.stride_V, select<1, 0, 2, 3>(args.stride_V));
+    auto mV           = make_tensor(make_gmem_ptr(args.ptr_V), shape_V, stride_V);
+
+    TME_V tme_load_V = [&]() {
       if constexpr (HasQv) {
         return TmeLoadVBuilder::make_tme_copy(mV);
       } else {
-        return tme_load_Vt;
+        return make_tme_copy<TmeVInnerHint, TmeVOuterHint>(MP31_TME_LOAD{}, mV, take<0, 2>(SmemLayoutVMmaPV{}));
       }
     }();
-    auto           tme_shape_V      = conditional_return<HasQv>(shape_V, shape_Vt);
+
+    // Used for permute tme load
     PermutedShapeV permuted_shape_V = TmeLoadVBuilder::get_permuted_shape(mV);
-    int const      cosize_v         = get<0>(shape_V) == 0 ? 0 : cosize(make_layout(shape_V, args.stride_V));
+    int const      cosize_v         = get<0>(shape_V_gmem) == 0 ? 0 : cosize(make_layout(shape_V_gmem, args.stride_V));
 
     RobustDescriptor desc_V = make_robust_desc(args.ptr_V, cosize_v);
 
@@ -716,23 +753,15 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     RobustDescriptor desc_K_new = make_robust_desc(args.ptr_K_new, cosize_k_new);
 
-    auto shape_V_new =
-        make_shape(get<0>(args.shape_K_new), args.headdim_V, get<2>(args.shape_K_new), get<3>(args.shape_K_new));
-    auto shape_V_new_t =
-        make_shape(args.headdim_V, get<0>(args.shape_K_new), get<2>(args.shape_K_new), get<3>(args.shape_K_new));
-    auto     stride_V_new_t = select<1, 0, 2, 3>(args.stride_V_new);
-    Tensor   mVnew          = make_tensor(make_gmem_ptr(args.ptr_V_new), shape_V_new, args.stride_V_new);
-    Tensor   mVnew_t        = make_tensor(make_gmem_ptr(args.ptr_V_new), shape_V_new_t, stride_V_new_t);
-    TME_VNew tme_load_V_new = [&]() {
-      if constexpr (HasQv) {
-        return make_tme_copy<TmeVNewInnerHint, TmeVNewOuterHint>(
-            MP31_TME_LOAD{}, conditional_return<IsAppendKV>(mVnew, mV), take<0, 2>(SmemLayoutV{}));
-      } else {
-        return make_tme_copy<TmeVInnerHint, TmeVOuterHint>(
-            MP31_TME_LOAD{}, conditional_return<IsAppendKV>(mVnew_t, mVt), take<0, 2>(SmemLayoutVt{}));
-      }
-    }();
-    int const cosize_v_new = get<0>(args.shape_K_new) == 0 ? 0 : cosize(make_layout(shape_V_new, args.stride_V_new));
+    Tensor mV_store =
+        make_tensor(make_gmem_ptr(args.ptr_V), select<1, 0, 2, 3>(shape_V_gmem), select<1, 0, 2, 3>(args.stride_V));
+    Tensor mVnew = make_tensor(
+        make_gmem_ptr(args.ptr_V_new),
+        make_shape(args.headdim_V, get<0>(args.shape_K_new), get<2>(args.shape_K_new), get<3>(args.shape_K_new)),
+        select<1, 0, 2, 3>(args.stride_V_new));
+    TME_VNew tme_load_V_new = make_tme_copy<TmeVInnerHint, TmeVOuterHint>(
+        MP31_TME_LOAD{}, conditional_return<IsAppendKV>(mVnew, mV_store), take<0, 2>(SmemLayoutVMmaPV{}));
+    int const cosize_v_new = get<0>(args.shape_K_new) == 0 ? 0 : cosize(mVnew.layout());
 
     RobustDescriptor desc_V_new = make_robust_desc(args.ptr_V_new, cosize_v_new);
 
@@ -785,7 +814,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         .permuted_shape_K = permuted_shape_K,
         .stride_K         = args.stride_K,
         .ptr_V            = args.ptr_V,
-        .shape_V          = tme_shape_V,
+        .shape_V          = shape_V,
         .permuted_shape_V = permuted_shape_V,
         .headdim_V        = args.headdim_V,
         .stride_V         = args.stride_V,
@@ -910,14 +939,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
 
     // Used for LSU
-    Tensor sK_pi = mute::as_position_independent_swizzle_tensor(sK);
-    Tensor sV_pi = mute::as_position_independent_swizzle_tensor([&]() {
-      if constexpr (HasQv) {
-        return make_tensor(make_smem_ptr(shared_storage.smem_v.data()), typename TmeLoadVBuilder::SmemLayoutK{});
-      } else {
-        return make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVLsu{});
-      }
-    }());
+    Tensor sV_lsu = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVLsu{});
 
     int const thread_idx             = threadIdx.x % NumProducerThreads;
     int const bidh_kv                = !IsPackGQA ? bidh / HeadRatio : bidh;
@@ -935,10 +957,28 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     }();
     Tensor mQ = params.tme_load_Q.get_tme_tensor(params.shape_Q_packed)(_, _, bidh, HasCuseqlensQ ? 0 : bidb);
     Tensor mK = params.tme_load_K.get_tme_tensor(params.permuted_shape_K)(_, _, bidh_kv, _);
+    auto   mV = [&]() {
+      if constexpr (HasQv) {
+        return params.tme_load_V.get_tme_tensor(params.permuted_shape_V)(_, _, bidh_kv, _);
+      } else {
+        return params.tme_load_V.get_tme_tensor(params.shape_V)(_, _, bidh_kv, _);
+      }
+    }();
 
     Tensor gQ = local_tile(domain_offset(offset_coord_q, mQ), TileShapeQ{}, make_coord(m_block, _0{}));
     Tensor gK = local_tile(
         domain_offset(make_coord(seqlen_info.offset_k, _0{}, _0{}), mK), TmeKTileShape{}, make_coord(_, _0{}, _));
+
+    auto gV = [&]() {
+      if constexpr (HasQv) {
+        return local_tile(
+            domain_offset(make_coord(seqlen_info.offset_k, _0{}, _0{}), mV), TmeVTileShape{}, make_coord(_, _0{}, _));
+      } else {
+        return local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k, _0{}), mV),
+                          select<1, 2>(TileShapePDV{}),
+                          make_coord(_0{}, _, _));
+      }
+    }();
 
     auto   cta_tme_Q = params.tme_load_Q.get_slice(0);
     Tensor tQgQ      = group_modes<0, 3>(cta_tme_Q.partition_S(gQ));
@@ -948,19 +988,6 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     Tensor tKgK      = group_modes<0, 3>(cta_tme_K.partition_S(gK));  // (TME, n, l)
     Tensor tKsK      = group_modes<0, 3>(cta_tme_K.partition_D(sK));  // (TME, pipe)
 
-    auto make_tme_v_tile = [&]() {
-      if constexpr (HasQv) {
-        Tensor mV = params.tme_load_V.get_tme_tensor(params.permuted_shape_V)(_, _, bidh_kv, _);
-        return local_tile(
-            domain_offset(make_coord(seqlen_info.offset_k, _0{}, _0{}), mV), TmeVTileShape{}, make_coord(_, _0{}, _));
-      } else {
-        Tensor mV = params.tme_load_V.get_tme_tensor(params.shape_V)(_, _, bidh_kv, _);
-        return local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k, _0{}), mV),
-                          select<1, 2>(TileShapePDV{}),
-                          make_coord(_0{}, _, _));
-      }
-    };
-    auto   gV        = make_tme_v_tile();
     auto   cta_tme_V = params.tme_load_V.get_slice(0);
     Tensor tVgV      = group_modes<0, 3>(cta_tme_V.partition_S(gV));  // (TME, n, b)
     Tensor tVsV      = group_modes<0, 3>(cta_tme_V.partition_D(sV));  // (TME, pipe)
@@ -976,13 +1003,20 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
                                      !IntraWarpSquadOverlap,
                                      1,
                                      KLoadVectorBits>;
-    GmemTiledCopyK tiled_copy_kv;
-    auto           thr_copy_kv = tiled_copy_kv.get_thread_slice(threadIdx.x);
+    GmemTiledCopyK tiled_copy_k;
+    auto           thr_copy_k = tiled_copy_k.get_thread_slice(threadIdx.x);
 
     Tensor mK_lsu = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(
         _, _, bidh_kv, HasCuseqlensK ? 0 : bidb_kv);
     Tensor gK_lsu =
         local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK_lsu), LsuKTile{}, make_coord(_, _0{}));
+
+    GmemTiledCopyV tiled_copy_v;
+    auto           thr_copy_v = tiled_copy_v.get_thread_slice(threadIdx.x);
+    Tensor         mV_lsu     = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_V, params.stride_V)(
+        _, _, bidh_kv, HasCuseqlensK ? 0 : bidb_kv);
+    Tensor gV_lsu =
+        local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV_lsu), LsuVTile{}, make_coord(_, _0{}));
 
     KVManager paged_kv_manager{params.ptr_pagetable,
                                params.shape_pagetable,
@@ -1008,7 +1042,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       pipeline_k.producer_acquire(smem_pipe_write);
       if constexpr (IsPagedKV) {
         if constexpr (UseLSULoadK) {
-          paged_kv_manager.load_K(n_block, sK_pi(_, _, smem_pipe_write.index()));
+          paged_kv_manager.load_K(n_block, sK(_, _, smem_pipe_write.index()));
           mute::ldgsts_wait();
           pipeline_k.producer_commit(smem_pipe_write);
         } else {
@@ -1021,9 +1055,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         // NOT Paged KV
         // Got BSHD or Ragged KV
         if constexpr (UseLSULoadK) {
-          Tensor tKgK_lsu = group_modes<0, 3>(thr_copy_kv.partition_S(gK_lsu(_, _, n_block)));
-          Tensor tKsK_lsu = group_modes<0, 3>(thr_copy_kv.partition_D(sK));
-          copy(tiled_copy_kv.with(params.desc_K), tKgK_lsu, tKsK_lsu(_, smem_pipe_write.index()));
+          Tensor tKgK_lsu = group_modes<0, 3>(thr_copy_k.partition_S(gK_lsu(_, _, n_block)));
+          Tensor tKsK_lsu = group_modes<0, 3>(thr_copy_k.partition_D(sK));
+          copy(tiled_copy_k.with(params.desc_K), tKgK_lsu, tKsK_lsu(_, smem_pipe_write.index()));
 
           mute::ldgsts_wait();
           pipeline_k.producer_commit(smem_pipe_write);
@@ -1039,8 +1073,11 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       pipeline_v.producer_acquire(smem_pipe_write);
       if constexpr (IsPagedKV) {
         if constexpr (UseLSULoadV) {
-          paged_kv_manager.template load_V<NeedsVLsuDestinationRowPairSwap>(n_block,
-                                                                            sV_pi(_, _, smem_pipe_write.index()));
+          if constexpr (HasQv) {
+            paged_kv_manager.template load_V(n_block, sV(_, _, smem_pipe_write.index()));
+          } else {
+            paged_kv_manager.template load_V(n_block, sV_lsu(_, _, smem_pipe_write.index()));
+          }
           mute::ldgsts_wait();
           pipeline_v.producer_commit(smem_pipe_write);
         } else {
@@ -1052,27 +1089,12 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       } else {
         // NOT Paged KV
         // Got BSHD or Ragged KV
-        if constexpr (UseLSULoadV) {
-          GmemTiledCopyV tiled_copy_v;
-          auto           thr_copy_v = tiled_copy_v.get_thread_slice(threadIdx.x);
-          if constexpr (HasQv) {
-            Tensor mV_lsu = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_V, params.stride_V)(
-                _, _, bidh_kv, HasCuseqlensK ? 0 : bidb_kv);
-            Tensor gV_lsu = local_tile(
-                domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV_lsu), LsuVTile{}, make_coord(_, _0{}));
-            Tensor tVgV_lsu = group_modes<0, 3>(thr_copy_v.partition_S(gV_lsu(_, _, n_block)));
-            Tensor tVsV_lsu = group_modes<0, 3>(thr_copy_v.partition_D(sV));
-            copy(tiled_copy_v.with(params.desc_V), tVgV_lsu, tVsV_lsu(_, smem_pipe_write.index()));
-          } else {
-            Tensor mV_lsu =
-                make_tensor(make_gmem_ptr(params.ptr_V), params.shape_V, select<1, 0, 2, 3>(params.stride_V))(
-                    _, _, bidh_kv, HasCuseqlensK ? 0 : bidb_kv);
-            Tensor gV_lsu = local_tile(
-                domain_offset(make_coord(_0{}, seqlen_info.offset_k), mV_lsu), LsuVTile{}, make_coord(_0{}, _));
-            Tensor tVgV_lsu = group_modes<0, 3>(thr_copy_v.partition_S(gV_lsu(_, _, n_block)));
-            Tensor tVsV_lsu = group_modes<0, 3>(thr_copy_v.partition_D(sV));
-            copy(tiled_copy_v.with(params.desc_V), tVgV_lsu, tVsV_lsu(_, smem_pipe_write.index()));
-          }
+
+        // For non-paged case, we only use lsu load v when HasQv
+        if constexpr (UseLSULoadV && HasQv) {
+          Tensor tVgV_lsu = group_modes<0, 3>(thr_copy_v.partition_S(gV_lsu(_, _, n_block)));
+          Tensor tVsV_lsu = group_modes<0, 3>(thr_copy_v.partition_D(sV));
+          copy(tiled_copy_v.with(params.desc_V), tVgV_lsu, tVsV_lsu(_, smem_pipe_write.index()));
 
           mute::ldgsts_wait();
           pipeline_v.producer_commit(smem_pipe_write);
@@ -1135,7 +1157,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       if constexpr (IsPagedKV) {
         // NOTE: force use same load method (LSU or TME) for both K and V if IsPagedKV
         if constexpr (UseLSULoadK || UseLSULoadV) {
-          paged_kv_manager.template load_page_table_for_lsu</* FirstIter */ true>(n_block);
+          paged_kv_manager.template load_page_table_for_lsu</* FirstIter */ true,
+                                                            /* PermuteK */ true,
+                                                            /* PermuteV */ HasQv>(n_block);
         } else {
           paged_kv_manager.template load_page_table_for_tme</* FirstIter */ true>(n_block);
         }
@@ -1166,7 +1190,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         // NOTE: using same load method (LSU or TME) for both K and V if IsPagedKV
         if (should_load_K) {
           if constexpr (UseLSULoadK || UseLSULoadV) {
-            paged_kv_manager.template load_page_table_for_lsu</* FirstIter */ false>(n_block);
+            paged_kv_manager.template load_page_table_for_lsu</* FirstIter */ false,
+                                                              /* PermuteK */ true,
+                                                              /* PermuteV */ HasQv>(n_block);
           } else {
             paged_kv_manager.template load_page_table_for_tme</* FirstIter */ false>(n_block);
           }
@@ -1210,7 +1236,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     ThrCopy        thr_copy_trans = tiled_copy_trans.get_thread_slice(thread_idx);
 
     Tensor smem_src = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), typename TmeLoadVBuilder::SmemLayoutK{});
-    Tensor smem_dst = make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVtStore{});
+    Tensor smem_dst = make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVStore{});
 
     Tensor tVsV  = thr_copy_trans.partition_S(smem_src);
     Tensor tVsVt = thr_copy_trans.partition_D(smem_dst);
@@ -1279,6 +1305,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     TiledMmaQK tiled_mma_qk;
     TiledMmaPV tiled_mma_pv;
+    TiledMmaQv tiled_mma_qv;
 
     Tensor acc_pv    = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePDV{}));
     auto   acc_pv_mn = make_tensor(acc_pv.data(), layout_acc_mn(tiled_mma_pv, acc_pv.layout()));
@@ -1297,32 +1324,24 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
     Tensor sP = make_tensor(make_smem_ptr(shared_storage.smem_p.data()), SmemLayoutP{});
+    Tensor sV =
+        make_tensor(make_smem_ptr(InKernelTranspose ? shared_storage.smem_vt.data() : shared_storage.smem_v.data()),
+                    SmemLayoutVMmaPV{});
 
-    // TiledMmaQK tiled_mma_qk;
-    // TiledMmaPV tiled_mma_pv;
+    Tensor sQv     = make_tensor(make_smem_ptr(shared_storage.smem_qv.data()), SmemLayoutQv{});
+    Tensor sVMmaQV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVMmaQV{});
 
     ThrMMA thr_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
     ThrMMA thr_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
+    ThrMMA thr_mma_qv = tiled_mma_qv.get_thread_slice(thread_idx);
 
     Tensor tSrQ = thr_mma_qk.partition_fragment_A(sQ);
     Tensor tSrK = thr_mma_qk.partition_fragment_B(sK);
     Tensor tOrP = thr_mma_pv.partition_fragment_A(sP);
-    auto   tOrV = [&] {
-      if constexpr (!InKernelTranspose) {
-        Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
-        return thr_mma_pv.partition_fragment_B(sV);
-      } else {
-        return nullptr;
-      }
-    }();
-    auto tOrVt = [&] {
-      if constexpr (InKernelTranspose) {
-        Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVt{});
-        return thr_mma_pv.partition_fragment_B(sVt);
-      } else {
-        return nullptr;
-      }
-    }();
+    Tensor tOrV = thr_mma_pv.partition_fragment_B(sV);
+
+    Tensor tSrQv = thr_mma_qv.partition_fragment_A(sQv);
+    Tensor tSrV  = thr_mma_qv.partition_fragment_B(sVMmaQV);
 
     auto wait_pv = [&]() {
       if constexpr (InKernelTranspose) {
@@ -1334,7 +1353,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     auto gemm_pv = [&]() {
       if constexpr (InKernelTranspose) {
-        mute::gemm(tiled_mma_pv, tOrP, tOrVt(_, _, _, smem_pipe_read_vt.index()), acc_pv);
+        mute::gemm(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_vt.index()), acc_pv);
       } else {
         mute::gemm(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), acc_pv);
       }
@@ -1352,12 +1371,15 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     R2STiledCopy tiled_copy_r2s;
     ThrCopy      thr_copy_r2s = tiled_copy_r2s.get_thread_slice(thread_idx);
-    Tensor       tPsP         = thr_copy_r2s.partition_D(mute::as_position_independent_swizzle_tensor(sP));
+    Tensor       tPsP         = thr_copy_r2s.partition_D(sP);
 
     float effective_scale      = HasSoftcap ? 1.0f : params.softmax_scale;
     float effective_scale_log2 = HasSoftcap ? static_cast<float>(M_LOG2E) : params.softmax_scale_log2;
     float softcap_val          = params.softcap_val;
     float softcap_scale        = params.softmax_scale / params.softcap_val;
+    float qk_descale           = 1.f;
+    float qv_descale           = 1.f;
+
     if constexpr (IsFP8) {
       float const q_descale = [&] {
         if constexpr (!HasQDescale) {
@@ -1375,8 +1397,18 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
           return params.ptr_k_descale[k_index];
         }
       }();
+      float const v_descale = [&] {
+        if constexpr (!HasVDescale) {
+          return 1.f;
+        } else {
+          auto v_index = bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale);
+          return params.ptr_v_descale[v_index];
+        }
+      }();
 
-      float qk_descale = q_descale * k_descale;
+      qk_descale = q_descale * k_descale;
+      qv_descale = q_descale * v_descale;
+
       if constexpr (HasSoftcap) {
         softcap_scale *= qk_descale;
       } else {
@@ -1385,7 +1417,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       }
     }
 
-    Softmax<Rows, HasLearnableSink> softmax{effective_scale, effective_scale_log2};
+    Softmax<Rows, HasLearnableSink, MaxOffset> softmax{effective_scale, effective_scale_log2};
 
     auto write_P_to_smem = [&](auto& accum_cvt) {
       Tensor tPrP = thr_copy_r2s.retile_S(accum_cvt);
@@ -1398,30 +1430,28 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       // TODO: remote sync
     };
 
-    auto add_qv_score = [&](auto& acc_qk) {
-      if constexpr (HasQv) {
-        TiledMmaQv tiled_mma_qv;
-        Tensor     sQv = make_tensor(make_smem_ptr(shared_storage.smem_qv.data()), SmemLayoutQv{});
-        Tensor     sV  = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
-
-        ThrMMA thr_mma_qv = tiled_mma_qv.get_thread_slice(thread_idx);
-        Tensor tSrQv      = thr_mma_qv.partition_fragment_A(sQv);
-        Tensor tSrV       = thr_mma_qv.partition_fragment_B(sV);
-
-        mute::gemm(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read_v.index()), acc_qk);
-      }
-    };
-
-    auto wait_qv_v = [&]() {
-      if constexpr (HasQv) {
-        pipeline_v.consumer_wait(smem_pipe_read_v);
-      }
-    };
-
     auto release_qv_v = [&]() {
       if constexpr (HasQv) {
         pipeline_v.consumer_release(smem_pipe_read_v);
         ++smem_pipe_read_v;
+      }
+    };
+
+    auto gemm_qv = [&](auto& acc_qk) {
+      if constexpr (HasQv) {
+        pipeline_v.consumer_wait(smem_pipe_read_v);
+        if constexpr (IsFP8) {
+          Tensor acc_qv = make_fragment_like(acc_qk);
+          clear(acc_qv);
+          mute::gemm(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read_v.index()), acc_qv);
+
+          MUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(acc_qk); ++i) {
+            acc_qk(i) = acc_qk(i) * qk_descale + acc_qv(i) * qv_descale;
+          }
+        } else {
+          mute::gemm(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read_v.index()), acc_qk);
+        }
       }
     };
 
@@ -1515,8 +1545,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
       // MMA QK
       mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), acc_qk);
-      wait_qv_v();
-      add_qv_score(acc_qk);
+
+      // MMA QV
+      gemm_qv(acc_qk);
 
       mate::warpsquad_commit_batch();
       mate::warpsquad_wait();
@@ -1555,8 +1586,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
         pipeline_k.consumer_wait(smem_pipe_read_k);
         mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), acc_qk);
-        wait_qv_v();
-        add_qv_score(acc_qk);
+
+        gemm_qv(acc_qk);
 
         mate::warpsquad_commit_batch();
 
@@ -1649,8 +1680,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         pipeline_k.consumer_wait(smem_pipe_read_k);
         // MMA QK
         mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), acc_qk);
-        wait_qv_v();
-        add_qv_score(acc_qk);
+
+        gemm_qv(acc_qk);
 
         mate::warpsquad_commit_batch();
         mate::warpsquad_wait();
@@ -1807,43 +1838,22 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     }
 
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
-    auto   sV = [&]() {
-      if constexpr (HasQv) {
-        return make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
-      } else {
-        return make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVt{});
-      }
-    }();
+    Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVMmaPV{});
 
     int const bidh_kv = !IsPackGQA ? bidh / HeadRatio : bidh;
 
     Tensor mKnew =
         params.tme_load_K_new.get_tme_tensor(params.shape_K_new)(_, _, bidh_kv, !HasCuseqlensKNew ? bidb : 0);
-    auto shape_Vnew = [&]() {
-      if constexpr (HasQv) {
-        return make_shape(
-            get<0>(params.shape_K_new), params.headdim_V, get<2>(params.shape_K_new), get<3>(params.shape_K_new));
-      } else {
-        return make_shape(
-            params.headdim_V, get<0>(params.shape_K_new), get<2>(params.shape_K_new), get<3>(params.shape_K_new));
-      }
-    }();
+    auto shape_Vnew = make_shape(
+        params.headdim_V, get<0>(params.shape_K_new), get<2>(params.shape_K_new), get<3>(params.shape_K_new));
     Tensor mVnew = params.tme_load_V_new.get_tme_tensor(shape_Vnew)(_, _, bidh_kv, !HasCuseqlensKNew ? bidb : 0);
 
     Tensor gKnew = local_tile(domain_offset(make_coord(seqlen_info.offset_k_new, _0{}), mKnew),
                               select<1, 2>(TileShapeQKD{}),
                               make_coord(_, _0{}));  // (N, K, _)
-    auto   gVnew = [&]() {
-      if constexpr (HasQv) {
-        return local_tile(domain_offset(make_coord(seqlen_info.offset_k_new, _0{}), mVnew),
-                          select<1, 2>(TileShapeQvD{}),
-                          make_coord(_, _0{}));  // (N, K_v, _)
-      } else {
-        return local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k_new), mVnew),
-                          select<1, 2>(TileShapePDV{}),
-                          make_coord(_0{}, _));  // (K_v, N, _)
-      }
-    }();
+    Tensor gVnew = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k_new), mVnew),
+                              select<1, 2>(TileShapePDV{}),
+                              make_coord(_0{}, _));  // (K_v, N, _)
 
     auto   cta_tme_K_new = params.tme_load_K_new.get_slice(0);
     Tensor tKgKnew       = group_modes<0, 3>(cta_tme_K_new.partition_S(gKnew));  // (TME, k)
@@ -1922,28 +1932,15 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     Tensor sK = mute::as_position_independent_swizzle_tensor(
         make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{}));
-    auto sV = [&]() {
-      if constexpr (HasQv) {
-        return mute::as_position_independent_swizzle_tensor(
-            make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{}));
-      } else {
-        return mute::as_position_independent_swizzle_tensor(
-            make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVLsu{}));
-      }
-    }();
+    Tensor sV = mute::as_position_independent_swizzle_tensor(
+        make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVLsu{}));
 
     int const bidh_kv = !IsPackGQA ? bidh / HeadRatio : bidh;
     int const bidb_kv = !HasKvBatchIdx ? bidb : params.kv_batch_idx[bidb];
 
     Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(
         _, _, bidh_kv, !HasCuseqlensK ? bidb_kv : 0);
-    auto shape_V = [&]() {
-      if constexpr (HasQv) {
-        return make_shape(get<0>(params.shape_K), params.headdim_V, get<2>(params.shape_K), get<3>(params.shape_K));
-      } else {
-        return make_shape(params.headdim_V, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
-      }
-    }();
+    auto shape_V = make_shape(get<0>(params.shape_K), params.headdim_V, get<2>(params.shape_K), get<3>(params.shape_K));
     Tensor mV =
         make_tensor(make_gmem_ptr(params.ptr_V), shape_V, params.stride_V)(_, _, bidh_kv, !HasCuseqlensK ? bidb_kv : 0);
 
@@ -1951,17 +1948,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     Tensor gK = local_tile(
         domain_offset(make_coord(offset_k, _0{}), mK), select<1, 2>(TileShapeQKD{}), make_coord(_, _0{}));  // (N, K, _)
-    auto gV = [&]() {
-      if constexpr (HasQv) {
-        return local_tile(domain_offset(make_coord(offset_k, _0{}), mV),
-                          select<1, 2>(TileShapeQvD{}),
-                          make_coord(_, _0{}));  // (N, K_v, _)
-      } else {
-        return local_tile(domain_offset(make_coord(offset_k, _0{}), mV),
-                          select<2, 1>(TileShapePDV{}),
-                          make_coord(_, _0{}));  // (N, K_v, _)
-      }
-    }();
+    Tensor gV = local_tile(domain_offset(make_coord(offset_k, _0{}), mV),
+                           select<2, 1>(TileShapePDV{}),
+                           make_coord(_, _0{}));  // (N, K_v, _)
 
     int const seqlen_k_new = seqlen_info.seqlen_k_new;
 
@@ -2123,11 +2112,14 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     int n_block = n_block_new_max - 1;
     if constexpr (IsPagedKV) {
       if constexpr (IsRotary) {
-        paged_kv_manager
-            .template load_page_table_for_lsu<true /* FirstIter */, false /* PermuteK */, Rotary_t::GmemThreadsPerRow>(
-                n_block);
+        paged_kv_manager.template load_page_table_for_lsu<true /* FirstIter */,
+                                                          false /* PermuteK */,
+                                                          false /* PermuteV */,
+                                                          Rotary_t::GmemThreadsPerRow>(n_block);
       } else {
-        paged_kv_manager.template load_page_table_for_lsu<true /* FirstIter */, false /* PermuteK */>(n_block);
+        paged_kv_manager
+            .template load_page_table_for_lsu<true /* FirstIter */, false /* PermuteK */, false /* PermuteV */>(
+                n_block);
       }
     }
     store_K(n_block, smem_pipe_read_kv_new);
@@ -2140,9 +2132,12 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         if constexpr (IsRotary) {
           paged_kv_manager.template load_page_table_for_lsu<false /* FirstIter */,
                                                             false /* PermuteK */,
+                                                            false /* PermuteV */,
                                                             Rotary_t::GmemThreadsPerRow>(n_block);
         } else {
-          paged_kv_manager.template load_page_table_for_lsu<false /* FirstIter */, false /* PermuteK */>(n_block);
+          paged_kv_manager
+              .template load_page_table_for_lsu<false /* FirstIter */, false /* PermuteK */, false /* PermuteV */>(
+                  n_block);
         }
       }
       store_K(n_block, smem_pipe_read_kv_new);

@@ -24,6 +24,7 @@ from ..flashmla_checks import (
 from .sparse_mla_v32_decode_fwd_scheduled import (
     tilelang_flashmla_interface as _decode_v32,
 )
+from .sparse_mla_decode_scheduled_common import check_sparse_mla_decode_strides
 from .sparse_mla_model1_decode_fwd_scheduled import (
     sparse_mla_decode_fwd_scheduled_interface_model1 as _decode_model1,
 )
@@ -76,8 +77,8 @@ def sparse_mla_decode_fwd(
     if extra_k_cache is not None:
         extra_k_cache = _byte_view_k_cache(extra_k_cache, "extra_k_cache")
     assert indices.dtype == torch.int32, "indices must be int32"
-    assert q.stride(-1) == 1, "q last dimension must be contiguous"
-    assert indices.stride(-1) == 1, "indices last dimension must be contiguous"
+    check_sparse_mla_decode_strides("q", q, multiple=8)
+    check_sparse_mla_decode_strides("indices", indices)
 
     if head_dim_q == 576:
         return _sparse_decode_v32(
@@ -162,13 +163,6 @@ def _sparse_decode_v32(
     indices = normalize_sparse_decode_indices(
         indices, batch_size, seq_len_q, num_heads_k, "indices"
     )
-    topk_length = require_batch_topk_length(topk_length, batch_size, "topk_length")
-    if attn_sink is not None:
-        assert attn_sink.dtype == torch.float32, "attn_sink must be float32"
-        assert attn_sink.shape == (q.shape[2],), (
-            "attn_sink must have shape [H_q] for V3.2 sparse decode"
-        )
-        assert attn_sink.stride(-1) == 1, "attn_sink last dimension must be contiguous"
     assert tile_scheduler_metadata is not None
     assert num_splits is not None
 
@@ -217,7 +211,9 @@ def _sparse_decode_model1(
     topk = indices.shape[-1]
     assert topk % 64 == 0, "MODEL1 sparse decode requires topk to be a multiple of 64"
 
-    k_cache_nope, k_cache_rope, k_cache_scales = model1_cache_page_views(k_cache)
+    k_cache_nope, k_cache_rope, k_cache_scales = model1_cache_page_views(
+        k_cache, check=False
+    )
     extra_indices = None
     if extra_k_cache is not None:
         assert extra_indices_in_kvcache is not None, (
@@ -225,9 +221,6 @@ def _sparse_decode_model1(
         )
         check_model1_k_cache(extra_k_cache, "extra_k_cache")
         assert extra_k_cache.shape[2] == num_heads_k
-        assert extra_indices_in_kvcache.stride(-1) == 1, (
-            "extra_indices_in_kvcache last dimension must be contiguous"
-        )
         extra_indices = normalize_sparse_decode_indices(
             extra_indices_in_kvcache,
             batch_size,
@@ -240,7 +233,7 @@ def _sparse_decode_model1(
             "MODEL1 sparse decode requires extra_topk to be a multiple of 64"
         )
         extra_k_cache_nope, extra_k_cache_rope, extra_k_cache_scales = (
-            model1_cache_page_views(extra_k_cache)
+            model1_cache_page_views(extra_k_cache, check=False)
         )
     else:
         assert extra_indices_in_kvcache is None, (
@@ -253,14 +246,15 @@ def _sparse_decode_model1(
             k_cache_scales,
         )
 
-    topk_length = require_batch_topk_length(topk_length, batch_size, "topk_length")
-    extra_topk_length = require_batch_topk_length(
-        extra_topk_length, batch_size, "extra_topk_length"
-    )
-
     if tile_scheduler_metadata is None or num_splits is None:
         assert tile_scheduler_metadata is None and num_splits is None, (
             "tile_scheduler_metadata and num_splits must be provided together"
+        )
+        metadata_topk_length = require_batch_topk_length(
+            topk_length, batch_size, "topk_length"
+        )
+        metadata_extra_topk_length = require_batch_topk_length(
+            extra_topk_length, batch_size, "extra_topk_length"
         )
         tile_scheduler_metadata, num_splits = metadata_getter(
             cache_seqlens=None,
@@ -272,8 +266,8 @@ def _sparse_decode_model1(
             extra_topk=extra_indices.shape[-1] if extra_indices is not None else None,
             q=q,
             bs=batch_size,
-            topk_length=topk_length,
-            extra_topk_length=extra_topk_length,
+            topk_length=metadata_topk_length,
+            extra_topk_length=metadata_extra_topk_length,
         )
 
     (

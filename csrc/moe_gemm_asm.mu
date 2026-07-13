@@ -4,6 +4,7 @@
 #include <musa_runtime.h>
 #include <mutlass/fast_math.h>
 
+#include <cstdint>
 #include <iostream>
 #include <mute/algorithm/tuple_algorithms.hpp>
 #include <mute/arch/copy_mp31_desc.hpp>
@@ -31,10 +32,30 @@ enum class MoeGemmMode {
   KContig
 };  // enum class MoeGemmMode
 
+inline bool is_4bit_b_dtype(DLDataType dtype) {
+  return dtype_equal(dtype, dl_int4);
+}
+
+inline mute::RobustReg make_scale_robust_desc(void* ptr, int nr_elem, DLDataType dtype, const char* name) {
+  if (ptr == nullptr || nr_elem == 0) {
+    return {};
+  }
+  const int bytes_per_elem = dtype.bits * dtype.lanes / 8;
+  TVM_FFI_ICHECK_EQ(bytes_per_elem * 8, dtype.bits * dtype.lanes) << name << " dtype must be byte-aligned";
+  return mute::make_robust_desc(static_cast<uint8_t*>(ptr), static_cast<size_t>(nr_elem) * bytes_per_elem).reg;
+}
+
+int64_t logical_k_from_packed_storage(int64_t packed_k, DLDataType logical_dtype) {
+  return packed_k * (is_4bit_b_dtype(logical_dtype) ? 2 : 1);
+}
+
 struct MoeGemmArgs {
   DLDataType type_a;
   DLDataType type_b;
   DLDataType type_d;
+  DLDataType type_scale_a{dl_float32};
+  DLDataType type_scale_b{dl_float32};
+  bool       n_split{false};
 
   // for deepgemm contiguous, m == sum(align(group_m[i]))
   // for deepgemm masked,     m == align(max_m) * num_expert
@@ -74,6 +95,7 @@ struct MoeGemmArgs {
   int scale_b_n;
   int scale_b_k;
   int scale_b_nr_elem;
+  int scale_b1_nr_elem;
 
   // deivce memory ptr
   void* p_a;
@@ -82,10 +104,13 @@ struct MoeGemmArgs {
 
   void* p_scale_a;
   void* p_scale_b;
+  void* p_scale_b1{nullptr};
   void* p_scale_out{nullptr};
 
   void* p_m_indices;
   void* p_signal;
+
+  float act_param{0.0f};
 
 };  // struct MoeGemmArgs
 
@@ -248,6 +273,11 @@ struct MoeGemmMubinDispatcher {
     config.num_squad_m = config.block.tile_m / 128;
     config.num_squad_n = config.block.tile_n / 128;
 
+    if (args.n_split && config.block.tile_m == 256 && config.block.tile_n == 256 && config.block.num_thread == 512) {
+      config.num_squad_m = 1;
+      config.num_squad_n = 4;
+    }
+
     MoeGemmAsmID id;
     id.a_type = moe_gemm_asm_src_type_to_id.at(encode_dlpack_dtype(args.type_a));
     id.b_type = moe_gemm_asm_src_type_to_id.at(encode_dlpack_dtype(args.type_b));
@@ -335,6 +365,7 @@ class MoeGemmAsmKernel {
     MUtensorDescriptor a_desc{};
     MUtensorDescriptor b_desc{};
     MUtensorDescriptor c_desc{};
+    MUtensorDescriptor kpart_desc{};
 
     mute::RobustReg robust_input_bias{};
     mute::RobustReg robust_input_z{};
@@ -359,6 +390,7 @@ class MoeGemmAsmKernel {
     float alpha{1.0f};
     float beta{0.0f};
     float gamma{0.0f};
+    float act_param{0.0f};
 
     int32_t scale_a_mode{};
     int32_t scale_b_mode{};
@@ -462,8 +494,9 @@ class MoeGemmAsmKernel {
 
     Params params;
 
-    int batch   = args.batch;
-    int batch_b = mode == MoeGemmMode::KContig ? 1 : (mode == MoeGemmMode::NoGroup ? args.batch : args.num_expert);
+    int  batch   = args.batch;
+    int  batch_b = mode == MoeGemmMode::KContig ? 1 : (mode == MoeGemmMode::NoGroup ? args.batch : args.num_expert);
+    bool is_4bit_b_mode = is_4bit_b_dtype(args.type_b);
 
     size_t tme_a_dim0, tme_a_dim1, tme_a_dim2, tme_a_stride0, tme_a_stride1;
     size_t tme_b_dim0, tme_b_dim1, tme_b_dim2, tme_b_stride0, tme_b_stride1;
@@ -480,7 +513,13 @@ class MoeGemmAsmKernel {
       tme_a_stride0 = args.stride_m_a;
       tme_a_stride1 = args.stride_batch_a;
     }
-    if (args.major_b == TensorMajor::MN) {
+    if (is_4bit_b_mode) {
+      tme_b_dim0    = args.k / 2;
+      tme_b_dim1    = args.n;
+      tme_b_dim2    = batch_b;
+      tme_b_stride0 = args.stride_n_b;
+      tme_b_stride1 = args.stride_batch_b;
+    } else if (args.major_b == TensorMajor::MN) {
       tme_b_dim0    = args.n;
       tme_b_dim1    = args.k;
       tme_b_dim2    = batch_b;
@@ -500,7 +539,15 @@ class MoeGemmAsmKernel {
     TmeDesc tensor_desc_b(mute::make_tuple(tme_b_dim0, tme_b_dim1, tme_b_dim2),
                           mute::make_tuple(tme_b_stride0, tme_b_stride1),
                           args.p_b,
-                          dl_dtype_to_tme_type(args.type_b));
+                          is_4bit_b_mode ? MU_TENSOR_DESCRIPTOR_DATA_TYPE_INT8 : dl_dtype_to_tme_type(args.type_b));
+    TmeDesc tensor_desc_c;
+    if (is_4bit_b_mode) {
+      tensor_desc_c = TmeDesc(
+          mute::make_tuple(static_cast<size_t>(args.n), static_cast<size_t>(args.m), static_cast<size_t>(batch)),
+          mute::make_tuple(args.stride_m_out, args.stride_batch_out),
+          args.p_d,
+          dl_dtype_to_tme_type(args.type_d));
+    }
 
     int gridy_in_group;
     int grid_y;
@@ -559,9 +606,19 @@ class MoeGemmAsmKernel {
 
     params.a_desc = tensor_desc_a.desc;
     params.b_desc = tensor_desc_b.desc;
+    if (is_4bit_b_mode) {
+      params.c_desc     = tensor_desc_c.desc;
+      params.kpart_desc = tensor_desc_c.desc;
+    }
 
-    params.robust_input_a_scale = mute::make_robust_desc(static_cast<float*>(args.p_scale_a), args.scale_a_nr_elem).reg;
-    params.robust_input_b_scale = mute::make_robust_desc(static_cast<float*>(args.p_scale_b), args.scale_b_nr_elem).reg;
+    params.robust_input_a_scale =
+        make_scale_robust_desc(args.p_scale_a, args.scale_a_nr_elem, args.type_scale_a, "scale_a");
+    params.robust_input_b_scale =
+        make_scale_robust_desc(args.p_scale_b, args.scale_b_nr_elem, args.type_scale_b, "scale_b");
+    if (args.p_scale_b1 != nullptr) {
+      params.robust_input_b_scale1 =
+          mute::make_robust_desc(static_cast<float*>(args.p_scale_b1), args.scale_b1_nr_elem).reg;
+    }
 
     if constexpr (mode == MoeGemmMode::Ragged) {
       params.robust_group_idx = mute::make_robust_desc(static_cast<int*>(args.p_m_indices), args.m).reg;
@@ -631,6 +688,7 @@ class MoeGemmAsmKernel {
 
     params.max_tile_y = swizzle_dim1 - 1;
     params.quant_tile = args.quant_tile;
+    params.act_param  = args.act_param;
 
     params.fast_macro_tile_x_ori = fast_macro_tile_x.divisor;
     params.fast_macro_tile_x_mul = fast_macro_tile_x.multiplier;
@@ -653,7 +711,10 @@ class MoeGemmAsmKernel {
     }
     params.tile_a_dim2 = 1;
 
-    if (args.major_b == TensorMajor::MN) {
+    if (is_4bit_b_mode) {
+      params.tile_b_dim0 = config.block.tile_k / 2;
+      params.tile_b_dim1 = config.block.tile_n / config.num_squad_n;
+    } else if (args.major_b == TensorMajor::MN) {
       params.tile_b_dim0 = config.block.tile_n / config.num_squad_n;
       params.tile_b_dim1 = config.block.tile_k / dl_dtype_size(args.type_b);
     } else {
@@ -697,12 +758,13 @@ class MoeGemmAsmKernel {
         &params.output_ptr,
         &params.amax_ptr,
 
-        // 3-5: Tensor描述符 (对象地址)
+        // 3-6: Tensor描述符 (对象地址)
         &params.a_desc,
         &params.b_desc,
         &params.c_desc,
+        &params.kpart_desc,
 
-        // 6-12: RobustReg输入参数 (对象地址)
+        // 7-13: RobustReg输入参数 (对象地址)
         &params.robust_input_bias,
         &params.robust_input_z,
         &params.robust_input_a_scale,
@@ -730,6 +792,7 @@ class MoeGemmAsmKernel {
         &params.alpha,
         &params.beta,
         &params.gamma,
+        &params.act_param,
 
         // 25-27: 缩放模式
         &params.scale_a_mode,
@@ -869,6 +932,117 @@ int current_num_mps(DLDevice device) {
 size_t leading_unsqueezed_batch_stride(ffi::TensorView tensor) {
   TVM_FFI_ICHECK_GT(tensor.ndim(), 0) << "tensor must have rank greater than 0";
   return static_cast<size_t>(tensor.stride(0) * tensor.size(0));
+}
+
+void check_w4a8_common(ffi::TensorView a,
+                       ffi::TensorView packed_b,
+                       ffi::TensorView scale_a,
+                       ffi::TensorView scale_b,
+                       ffi::TensorView out,
+                       const char*     func_name) {
+  check_mp31(a.device(), func_name);
+  CHECK_MUSA(a);
+  CHECK_MUSA(packed_b);
+  CHECK_MUSA(scale_a);
+  CHECK_MUSA(scale_b);
+  CHECK_MUSA(out);
+  CHECK_DEVICE(a, packed_b);
+  CHECK_DEVICE(a, scale_a);
+  CHECK_DEVICE(a, scale_b);
+  CHECK_DEVICE(a, out);
+  CHECK_CONTIGUOUS(scale_a);
+  CHECK_CONTIGUOUS(packed_b);
+  CHECK_CONTIGUOUS(scale_b);
+  CHECK_CONTIGUOUS(out);
+  TVM_FFI_ICHECK(is_fp8_dtype(a.dtype())) << "a must be fp8";
+  TVM_FFI_ICHECK(dtype_equal(packed_b.dtype(), dl_int8)) << "packed_b must be int8 byte storage";
+  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(out.dtype())) << "out must be bf16 or fp16";
+}
+
+void check_w4a8_quant_recipes(const std::tuple<int64_t, int64_t>& a_quant_recipe,
+                              const std::tuple<int64_t, int64_t>& b_quant_recipe) {
+  TVM_FFI_ICHECK_EQ(std::get<0>(a_quant_recipe), 1) << "a_quant_recipe[0] must be 1";
+  TVM_FFI_ICHECK_EQ(std::get<1>(a_quant_recipe), -1) << "a_quant_recipe[1] must be -1";
+  TVM_FFI_ICHECK_EQ(std::get<0>(b_quant_recipe), 1) << "b_quant_recipe[0] must be 1";
+  TVM_FFI_ICHECK_EQ(std::get<1>(b_quant_recipe), 128) << "b_quant_recipe[1] must be 128";
+}
+
+int32_t quantized_axis_size(int32_t logical_size, int64_t quant_block) {
+  if (quant_block == -1) {
+    return 1;
+  }
+  TVM_FFI_ICHECK_GT(quant_block, 0) << "quant_recipe entries must be positive or -1";
+  return mutlass::ceil_div(logical_size, static_cast<int32_t>(quant_block));
+}
+
+TensorQuantMode quant_mode_from_recipe(const std::tuple<int64_t, int64_t>& quant_recipe) {
+  const int64_t outer_block = std::get<0>(quant_recipe);
+  const int64_t inner_block = std::get<1>(quant_recipe);
+  if (outer_block == -1 && inner_block == -1) {
+    return TensorQuantMode::TENSOR;
+  }
+  if (outer_block == 1 && inner_block == -1) {
+    return TensorQuantMode::CHANNEL;
+  }
+  if (outer_block == 1 || inner_block == -1) {
+    return TensorQuantMode::GROUP;
+  }
+  return TensorQuantMode::BLOCK;
+}
+
+int32_t quant_tile_from_recipes(const std::tuple<int64_t, int64_t>& a_quant_recipe,
+                                const std::tuple<int64_t, int64_t>& b_quant_recipe) {
+  const int64_t a_k_quant_block = std::get<1>(a_quant_recipe);
+  const int64_t b_k_quant_block = std::get<1>(b_quant_recipe);
+  if (a_k_quant_block > 0 && b_k_quant_block > 0) {
+    TVM_FFI_ICHECK_EQ(a_k_quant_block, b_k_quant_block)
+        << "a_quant_recipe and b_quant_recipe must use the same k block size";
+    return static_cast<int32_t>(a_k_quant_block);
+  }
+  if (a_k_quant_block > 0) {
+    return static_cast<int32_t>(a_k_quant_block);
+  }
+  if (b_k_quant_block > 0) {
+    return static_cast<int32_t>(b_k_quant_block);
+  }
+  return 1;
+}
+
+void fill_w4a8_common_args(mate::moe_gemm::MoeGemmArgs&        args,
+                           ffi::TensorView                     a,
+                           ffi::TensorView                     packed_b,
+                           ffi::TensorView                     scale_a,
+                           ffi::TensorView                     scale_b,
+                           ffi::TensorView                     out,
+                           const std::tuple<int64_t, int64_t>& a_quant_recipe,
+                           const std::tuple<int64_t, int64_t>& b_quant_recipe) {
+  args.type_a       = a.dtype();
+  args.type_b       = dl_int4;
+  args.type_d       = out.dtype();
+  args.type_scale_a = scale_a.dtype();
+  args.type_scale_b = scale_b.dtype();
+  args.n_split      = true;
+
+  args.quant_tile      = quant_tile_from_recipes(a_quant_recipe, b_quant_recipe);
+  args.total_mp_count  = current_num_mps(a.device());
+  args.target_mp_count = args.total_mp_count;
+
+  args.major_a       = TensorMajor::K;
+  args.major_b       = TensorMajor::K;
+  args.quant_mode_a  = quant_mode_from_recipe(a_quant_recipe);
+  args.quant_mode_b  = quant_mode_from_recipe(b_quant_recipe);
+  args.major_scale_a = TensorMajor::K;
+  args.major_scale_b = TensorMajor::K;
+
+  args.scale_a_nr_elem = static_cast<int32_t>(scale_a.numel());
+  args.scale_b_nr_elem = static_cast<int32_t>(scale_b.numel());
+
+  args.p_a       = a.data_ptr();
+  args.p_b       = packed_b.data_ptr();
+  args.p_d       = out.data_ptr();
+  args.p_scale_a = scale_a.data_ptr();
+  args.p_scale_b = scale_b.data_ptr();
+  args.p_signal  = nullptr;
 }
 
 template <typename Kernel>
@@ -1109,6 +1283,161 @@ std::optional<std::tuple<int64_t, int64_t>> masked_moe_gemm_8bit(
   args.p_scale_b   = scale_b.data_ptr();
   args.p_m_indices = masked_tokens_info.data_ptr();
   args.p_signal    = signal.has_value() ? signal.value().data_ptr() : nullptr;
+
+  using Kernel = mate::moe_gemm::mubin::MoeGemmAsmKernel<mate::moe_gemm::MoeGemmMode::Masked>;
+  run_moe_gemm_kernel<Kernel>(args, a.device());
+
+  if (signal.has_value()) {
+    auto [_, config, __] = Kernel::to_underlying_arguments(args, get_stream(a.device()));
+    return std::make_pair(config.block.tile_m, mutlass::ceil_div(args.n, config.block.tile_n));
+  }
+  return std::nullopt;
+}
+
+void ragged_moe_gemm_mixed_dtype(const std::tuple<ffi::TensorView, ffi::TensorView>& input_a,
+                                 ffi::TensorView                                     packed_b,
+                                 ffi::TensorView                                     scale_b,
+                                 ffi::TensorView                                     ragged_tokens_info,
+                                 ffi::TensorView                                     out,
+                                 int64_t                                             alignment_m,
+                                 const std::tuple<int64_t, int64_t>&                 a_quant_recipe,
+                                 const std::tuple<int64_t, int64_t>&                 b_quant_recipe) {
+  const auto& [a, scale_a] = input_a;
+  check_w4a8_common(a, packed_b, scale_a, scale_b, out, "ragged_moe_gemm_mixed_dtype");
+  check_w4a8_quant_recipes(a_quant_recipe, b_quant_recipe);
+  CHECK_MUSA(ragged_tokens_info);
+  CHECK_DEVICE(a, ragged_tokens_info);
+  CHECK_DIM(2, a);
+  CHECK_DIM(1, scale_a);
+  CHECK_DIM(3, packed_b);
+  CHECK_DIM(3, scale_b);
+  CHECK_DIM(1, ragged_tokens_info);
+  CHECK_DIM(2, out);
+  TVM_FFI_ICHECK_EQ(a.stride(-1), 1) << "a must be contiguous at the last dimension";
+  CHECK_CONTIGUOUS(ragged_tokens_info);
+  TVM_FFI_ICHECK(dtype_equal(ragged_tokens_info.dtype(), dl_int32)) << "ragged_tokens_info must be int32";
+
+  mate::moe_gemm::MoeGemmArgs args{};
+  fill_w4a8_common_args(args, a, packed_b, scale_a, scale_b, out, a_quant_recipe, b_quant_recipe);
+
+  args.m          = static_cast<int32_t>(a.size(0));
+  args.k          = static_cast<int32_t>(a.size(1));
+  args.num_expert = static_cast<int32_t>(packed_b.size(0));
+  args.n          = static_cast<int32_t>(packed_b.size(1));
+
+  TVM_FFI_ICHECK_EQ(mate::moe_gemm::logical_k_from_packed_storage(packed_b.size(2), args.type_b), args.k);
+  TVM_FFI_ICHECK_EQ(scale_a.size(0), quantized_axis_size(args.m, std::get<0>(a_quant_recipe)));
+  TVM_FFI_ICHECK_EQ(scale_b.size(0), args.num_expert);
+  TVM_FFI_ICHECK_EQ(scale_b.size(1), quantized_axis_size(args.n, std::get<0>(b_quant_recipe)));
+  TVM_FFI_ICHECK_EQ(scale_b.size(2), quantized_axis_size(args.k, std::get<1>(b_quant_recipe)));
+  TVM_FFI_ICHECK_EQ(out.size(0), args.m);
+  TVM_FFI_ICHECK_EQ(out.size(1), args.n);
+  TVM_FFI_ICHECK_EQ(ragged_tokens_info.size(0), args.m);
+
+  if (gemm_common::gemm_early_return(args.m, args.n, args.k, out)) {
+    return;
+  }
+
+  args.alignment_m = static_cast<int32_t>(alignment_m);
+  TVM_FFI_ICHECK(args.alignment_m == 128 || args.alignment_m == 256) << "alignment_m must be 128 or 256";
+
+  args.stride_m_a       = a.stride(0);
+  args.stride_batch_a   = leading_unsqueezed_batch_stride(a);
+  args.stride_n_b       = packed_b.stride(1);
+  args.stride_batch_b   = packed_b.stride(0);
+  args.stride_m_out     = out.stride(0);
+  args.stride_batch_out = leading_unsqueezed_batch_stride(out);
+
+  args.scale_a_m = static_cast<int32_t>(scale_a.size(0));
+  args.scale_a_k = quantized_axis_size(args.k, std::get<1>(a_quant_recipe));
+  args.scale_b_n = static_cast<int32_t>(scale_b.size(1));
+  args.scale_b_k = static_cast<int32_t>(scale_b.size(2));
+
+  args.p_m_indices = ragged_tokens_info.data_ptr();
+
+  using Kernel = mate::moe_gemm::mubin::MoeGemmAsmKernel<mate::moe_gemm::MoeGemmMode::Ragged>;
+  run_moe_gemm_kernel<Kernel>(args, a.device());
+}
+
+std::optional<std::tuple<int64_t, int64_t>> masked_moe_gemm_mixed_dtype(
+    const std::tuple<ffi::TensorView, ffi::TensorView>& input_a,
+    ffi::TensorView                                     packed_b,
+    ffi::TensorView                                     scale_b,
+    ffi::TensorView                                     masked_tokens_info,
+    ffi::TensorView                                     out,
+    int64_t                                             expect_tokens,
+    std::optional<ffi::TensorView>                      signal,
+    const std::tuple<int64_t, int64_t>&                 a_quant_recipe,
+    const std::tuple<int64_t, int64_t>&                 b_quant_recipe) {
+  const auto& [a, scale_a] = input_a;
+  check_w4a8_common(a, packed_b, scale_a, scale_b, out, "masked_moe_gemm_mixed_dtype");
+  check_w4a8_quant_recipes(a_quant_recipe, b_quant_recipe);
+  CHECK_MUSA(masked_tokens_info);
+  CHECK_DEVICE(a, masked_tokens_info);
+  CHECK_DIM(3, a);
+  CHECK_DIM(2, scale_a);
+  CHECK_DIM(3, packed_b);
+  CHECK_DIM(3, scale_b);
+  CHECK_DIM(1, masked_tokens_info);
+  CHECK_DIM(3, out);
+  TVM_FFI_ICHECK_EQ(a.stride(-1), 1) << "a must be contiguous at the last dimension";
+  TVM_FFI_ICHECK(scale_a.stride(-1) == 1 || scale_a.stride(-2) == 1) << "scale_a must be contiguous";
+  CHECK_CONTIGUOUS(masked_tokens_info);
+  TVM_FFI_ICHECK(dtype_equal(masked_tokens_info.dtype(), dl_int32)) << "masked_tokens_info must be int32";
+  if (signal.has_value()) {
+    CHECK_MUSA(signal.value());
+    CHECK_CONTIGUOUS(signal.value());
+    CHECK_DEVICE(a, signal.value());
+    CHECK_DIM(1, signal.value());
+  }
+
+  mate::moe_gemm::MoeGemmArgs args{};
+  fill_w4a8_common_args(args, a, packed_b, scale_a, scale_b, out, a_quant_recipe, b_quant_recipe);
+
+  const int max_m = static_cast<int32_t>(a.size(1));
+  args.num_expert = static_cast<int32_t>(a.size(0));
+  args.m          = max_m * args.num_expert;
+  args.k          = static_cast<int32_t>(a.size(2));
+  args.n          = static_cast<int32_t>(packed_b.size(1));
+
+  TVM_FFI_ICHECK_EQ(packed_b.size(0), args.num_expert);
+  TVM_FFI_ICHECK_EQ(mate::moe_gemm::logical_k_from_packed_storage(packed_b.size(2), args.type_b), args.k);
+  TVM_FFI_ICHECK_EQ(scale_a.size(0), args.num_expert);
+  TVM_FFI_ICHECK_EQ(scale_a.size(1), quantized_axis_size(max_m, std::get<0>(a_quant_recipe)));
+  TVM_FFI_ICHECK_EQ(scale_b.size(0), args.num_expert);
+  TVM_FFI_ICHECK_EQ(scale_b.size(1), quantized_axis_size(args.n, std::get<0>(b_quant_recipe)));
+  TVM_FFI_ICHECK_EQ(scale_b.size(2), quantized_axis_size(args.k, std::get<1>(b_quant_recipe)));
+  TVM_FFI_ICHECK_EQ(out.size(0), args.num_expert);
+  TVM_FFI_ICHECK_EQ(out.size(1), max_m);
+  TVM_FFI_ICHECK_EQ(out.size(2), args.n);
+  TVM_FFI_ICHECK_EQ(masked_tokens_info.size(0), args.num_expert);
+
+  if (gemm_common::gemm_early_return(max_m, args.n, args.k, out)) {
+    return std::nullopt;
+  }
+
+  args.alignment_m = 0;
+  args.expected_m  = static_cast<int32_t>(expect_tokens);
+
+  args.stride_m_a       = a.stride(1);
+  args.stride_batch_a   = leading_unsqueezed_batch_stride(a);
+  args.stride_n_b       = packed_b.stride(1);
+  args.stride_batch_b   = packed_b.stride(0);
+  args.stride_m_out     = out.stride(1);
+  args.stride_batch_out = leading_unsqueezed_batch_stride(out);
+
+  args.scale_a_m = args.num_expert * static_cast<int32_t>(scale_a.size(1));
+  args.scale_a_k = quantized_axis_size(args.k, std::get<1>(a_quant_recipe));
+  args.scale_b_n = static_cast<int32_t>(scale_b.size(1));
+  args.scale_b_k = static_cast<int32_t>(scale_b.size(2));
+
+  args.p_m_indices = masked_tokens_info.data_ptr();
+  args.p_signal    = signal.has_value() ? signal.value().data_ptr() : nullptr;
+
+  if (signal.has_value()) {
+    constexpr int tile_signal = 64;
+    TVM_FFI_ICHECK_EQ(signal.value().size(0), args.num_expert * mutlass::ceil_div(max_m, tile_signal));
+  }
 
   using Kernel = mate::moe_gemm::mubin::MoeGemmAsmKernel<mate::moe_gemm::MoeGemmMode::Masked>;
   run_moe_gemm_kernel<Kernel>(args, a.device());
@@ -1732,6 +2061,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(k_grouped_contig_gemm_16bit, k_grouped_contig_gemm
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_contig_gemm_16bit, m_grouped_contig_gemm_16bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ragged_moe_gemm_8bit, ragged_moe_gemm_8bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(masked_moe_gemm_8bit, masked_moe_gemm_8bit);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ragged_moe_gemm_mixed_dtype, ragged_moe_gemm_mixed_dtype);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(masked_moe_gemm_mixed_dtype, masked_moe_gemm_mixed_dtype);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(k_grouped_contig_gemm_8bit, k_grouped_contig_gemm_8bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_contig_gemm_8bit, m_grouped_contig_gemm_8bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(groupwise_gemm_8bit_fp8output, groupwise_gemm_8bit_fp8output);

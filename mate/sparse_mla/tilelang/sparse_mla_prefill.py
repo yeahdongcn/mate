@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from .sparse_mla_prefill_common import check_sparse_mla_strides
 from .sparse_mla_v32_fwd_pipelined import (
     tilelang_sparse_mla_prefill_fwd_interface as _prefill_v32,
 )
@@ -33,9 +34,9 @@ def sparse_mla_prefill_fwd(
     assert indices.dtype == torch.int32, "indices must be int32"
     seq_len_q, _, head_dim_q = q.shape
     _, h_k, _ = kv.shape
-    assert q.stride(-1) == 1, "q last dimension must be contiguous"
-    assert kv.stride(-1) == 1, "kv last dimension must be contiguous"
-    assert indices.stride(-1) == 1, "indices last dimension must be contiguous"
+    check_sparse_mla_strides("q", q, multiple=8)
+    check_sparse_mla_strides("kv", kv, multiple=8)
+    check_sparse_mla_strides("indices", indices)
     assert head_dim_q == kv.shape[-1]
     assert seq_len_q == indices.shape[0]
     assert h_k == indices.shape[1]

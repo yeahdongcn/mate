@@ -154,9 +154,6 @@ def flash_mla_sparse_fwd(
     seq_len_q, _, head_dim_q = q.shape
     _, h_k, _ = kv.shape
     _, _, topk = indices.shape
-    assert q.stride(-1) == 1, "q last dimension must be contiguous"
-    assert kv.stride(-1) == 1, "kv last dimension must be contiguous"
-    assert indices.stride(-1) == 1, "indices last dimension must be contiguous"
     assert head_dim_q == kv.shape[-1]
     assert seq_len_q == indices.shape[0]
     assert h_k == indices.shape[1]
@@ -261,13 +258,19 @@ def flash_mla_with_kvcache(
         The token indices tensor with shape ``(batch_size, seq_len_q, topk)``.
         If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to.
         Invalid indices should be set to -1 or numbers >= total_seq_len_kv. For details about how to set up `indices`, please refer to README.md.
-    For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
-        head_dim should be 576 while head_dim_v should be 512.
-        In FP8+sparse mode, each token's KV cache is 656 Bytes, structured as:
-            - The shape of the tensor `k_cache` is (num_blocks, page_block_size, num_heads_k, head_dim), and num_heads_k must be 1.
-            - First 512 bytes: The "quantized NoPE" part, containing 512 float8_e4m3 values.
-            - Next 16 bytes: Scale factors, containing 4 float32 values. The first float32 is the scale for the first 128 float8_e4m3 values, the second for the next 128, and so on.
-            - Last 128 bytes: The "RoPE" part, containing 64 bfloat16 values. This part is not quantized for accuracy.
+    Notes
+    -----
+    For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2, ``head_dim`` should be
+    576 while ``head_dim_v`` should be 512.
+
+    In FP8 + sparse mode, each token's KV cache is 656 bytes. ``k_cache`` has
+    shape ``(num_blocks, page_block_size, num_heads_k, head_dim)``, and
+    ``num_heads_k`` must be 1. The first 512 bytes contain the quantized NoPE
+    part with 512 ``float8_e4m3`` values. The next 16 bytes contain four
+    ``float32`` scale factors, one for each group of 128
+    ``float8_e4m3`` values. The final 128 bytes contain the RoPE part with 64
+    ``bfloat16`` values; this part is left unquantized for accuracy.
+
     Returns
     -------
     Tuple[Tensor, Tensor]

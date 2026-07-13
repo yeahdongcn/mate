@@ -14,6 +14,7 @@ from mate.jit.gemm.deep_gemm.paged_mqa_logits import gen_paged_mqa_logits_aot
 from mate.jit.gemm_ops import gen_gemm_ops_aot
 from mate.jit.guard_allocator import gen_guard_allocator_aot
 from mate.jit.mla_ops import gen_mla_ops_aot
+from mate.jit.mega_moe import gen_mega_moe_runtime_utils_spec
 from mate.jit.moe_fused_gate import gen_moe_fused_gate_aot
 from mate.jit.sage_attention import gen_sage_attention_aot
 
@@ -109,6 +110,7 @@ def gen_all_modules(config: dict[str, object] | None = None):
         specs.extend(gen_hyperconnection_aot())
     if add_moe:
         specs.extend(gen_moe_fused_gate_aot())
+        specs.append(gen_mega_moe_runtime_utils_spec())
 
     return _dedupe_specs(specs)
 

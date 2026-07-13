@@ -62,6 +62,7 @@ comprehensive logging, and environment inspection tools.
    Command Line Interface <cli>
    Logging <logging_debugging>
    Environment Variables <environment_variables>
+   Guard Allocator Debugging <guard_allocator>
 
 .. toctree::
    :maxdepth: 1
@@ -70,5 +71,12 @@ comprehensive logging, and environment inspection tools.
    Python APIs <api_reference>
    Attention <api/attention>
    GEMM <api/gemm>
+   Mega MoE <api/mega_moe>
    HyperConnection <api/hyperconnection>
    KDA <api/kda>
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Appendix
+
+   Documentation History <documentation_history>

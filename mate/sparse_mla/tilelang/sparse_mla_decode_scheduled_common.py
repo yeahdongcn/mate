@@ -46,6 +46,23 @@ SCHEDULED_DECODE_COMPILE_FLAGS = [
 ]
 
 
+def check_sparse_mla_decode_strides(
+    name: str, tensor: torch.Tensor, multiple: Optional[int] = None
+) -> None:
+    if tensor.is_contiguous():
+        return
+    if tensor.shape[-1] != 1:
+        assert tensor.stride(-1) == 1, f"{name} last dimension must be contiguous"
+    for dim, (size, stride) in enumerate(zip(tensor.shape[:-1], tensor.stride()[:-1])):
+        if size == 1:
+            continue
+        assert stride > 0, f"{name} stride({dim}) must be positive, got {stride}"
+        if multiple is not None:
+            assert stride % multiple == 0, (
+                f"{name} stride({dim}) must be divisible by {multiple}, got {stride}"
+            )
+
+
 def make_scheduled_decode_combine(
     *,
     batch,
@@ -377,6 +394,7 @@ def make_scheduled_decode_finalize_left(
     l1_start,
     out_dtype="bfloat16",
     guard_invalid_heads=False,
+    support_split=True,
 ):
     """Build the shared left-half split writeback macro."""
 
@@ -520,44 +538,47 @@ def make_scheduled_decode_finalize_left(
                 for h_i in T.Parallel(h_per_block):
                     lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
         else:
-            if guard_invalid_heads:
-                for h_i, d_i in T.Parallel(h_per_block, out_width):
-                    if h0 + h_i < num_heads:
+            if support_split:
+                if guard_invalid_heads:
+                    for h_i, d_i in T.Parallel(h_per_block, out_width):
+                        if h0 + h_i < num_heads:
+                            output_partial[
+                                n_split_idx + num_splits[b_i],
+                                s_i,
+                                h0 + h_i,
+                                l0_start + d_i,
+                            ] = acc_o_l_0[h_i, d_i]
+                            output_partial[
+                                n_split_idx + num_splits[b_i],
+                                s_i,
+                                h0 + h_i,
+                                l1_start + d_i,
+                            ] = acc_o_l_1[h_i, d_i]
+                    for h_i in T.Parallel(h_per_block):
+                        if h0 + h_i < num_heads:
+                            glse[n_split_idx + num_splits[b_i], s_i, h0 + h_i] = sumexp[
+                                h_i
+                            ]
+                else:
+                    T.copy(
+                        acc_o_l_0,
                         output_partial[
                             n_split_idx + num_splits[b_i],
                             s_i,
-                            h0 + h_i,
-                            l0_start + d_i,
-                        ] = acc_o_l_0[h_i, d_i]
+                            h0:h1,
+                            l0_start : l0_start + out_width,
+                        ],
+                    )
+                    T.copy(
+                        acc_o_l_1,
                         output_partial[
                             n_split_idx + num_splits[b_i],
                             s_i,
-                            h0 + h_i,
-                            l1_start + d_i,
-                        ] = acc_o_l_1[h_i, d_i]
-                for h_i in T.Parallel(h_per_block):
-                    if h0 + h_i < num_heads:
-                        glse[n_split_idx + num_splits[b_i], s_i, h0 + h_i] = sumexp[h_i]
-            else:
-                T.copy(
-                    acc_o_l_0,
-                    output_partial[
-                        n_split_idx + num_splits[b_i],
-                        s_i,
-                        h0:h1,
-                        l0_start : l0_start + out_width,
-                    ],
-                )
-                T.copy(
-                    acc_o_l_1,
-                    output_partial[
-                        n_split_idx + num_splits[b_i],
-                        s_i,
-                        h0:h1,
-                        l1_start : l1_start + out_width,
-                    ],
-                )
-                T.copy(sumexp, glse[n_split_idx + num_splits[b_i], s_i, h0:h1])
+                            h0:h1,
+                            l1_start : l1_start + out_width,
+                        ],
+                    )
+                    T.copy(sumexp, glse[n_split_idx + num_splits[b_i], s_i, h0:h1])
 
     return finalize_left
 
@@ -573,6 +594,7 @@ def make_scheduled_decode_finalize_right(
     r1_start,
     out_dtype="bfloat16",
     guard_invalid_heads=False,
+    support_split=True,
 ):
     """Build the shared right-half split writeback macro."""
 
@@ -625,40 +647,41 @@ def make_scheduled_decode_finalize_right(
                     output[b_i, s_i, h0:h1, r1_start : r1_start + out_width],
                 )
         else:
-            if guard_invalid_heads:
-                for h_i, d_i in T.Parallel(h_per_block, out_width):
-                    if h0 + h_i < num_heads:
+            if support_split:
+                if guard_invalid_heads:
+                    for h_i, d_i in T.Parallel(h_per_block, out_width):
+                        if h0 + h_i < num_heads:
+                            output_partial[
+                                n_split_idx + num_splits[b_i],
+                                s_i,
+                                h0 + h_i,
+                                r0_start + d_i,
+                            ] = acc_o_r_0[h_i, d_i]
+                            output_partial[
+                                n_split_idx + num_splits[b_i],
+                                s_i,
+                                h0 + h_i,
+                                r1_start + d_i,
+                            ] = acc_o_r_1[h_i, d_i]
+                else:
+                    T.copy(
+                        acc_o_r_0,
                         output_partial[
                             n_split_idx + num_splits[b_i],
                             s_i,
-                            h0 + h_i,
-                            r0_start + d_i,
-                        ] = acc_o_r_0[h_i, d_i]
+                            h0:h1,
+                            r0_start : r0_start + out_width,
+                        ],
+                    )
+                    T.copy(
+                        acc_o_r_1,
                         output_partial[
                             n_split_idx + num_splits[b_i],
                             s_i,
-                            h0 + h_i,
-                            r1_start + d_i,
-                        ] = acc_o_r_1[h_i, d_i]
-            else:
-                T.copy(
-                    acc_o_r_0,
-                    output_partial[
-                        n_split_idx + num_splits[b_i],
-                        s_i,
-                        h0:h1,
-                        r0_start : r0_start + out_width,
-                    ],
-                )
-                T.copy(
-                    acc_o_r_1,
-                    output_partial[
-                        n_split_idx + num_splits[b_i],
-                        s_i,
-                        h0:h1,
-                        r1_start : r1_start + out_width,
-                    ],
-                )
+                            h0:h1,
+                            r1_start : r1_start + out_width,
+                        ],
+                    )
 
     return finalize_right
 
@@ -681,6 +704,8 @@ def require_batch_lengths(
         return torch.full((batch,), fill, dtype=torch.int32, device=device)
     assert lengths.dtype == torch.int32, f"{name} must be int32"
     assert lengths.shape == (batch,), f"{name} must have shape [batch]"
+    if lengths.shape[-1] != 1:
+        assert lengths.stride(-1) == 1, f"{name} last dimension must be contiguous"
     return lengths.contiguous()
 
 
@@ -690,6 +715,8 @@ def optional_attn_sink(attn_sink: Optional[torch.Tensor], heads: int, device):
         attn_sink = torch.empty((heads,), dtype=torch.float32, device=device)
     assert attn_sink.dtype == torch.float32
     assert attn_sink.shape == (heads,)
+    if attn_sink.shape[-1] != 1:
+        assert attn_sink.stride(-1) == 1, "attn_sink last dimension must be contiguous"
     return attn_sink.contiguous(), has_attn_sink
 
 
@@ -701,17 +728,22 @@ def allocate_scheduled_decode_outputs(
     num_mp_parts: int,
     dtype: torch.dtype,
     device,
+    dummy_partials: bool = False,
 ):
-    glse = torch.empty(
-        (batch + num_mp_parts, seq_len, heads),
-        dtype=torch.float32,
-        device=device,
-    )
-    out_partial = torch.empty(
-        (batch + num_mp_parts, seq_len, heads, dim),
-        dtype=torch.float32,
-        device=device,
-    )
+    if dummy_partials:
+        glse = torch.empty((1,), dtype=torch.float32, device=device)
+        out_partial = torch.empty((1,), dtype=torch.float32, device=device)
+    else:
+        glse = torch.empty(
+            (batch + num_mp_parts, seq_len, heads),
+            dtype=torch.float32,
+            device=device,
+        )
+        out_partial = torch.empty(
+            (batch + num_mp_parts, seq_len, heads, dim),
+            dtype=torch.float32,
+            device=device,
+        )
     out = torch.empty((batch, seq_len, heads, dim), dtype=dtype, device=device)
     lse = torch.empty((batch, heads, seq_len), dtype=torch.float32, device=device)
     return glse, out_partial, out, lse
@@ -745,6 +777,7 @@ def prepare_scheduled_decode_runtime(
     out_dtype: torch.dtype,
     device,
     variant_name: str,
+    dummy_partials: bool = False,
 ) -> ScheduledDecodeRuntime:
     num_mp_parts = int(tile_scheduler_metadata.shape[0])
     assert tile_scheduler_metadata.shape == (num_mp_parts, 8)
@@ -756,7 +789,7 @@ def prepare_scheduled_decode_runtime(
     attn_sink_arg, has_attn_sink = optional_attn_sink(attn_sink, heads, device)
     max_nums_splits = scheduled_max_num_splits(num_mp_parts, variant_name)
     glse, out_partial, out, lse = allocate_scheduled_decode_outputs(
-        batch, seq_len, heads, dim, num_mp_parts, out_dtype, device
+        batch, seq_len, heads, dim, num_mp_parts, out_dtype, device, dummy_partials
     )
     return ScheduledDecodeRuntime(
         topk_length=topk_length_arg,
