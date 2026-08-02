@@ -391,6 +391,59 @@ def test_v32_sparse_mla_decode_official_style(case):
 
 
 @tilelang.testing.requires_musa_compute_version_ge(3, 1)
+def test_v32_sparse_mla_decode_large_cache_stride():
+    device = get_test_device()
+    torch.manual_seed(20260725)
+    batch_size, seq_len_q, num_heads, d_qk, d_v, topk = 1, 1, 64, 576, 512, 64
+
+    q = torch.randn(
+        (batch_size, seq_len_q, num_heads, d_qk),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv = torch.randn((2, 1, 1, d_qk), dtype=torch.bfloat16, device=device)
+    compact_cache = quantize_k_cache(kv, FP8KVCacheLayout.V32_FP8Sparse).contiguous()
+
+    # Put the second logical token beyond the signed int32 address space.
+    large_cache = torch.empty_strided(
+        compact_cache.shape,
+        (1 << 31, 656, 656, 1),
+        dtype=compact_cache.dtype,
+        device=device,
+    )
+    large_cache.copy_(compact_cache)
+    indices = torch.ones(
+        (batch_size, seq_len_q, 1, topk), dtype=torch.int32, device=device
+    )
+
+    import flash_mla
+
+    sched_meta, _ = flash_mla.get_mla_metadata()
+
+    def run_decode(k_cache):
+        return flash_mla.flash_mla_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=d_v,
+            tile_scheduler_metadata=sched_meta,
+            num_splits=None,
+            softmax_scale=d_qk**-0.5,
+            causal=False,
+            is_fp8_kvcache=True,
+            indices=indices,
+        )
+
+    compact_out, compact_lse = run_decode(compact_cache)
+    large_out, large_lse = run_decode(large_cache)
+    torch.musa.synchronize()
+
+    torch.testing.assert_close(large_out, compact_out, rtol=0, atol=0)
+    torch.testing.assert_close(large_lse, compact_lse, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_musa_compute_version_ge(3, 1)
 def test_v32_sparse_mla_decode_sched_meta_reuse_official_style():
     device = get_test_device()
     torch.manual_seed(20260507)

@@ -1,4 +1,6 @@
 # ruff: noqa
+from typing import Any
+
 import torch
 import tilelang
 from tilelang import language as T
@@ -9,9 +11,11 @@ from ...mate_runtime import resolve_num_mps
 from .sparse_mla_prefill_common import (
     SPARSE_PREFILL_COMPILE_FLAGS,
     SPARSE_PREFILL_PASS_CONFIGS,
-    optional_prefill_attn_sink,
-    require_token_lengths,
+    prepare_sparse_mla_strided_tensor,
+    validate_prefill_attn_sink,
+    validate_token_lengths,
 )
+from .sparse_mla_index_type import jit_for_tensor_addressing
 from ...execution_context import raise_complete_if_dry_run
 
 
@@ -22,7 +26,7 @@ def get_test_device() -> str:
 
 
 @tilelang.jit(
-    out_idx=[-3, -2, -1],
+    out_idx=[3, 4, 5],
     pass_configs=SPARSE_PREFILL_PASS_CONFIGS,
     verbose=True,
     compile_flags=SPARSE_PREFILL_COMPILE_FLAGS,
@@ -39,6 +43,7 @@ def sparse_attention_fwd_kernel(
     block_i=64,
     threads=640,
     has_attn_sink=False,
+    has_topk_length=False,
     is_persistence=True,
     persistent_blocks=None,
 ):
@@ -60,10 +65,14 @@ def sparse_attention_fwd_kernel(
 
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
+    q_stride_s = T.dynamic("q_stride_s")
+    q_stride_h = T.dynamic("q_stride_h")
+    kv_stride_s = T.dynamic("kv_stride_s")
+    kv_stride_g = T.dynamic("kv_stride_g")
+    indices_stride_s = T.dynamic("indices_stride_s")
+    indices_stride_g = T.dynamic("indices_stride_g")
 
     head_kv = num_heads // kv_group
-    # Keep the hot V3.2 path on the dense Tensor ABI; non-contiguous q/kv
-    # lowering is much slower than the temp perf kernel.
     q_shape = [seq_len, num_heads, dim + tail_dim]
     kv_shape = [seq_len_kv, kv_group, dim + tail_dim]
     o_shape = [seq_len, num_heads, dim]
@@ -75,8 +84,14 @@ def sparse_attention_fwd_kernel(
     accum_dtype = "float"
     dtype_bytes = 2
 
-    q_cosize = cosize(q_shape)
-    kv_cosize = cosize(kv_shape)
+    q_strides = (q_stride_s, q_stride_h, 1)
+    kv_strides = (kv_stride_s, kv_stride_g, 1)
+    indices_strides = (indices_stride_s, indices_stride_g, 1)
+    q_cosize = cosize(q_shape, q_strides)
+    kv_cosize = cosize(kv_shape, kv_strides)
+    q_type: Any = T.StridedTensor(q_shape, q_strides, dtype)
+    kv_type: Any = T.StridedTensor(kv_shape, kv_strides, dtype)
+    indices_type: Any = T.StridedTensor(indices_shape, indices_strides, indices_dtype)
 
     padded_head_kv = max(tilelang.math.next_power_of_2(head_kv), 64)
     if padded_head_kv != head_kv:
@@ -101,21 +116,27 @@ def sparse_attention_fwd_kernel(
         T.min(persistent_blocks, logical_blocks) if is_persistence else logical_blocks
     )
 
-    @T.prim_func
-    def dsa_prefill(
-        q: T.Tensor(q_shape, dtype),  # type: ignore
-        kv: T.Tensor(kv_shape, dtype),  # type: ignore
-        indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        topk_length: T.Tensor([seq_len], indices_dtype),  # type: ignore
-        attn_sink: T.Tensor([num_heads], accum_dtype),  # type: ignore
-        output: T.Tensor(o_shape, dtype),  # type: ignore
-        max_logits_out: T.Tensor(max_logits_shape, accum_dtype),  # type: ignore
-        lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
+    @T.macro
+    def dsa_prefill_body(
+        q,
+        kv,
+        indices,
+        topk_length,
+        attn_sink,
+        output,
+        max_logits_out,
+        lse,
     ):
         with T.Kernel(launch_blocks, kv_group, threads=threads) as (
             bx,
             by,
         ):
+            T.assume(q_stride_s % 8 == 0)
+            T.assume(q_stride_h % 8 == 0)
+            T.assume(kv_stride_s % 8 == 0)
+            T.assume(kv_stride_g % 8 == 0)
+            T.assume(indices_stride_s % 8 == 0)
+            T.assume(indices_stride_g % 8 == 0)
             q_shared_l = T.alloc_shared([heads_per_block, dim_qk // 2], dtype)
             q_shared_r = T.alloc_shared([heads_per_block, dim_qk // 2], dtype)
             kv_shared_l = T.alloc_shared([block_i, dim_qk // 2], dtype)
@@ -567,7 +588,10 @@ def sparse_attention_fwd_kernel(
                     # producer: 128 ldg_ty 16
                     ldg_tx = (tid - 512) % 8
                     ldg_ty = (tid - 512) // 8
-                    topk_len_local[0] = topk_length[s_i]
+                    if has_topk_length:
+                        topk_len_local[0] = topk_length[s_i]
+                    else:
+                        topk_len_local[0] = topk
                     for i_i in range(T.ceildiv(topk, block_i)):
                         # Load sparse indices for the next kv block.
                         for r in T.unroll(4):
@@ -705,6 +729,98 @@ def sparse_attention_fwd_kernel(
                 else:
                     logical_bx = logical_blocks
 
+    if has_topk_length and has_attn_sink:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: q_type,
+            kv: kv_type,
+            indices: indices_type,
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            topk_length: T.Tensor([seq_len], indices_dtype),
+            attn_sink: T.Tensor([num_heads], accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                topk_length,
+                attn_sink,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_topk_length:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: q_type,
+            kv: kv_type,
+            indices: indices_type,
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            topk_length: T.Tensor([seq_len], indices_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                topk_length,
+                None,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_attn_sink:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: q_type,
+            kv: kv_type,
+            indices: indices_type,
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            attn_sink: T.Tensor([num_heads], accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                None,
+                attn_sink,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    else:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: q_type,
+            kv: kv_type,
+            indices: indices_type,
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                None,
+                None,
+                output,
+                max_logits_out,
+                lse,
+            )
+
     return dsa_prefill
 
 
@@ -728,27 +844,37 @@ def tilelang_sparse_mla_prefill_fwd_interface(
     assert q.dtype == torch.bfloat16, "q must be bfloat16"
     assert kv.dtype == torch.bfloat16, "kv must be bfloat16"
     assert indices.dtype == torch.int32, "indices must be int32"
-    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
-    seq_len, heads, dim_plus_tail_dim = q.shape
-    seq_len_kv, kv_group, _ = kv.shape
+    q, q_shape = prepare_sparse_mla_strided_tensor("q", q, multiple=8)
+    kv, kv_shape = prepare_sparse_mla_strided_tensor("kv", kv, multiple=8)
+    indices, indices_shape = prepare_sparse_mla_strided_tensor(
+        "indices", indices, multiple=8
+    )
+    seq_len, heads, dim_plus_tail_dim = q_shape
+    seq_len_kv, kv_group, _ = kv_shape
 
     dim = d_v
 
-    assert kv.shape[-1] == dim_plus_tail_dim
+    assert kv_shape[-1] == dim_plus_tail_dim
     tail_dim = dim_plus_tail_dim - dim
-    _, _, topk = indices.shape
-    assert indices.shape == (seq_len, kv_group, topk)
+    _, _, topk = indices_shape
+    assert indices_shape == (seq_len, kv_group, topk)
     assert dim == 512, f"V3.2 kernel currently expects d_v=512, got {dim}"
     assert tail_dim == 64, f"V3.2 kernel currently expects tail_dim=64, got {tail_dim}"
-    topk_length = require_token_lengths(
-        topk_length, seq_len, topk, q.device, "topk_length"
-    )
+    topk_length = validate_token_lengths(topk_length, seq_len, "topk_length")
+    attn_sink = validate_prefill_attn_sink(attn_sink, heads)
     if is_persistence:
         persistent_blocks = resolve_num_mps(q.device, persistent_blocks)
     else:
         persistent_blocks = 0
 
-    kernel = sparse_attention_fwd_kernel(
+    # These inputs dominate the contiguous output and auxiliary tensor spans.
+    kernel_factory = jit_for_tensor_addressing(
+        sparse_attention_fwd_kernel,
+        q,
+        kv,
+        indices,
+    )
+    kernel = kernel_factory(
         heads,
         dim,
         tail_dim,
@@ -758,6 +884,7 @@ def tilelang_sparse_mla_prefill_fwd_interface(
         is_causal=is_casual,
         threads=threads,
         has_attn_sink=attn_sink is not None,
+        has_topk_length=topk_length is not None,
         is_persistence=is_persistence,
         persistent_blocks=persistent_blocks,
     )
@@ -765,8 +892,12 @@ def tilelang_sparse_mla_prefill_fwd_interface(
         kernel.show_source()
     raise_complete_if_dry_run()
 
-    attn_sink_arg, _ = optional_prefill_attn_sink(attn_sink, heads, q.device)
-    out = kernel(q, kv, indices, topk_length, attn_sink_arg)
+    args = [q, kv, indices]
+    if topk_length is not None:
+        args.append(topk_length)
+    if attn_sink is not None:
+        args.append(attn_sink)
+    out = kernel(*args)
     out_tensor, max_logits, lse_tensor = out
     if return_max_logits:
         return out_tensor, max_logits, lse_tensor

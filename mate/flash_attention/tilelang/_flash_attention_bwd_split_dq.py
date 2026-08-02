@@ -23,22 +23,22 @@ from ._flash_attention_bwd_common import (
 def flashattn_bwd_ws_split_dq(
     dim,
     is_causal,
+    has_window_left,
+    has_window_right,
+    has_softcap,
     is_varlen,
     is_bhsd=False,
     heads_q_eq_heads_kv=False,
+    has_seqused_q=False,
+    has_seqused_k=False,
     block_M=128,
     block_N=64,
-    smscale=None,
     dtype="bfloat16",
+    use_static_dims=False,
 ):
     if dim not in (128, 256):
         raise ValueError("flashattn_bwd_ws_split_dq only supports dim == 128 or 256")
 
-    if smscale is not None:
-        rln2_scale = smscale * 1.44269504
-    else:
-        smscale = 1.0 / (dim**0.5)
-        rln2_scale = smscale * 1.44269504
     producer_threads = 128
     consumer0_threads = 256
     consumer1_threads = 256
@@ -70,12 +70,33 @@ def flashattn_bwd_ws_split_dq(
     dq_stride_b = T.dynamic("dq_stride_b")
     dq_stride_s = T.dynamic("dq_stride_s")
     dq_stride_h = T.dynamic("dq_stride_h")
+    qk_dim = dim if use_static_dims else T.dynamic("qk_dim")
+    v_dim = dim if use_static_dims else T.dynamic("v_dim")
+    dq_dim = dim if use_static_dims else T.dynamic("dq_dim")
     q_shape = (
-        (total_seq_q, heads_q, dim) if is_varlen else (batch, seqlen_q, heads_q, dim)
+        (total_seq_q, heads_q, qk_dim)
+        if is_varlen
+        else (batch, seqlen_q, heads_q, qk_dim)
     )
-    dq_shape = q_shape
-    kv_shape = (
-        (total_seq_kv, heads_kv, dim) if is_varlen else (batch, seqlen_k, heads_kv, dim)
+    dq_shape = (
+        (total_seq_q, heads_q, dq_dim)
+        if is_varlen
+        else (batch, seqlen_q, heads_q, dq_dim)
+    )
+    k_shape = (
+        (total_seq_kv, heads_kv, qk_dim)
+        if is_varlen
+        else (batch, seqlen_k, heads_kv, qk_dim)
+    )
+    v_shape = (
+        (total_seq_kv, heads_kv, v_dim)
+        if is_varlen
+        else (batch, seqlen_k, heads_kv, v_dim)
+    )
+    do_shape = (
+        (total_seq_q, heads_q, v_dim)
+        if is_varlen
+        else (batch, seqlen_q, heads_q, v_dim)
     )
     q_strides = (
         (q_stride_s, q_stride_h, 1)
@@ -104,11 +125,11 @@ def flashattn_bwd_ws_split_dq(
     )
     q_type = T.StridedTensor(q_shape, q_strides, dtype)
     dq_type = T.StridedTensor(dq_shape, dq_strides, dtype)
-    k_type = T.StridedTensor(kv_shape, k_strides, dtype)
-    v_type = T.StridedTensor(kv_shape, v_strides, dtype)
-    do_type = T.StridedTensor(q_shape, do_strides, dtype)
+    k_type = T.StridedTensor(k_shape, k_strides, dtype)
+    v_type = T.StridedTensor(v_shape, v_strides, dtype)
+    do_type = T.StridedTensor(do_shape, do_strides, dtype)
     dtype_bytes = _tilelang_dtype_nbytes(dtype)
-    k_robust_bytes = cosize(kv_shape, k_strides) * dtype_bytes
+    k_robust_bytes = cosize(k_shape, k_strides) * dtype_bytes
 
     def q_block(tensor, batch_idx, q_start, begin_seq, head, dim_start):
         if is_varlen:
@@ -164,12 +185,19 @@ def flashattn_bwd_ws_split_dq(
         dO: do_type,  # type: ignore
         cu_seq_q: T.Tensor([batch + 1], T.int32),  # type: ignore
         cu_seq_kv: T.Tensor([batch + 1], T.int32),  # type: ignore
+        seqused_q: T.Tensor([batch], T.int32),  # type: ignore
+        seqused_k: T.Tensor([batch], T.int32),  # type: ignore
         Lse: T.Tensor(
             [heads_q, total_seq_q] if is_varlen else [batch, heads_q, seqlen_q],
             accum_dtype,
         ),  # type: ignore
         Delta: T.Tensor([total_seq_q, heads_q], accum_dtype),  # type: ignore
         max_seq_q: T.int32,  # type: ignore
+        window_size_left: T.int32,  # type: ignore
+        window_size_right: T.int32,  # type: ignore
+        softcap: T.float32,  # type: ignore
+        smscale: T.float32,  # type: ignore
+        rln2_scale: T.float32,  # type: ignore
     ):
         with T.Kernel(
             T.ceildiv(max_seq_q, block_M),
@@ -177,6 +205,12 @@ def flashattn_bwd_ws_split_dq(
             batch,
             threads=threads,
         ) as (bx, by, bz):
+            T.assume(qk_dim <= dim)
+            T.assume(v_dim <= dim)
+            T.assume(dq_dim <= dim)
+            T.assume(qk_dim % 8 == 0)
+            T.assume(v_dim % 8 == 0)
+            T.assume(dq_dim % 8 == 0)
             T.assume(q_stride_s % 8 == 0)
             T.assume(q_stride_h % 8 == 0)
             T.assume(k_stride_s % 8 == 0)
@@ -277,6 +311,10 @@ def flashattn_bwd_ws_split_dq(
                 end_seq_q = begin_seq_q + seqlen_q
                 begin_seq_kv = bz * seqlen_k
                 end_seq_kv = begin_seq_kv + seqlen_k
+            if has_seqused_q:
+                end_seq_q = begin_seq_q + seqused_q[bz]
+            if has_seqused_k:
+                end_seq_kv = begin_seq_kv + seqused_k[bz]
             block_q_start = begin_seq_q + bx * block_M
 
             local_seq_q = end_seq_q - begin_seq_q
@@ -418,6 +456,8 @@ def flashattn_bwd_ws_split_dq(
                 accs_accum = T.alloc_fragment([block_M, block_N], accum_dtype)
                 dp_accum = T.alloc_fragment([block_M, block_N], accum_dtype)
                 accum_s_next = T.alloc_fragment([block_M, block_N], accum_dtype)
+                if has_softcap:
+                    softcap_deriv = T.alloc_fragment([block_M, block_N], accum_dtype)
                 accs_cast = T.alloc_fragment([block_M, block_N], dtype)
                 lse_buffer = T.alloc_fragment([block_M], accum_dtype)
                 delta_buffer = T.alloc_fragment([block_M], accum_dtype)
@@ -426,6 +466,10 @@ def flashattn_bwd_ws_split_dq(
                         lse_elem(Lse, bz, block_q_start + i, begin_seq_q, by),
                         lse_buffer[i],
                         src_robust_desc=lse_robust_desc,
+                    )
+                for i in T.Parallel(block_M):
+                    lse_buffer[i] = T.if_then_else(
+                        T.isfinite(lse_buffer[i]), lse_buffer[i], 2**30
                     )
                 for i in T.Parallel(block_M):
                     T.copy(Delta[block_q_start + i, by], delta_buffer[i])
@@ -502,10 +546,74 @@ def flashattn_bwd_ws_split_dq(
                             accs_accum[i, j] = T.if_then_else(
                                 valid, accs_accum[i, j], -(2**30)
                             )
-                    for i, j in T.Parallel(block_M, block_N):
-                        accs_accum[i, j] = accs_accum[i, j] * rln2_scale - lse_buffer[i]
-                    for i, j in T.Parallel(block_M, block_N):
-                        accs_accum[i, j] = T.exp2(accs_accum[i, j])
+                    if has_window_left or has_window_right:
+                        for i, j in T.Parallel(block_M, block_N):
+                            q_idx = bx * block_M + i
+                            k_idx = kv_start - begin_seq_kv + j
+                            valid = (
+                                not has_window_left
+                                or k_idx >= q_idx + causal_offset - window_size_left
+                            ) and (
+                                not has_window_right
+                                or k_idx <= q_idx + causal_offset + window_size_right
+                            )
+                            accs_accum[i, j] = T.if_then_else(
+                                valid, accs_accum[i, j], -(2**30)
+                            )
+                    if has_softcap:
+                        for i, j in T.Parallel(block_M, block_N):
+                            softcap_tanh = T.tanh(accs_accum[i, j] * smscale / softcap)
+                            softcap_deriv[i, j] = 1.0 - softcap_tanh * softcap_tanh
+                            accs_accum[i, j] = softcap_tanh * softcap
+                        if (kv_start + block_N) > end_seq_kv:
+                            for i, j in T.Parallel(block_M, block_N):
+                                valid = kv_start + j < end_seq_kv
+                                accs_accum[i, j] = T.if_then_else(
+                                    valid, accs_accum[i, j], -(2**30)
+                                )
+                                softcap_deriv[i, j] = T.if_then_else(
+                                    valid, softcap_deriv[i, j], 0.0
+                                )
+                        if is_causal:
+                            for i, j in T.Parallel(block_M, block_N):
+                                q_idx = bx * block_M + i
+                                k_idx = kv_start - begin_seq_kv + j
+                                valid = q_idx + causal_offset >= k_idx
+                                accs_accum[i, j] = T.if_then_else(
+                                    valid, accs_accum[i, j], -(2**30)
+                                )
+                                softcap_deriv[i, j] = T.if_then_else(
+                                    valid, softcap_deriv[i, j], 0.0
+                                )
+                        if has_window_left or has_window_right:
+                            for i, j in T.Parallel(block_M, block_N):
+                                q_idx = bx * block_M + i
+                                k_idx = kv_start - begin_seq_kv + j
+                                valid = (
+                                    not has_window_left
+                                    or k_idx >= q_idx + causal_offset - window_size_left
+                                ) and (
+                                    not has_window_right
+                                    or k_idx
+                                    <= q_idx + causal_offset + window_size_right
+                                )
+                                accs_accum[i, j] = T.if_then_else(
+                                    valid, accs_accum[i, j], -(2**30)
+                                )
+                                softcap_deriv[i, j] = T.if_then_else(
+                                    valid, softcap_deriv[i, j], 0.0
+                                )
+                        for i, j in T.Parallel(block_M, block_N):
+                            accs_accum[i, j] = T.exp2(
+                                accs_accum[i, j] * log2e - lse_buffer[i]
+                            )
+                    else:
+                        for i, j in T.Parallel(block_M, block_N):
+                            accs_accum[i, j] = (
+                                accs_accum[i, j] * rln2_scale - lse_buffer[i]
+                            )
+                        for i, j in T.Parallel(block_M, block_N):
+                            accs_accum[i, j] = T.exp2(accs_accum[i, j])
                     T.wait_wgmma(0)
                     T.barrier_arrive(bar_kt0_free)
 
@@ -535,6 +643,18 @@ def flashattn_bwd_ws_split_dq(
                             k_idx = kv_start - begin_seq_kv + j
                             valid = q_idx + causal_offset >= k_idx
                             dp_accum[i, j] = T.if_then_else(valid, dp_accum[i, j], 0.0)
+                    if has_window_left or has_window_right:
+                        for i, j in T.Parallel(block_M, block_N):
+                            q_idx = bx * block_M + i
+                            k_idx = kv_start - begin_seq_kv + j
+                            valid = (
+                                not has_window_left
+                                or k_idx >= q_idx + causal_offset - window_size_left
+                            ) and (
+                                not has_window_right
+                                or k_idx <= q_idx + causal_offset + window_size_right
+                            )
+                            dp_accum[i, j] = T.if_then_else(valid, dp_accum[i, j], 0.0)
 
                     T.barrier_wait(bar_kt0_ready, phase_consumer0 ^ 1)
                     _annotate_sqmma(Kt_shared_0, k_major=True)
@@ -551,6 +671,9 @@ def flashattn_bwd_ws_split_dq(
                         dp_accum[i, j] = dp_accum[i, j] * smscale - delta_buffer[i]
                     for i, j in T.Parallel(block_M, block_N):
                         dp_accum[i, j] = dp_accum[i, j] * accs_accum[i, j]
+                    if has_softcap:
+                        for i, j in T.Parallel(block_M, block_N):
+                            dp_accum[i, j] = dp_accum[i, j] * softcap_deriv[i, j]
                     if (bx * block_M + block_M) >= local_seq_q:
                         for i, j in T.Parallel(block_M, block_N):
                             dp_accum[i, j] = T.if_then_else(
@@ -650,16 +773,23 @@ def flashattn_bwd_ws_split_dq(
                 T.copy(accum_dq1, dq_cast1)
                 for i, j in T.Parallel(block_M, dim // 2):
                     if bx * block_M + i < local_seq_q:
-                        T.copy(
-                            dq_cast0[i, j],
-                            dq_elem(dQ, bz, block_q_start + i, begin_seq_q, by, j),
-                        )
-                        T.copy(
-                            dq_cast1[i, j],
-                            dq_elem(
-                                dQ, bz, block_q_start + i, begin_seq_q, by, dim // 2 + j
-                            ),
-                        )
+                        if j < dq_dim:
+                            T.copy(
+                                dq_cast0[i, j],
+                                dq_elem(dQ, bz, block_q_start + i, begin_seq_q, by, j),
+                            )
+                        if dim // 2 + j < dq_dim:
+                            T.copy(
+                                dq_cast1[i, j],
+                                dq_elem(
+                                    dQ,
+                                    bz,
+                                    block_q_start + i,
+                                    begin_seq_q,
+                                    by,
+                                    dim // 2 + j,
+                                ),
+                            )
 
     return flashattn_bwd_ws_split_dq_kernel
 

@@ -22,7 +22,7 @@ from packaging.version import Version  # noqa: E402
 
 project = "MATE"
 copyright = "2020-2026, MooreThreads GPU Computing Team"
-author = "MooreThreads GPU Computing Team"
+author = "MATE Contributors"
 CURRENT_DOCS_RELEASE = (ROOT / "version.txt").read_text(encoding="utf-8").strip()
 
 

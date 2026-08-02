@@ -1,4 +1,6 @@
 # ruff: noqa
+from typing import Any
+
 import torch
 import tilelang
 from tilelang import language as T
@@ -16,7 +18,9 @@ from .sparse_mla_decode_scheduled_common import (
     make_scheduled_decode_online_softmax,
     make_scheduled_decode_stage_value_shared,
     prepare_scheduled_decode_runtime,
+    prepare_sparse_mla_decode_strided_tensor,
 )
+from .sparse_mla_index_type import jit_for_tensor_addressing
 from ...execution_context import raise_complete_if_dry_run
 
 
@@ -39,7 +43,9 @@ def sparse_attention_fwd_kernel(
     threads=640,
     max_nums_splits=32,
     has_attn_sink=False,
+    has_topk_length=False,
     support_split=True,
+    use_int64_cosize=False,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
@@ -59,6 +65,18 @@ def sparse_attention_fwd_kernel(
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
     num_mp_parts = T.dynamic("num_mp_parts")
+    q_stride_b = T.dynamic("q_stride_b")
+    q_stride_s = T.dynamic("q_stride_s")
+    q_stride_h = T.dynamic("q_stride_h")
+    kv_stride_s = T.dynamic("kv_stride_s")
+    kv_stride_g = T.dynamic("kv_stride_g")
+    k_pe_stride_s = T.dynamic("k_pe_stride_s")
+    k_pe_stride_g = T.dynamic("k_pe_stride_g")
+    quant_scales_stride_s = T.dynamic("quant_scales_stride_s")
+    quant_scales_stride_g = T.dynamic("quant_scales_stride_g")
+    indices_stride_b = T.dynamic("indices_stride_b")
+    indices_stride_s = T.dynamic("indices_stride_s")
+    indices_stride_g = T.dynamic("indices_stride_g")
 
     head_kv = num_heads // kv_group
     indices_dtype = "int32"
@@ -66,8 +84,37 @@ def sparse_attention_fwd_kernel(
     accum_dtype = "float"
     dtype_bytes = 2
     dim_bytes = 656
-    q_cosize = cosize([batch, seq_len, num_heads, dim + tail_dim])
-    kv_cosize = cosize([seq_len_kv, kv_group, dim_bytes])
+    q_shape = [batch, seq_len, num_heads, dim + tail_dim]
+    kv_shape = [seq_len_kv, kv_group, dim_bytes]
+    k_pe_shape = [seq_len_kv, kv_group, dim_bytes // 2]
+    quant_scales_shape = [seq_len_kv, kv_group, dim_bytes // 4]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    q_strides = (q_stride_b, q_stride_s, q_stride_h, 1)
+    kv_strides = (kv_stride_s, kv_stride_g, 1)
+    k_pe_strides = (k_pe_stride_s, k_pe_stride_g, 1)
+    quant_scales_strides = (
+        quant_scales_stride_s,
+        quant_scales_stride_g,
+        1,
+    )
+    indices_strides = (indices_stride_b, indices_stride_s, indices_stride_g, 1)
+    if use_int64_cosize:
+        q_cosize = cosize(
+            q_shape, tuple(tir.Cast("int64", stride) for stride in q_strides)
+        )
+        kv_cosize = cosize(
+            kv_shape, tuple(tir.Cast("int64", stride) for stride in kv_strides)
+        )
+    else:
+        q_cosize = cosize(q_shape, q_strides)
+        kv_cosize = cosize(kv_shape, kv_strides)
+    q_type: Any = T.StridedTensor(q_shape, q_strides, dtype)
+    kv_type: Any = T.StridedTensor(kv_shape, kv_strides, "float8_e4m3")
+    k_pe_type: Any = T.StridedTensor(k_pe_shape, k_pe_strides, dtype)
+    quant_scales_type: Any = T.StridedTensor(
+        quant_scales_shape, quant_scales_strides, T.float32
+    )
+    indices_type: Any = T.StridedTensor(indices_shape, indices_strides, indices_dtype)
     padded_head_kv = max(tilelang.math.next_power_of_2(head_kv), block_h)
     if padded_head_kv != head_kv:
         assert kv_group == 1
@@ -123,30 +170,38 @@ def sparse_attention_fwd_kernel(
         continuity=pv_mma_n,
     )
     load_indices = make_scheduled_decode_indices_loader(block_i=block_i)
-    glse_shape = [batch + num_mp_parts, seq_len, num_heads] if support_split else [1]
-    output_partial_shape = (
-        [batch + num_mp_parts, seq_len, num_heads, dim] if support_split else [1]
-    )
 
     @T.macro
     def dsa_decode_split(
-        q: T.Tensor([batch, seq_len, num_heads, dim + tail_dim], dtype),  # type: ignore
-        kv: T.Tensor([seq_len_kv, kv_group, dim_bytes], kv_latent_dtype),  # type: ignore
-        k_pe: T.Tensor([seq_len_kv, kv_group, dim_bytes // 2], dtype),  # type: ignore
-        quant_scales: T.Tensor([seq_len_kv, kv_group, dim_bytes // 4], T.float32),  # type: ignore
-        indices: T.Tensor([batch, seq_len, kv_group, topk], indices_dtype),  # type: ignore
-        topk_length: T.Tensor([batch], T.int32),  # type: ignore
-        attn_sink: T.Tensor([num_heads], T.float32),  # type: ignore
-        tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),  # type: ignore
-        num_splits: T.Tensor([batch + 1], T.int32),  # type: ignore
-        glse: T.Tensor(glse_shape, T.float32),  # type: ignore
-        output_partial: T.Tensor(output_partial_shape, accum_dtype),  # type: ignore
-        output: T.Tensor([batch, seq_len, num_heads, dim], dtype),  # type: ignore
-        lse: T.Tensor([batch, num_heads, seq_len], T.float32),  # type: ignore
+        q,
+        kv,
+        k_pe,
+        quant_scales,
+        indices,
+        topk_length,
+        attn_sink,
+        tile_scheduler_metadata,
+        num_splits,
+        glse,
+        output_partial,
+        output,
+        lse,
     ):
         with T.Kernel(
             seq_len * head_repeats, kv_group, num_mp_parts, threads=threads
         ) as (bx, by, bz):
+            T.assume(q_stride_b % 8 == 0)
+            T.assume(q_stride_s % 8 == 0)
+            T.assume(q_stride_h % 8 == 0)
+            T.assume(kv_stride_s % 8 == 0)
+            T.assume(kv_stride_g % 8 == 0)
+            T.assume(k_pe_stride_s % 8 == 0)
+            T.assume(k_pe_stride_g % 8 == 0)
+            T.assume(quant_scales_stride_s % 4 == 0)
+            T.assume(quant_scales_stride_g % 4 == 0)
+            T.assume(indices_stride_b % 8 == 0)
+            T.assume(indices_stride_s % 8 == 0)
+            T.assume(indices_stride_g % 8 == 0)
             kv_shared_l = T.alloc_shared([block_i, dim_qk // 2], dtype)
             kv_shared_r = T.alloc_shared([block_i, dim_qk // 2], dtype)
             q_shared_l = T.alloc_shared([heads_per_block, dim_qk // 2], dtype)
@@ -223,7 +278,12 @@ def sparse_attention_fwd_kernel(
                 end_block_idx = T.alloc_var(T.int32)
                 n_split_idx = T.alloc_var(T.int32)
                 dynamic_total_blocks = T.alloc_var(T.int32)
-                dynamic_total_blocks = T.max(T.ceildiv(topk_length[b_i], block_i), 1)
+                if has_topk_length:
+                    dynamic_total_blocks = T.max(
+                        T.ceildiv(topk_length[b_i], block_i), 1
+                    )
+                else:
+                    dynamic_total_blocks = T.max(T.ceildiv(topk, block_i), 1)
                 start_block_idx = T.if_then_else(
                     b_i == begin_idx, sched_begin_block_idx, 0
                 )
@@ -674,13 +734,17 @@ def sparse_attention_fwd_kernel(
                     ldg_scale_tx = (tid - 512) % 2
                     ldg_scale_ty = (tid - 512) // 2
                     for i_i in range(start_block_idx, end_block_idx):
+                        if has_topk_length:
+                            effective_topk = topk_length[b_i]
+                        else:
+                            effective_topk = topk
                         load_indices(
                             indices,
                             b_i,
                             s_i,
                             g_i,
                             i_i,
-                            topk_length[b_i],
+                            effective_topk,
                             seq_len_kv,
                             ldg_ty,
                             ldg_tx,
@@ -818,21 +882,21 @@ def sparse_attention_fwd_kernel(
         max_lse_init=-(2**30) * sm_scale,
     )
 
-    @T.prim_func
-    def dsa_decode(
-        q: T.Tensor([batch, seq_len, num_heads, dim + tail_dim], dtype),  # type: ignore
-        kv: T.Tensor([seq_len_kv, kv_group, dim_bytes], kv_latent_dtype),  # type: ignore
-        k_pe: T.Tensor([seq_len_kv, kv_group, dim_bytes // 2], dtype),  # type: ignore
-        quant_scales: T.Tensor([seq_len_kv, kv_group, dim_bytes // 4], T.float32),  # type: ignore
-        indices: T.Tensor([batch, seq_len, kv_group, topk], indices_dtype),  # type: ignore
-        topk_length: T.Tensor([batch], T.int32),  # type: ignore
-        attn_sink: T.Tensor([num_heads], T.float32),  # type: ignore
-        tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),  # type: ignore
-        num_splits: T.Tensor([batch + 1], T.int32),  # type: ignore
-        glse: T.Tensor(glse_shape, accum_dtype),  # type: ignore
-        output_partial: T.Tensor(output_partial_shape, accum_dtype),  # type: ignore
-        output: T.Tensor([batch, seq_len, num_heads, dim], dtype),  # type: ignore
-        lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),  # type: ignore
+    @T.macro
+    def run_decode(
+        q,
+        kv,
+        k_pe,
+        quant_scales,
+        indices,
+        topk_length,
+        attn_sink,
+        tile_scheduler_metadata,
+        num_splits,
+        glse,
+        output_partial,
+        output,
+        lse,
     ):
         dsa_decode_split(
             q,
@@ -851,6 +915,266 @@ def sparse_attention_fwd_kernel(
         )
         if support_split:
             dsa_combine(num_splits, glse, output_partial, attn_sink, output, lse)
+
+    if support_split:
+        glse_type = T.Tensor([batch + num_mp_parts, seq_len, num_heads], accum_dtype)
+        output_partial_type = T.Tensor(
+            [batch + num_mp_parts, seq_len, num_heads, dim], accum_dtype
+        )
+        if has_topk_length and has_attn_sink:
+
+            @T.prim_func
+            def dsa_decode(
+                q: q_type,
+                kv: kv_type,
+                k_pe: k_pe_type,
+                quant_scales: quant_scales_type,
+                indices: indices_type,
+                topk_length: T.Tensor([batch], T.int32),
+                attn_sink: T.Tensor([num_heads], T.float32),
+                tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),
+                num_splits: T.Tensor([batch + 1], T.int32),
+                glse: glse_type,
+                output_partial: output_partial_type,
+                output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
+                lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+            ):
+                run_decode(
+                    q,
+                    kv,
+                    k_pe,
+                    quant_scales,
+                    indices,
+                    topk_length,
+                    attn_sink,
+                    tile_scheduler_metadata,
+                    num_splits,
+                    glse,
+                    output_partial,
+                    output,
+                    lse,
+                )
+
+        elif has_topk_length:
+
+            @T.prim_func
+            def dsa_decode(
+                q: q_type,
+                kv: kv_type,
+                k_pe: k_pe_type,
+                quant_scales: quant_scales_type,
+                indices: indices_type,
+                topk_length: T.Tensor([batch], T.int32),
+                tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),
+                num_splits: T.Tensor([batch + 1], T.int32),
+                glse: glse_type,
+                output_partial: output_partial_type,
+                output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
+                lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+            ):
+                run_decode(
+                    q,
+                    kv,
+                    k_pe,
+                    quant_scales,
+                    indices,
+                    topk_length,
+                    None,
+                    tile_scheduler_metadata,
+                    num_splits,
+                    glse,
+                    output_partial,
+                    output,
+                    lse,
+                )
+
+        elif has_attn_sink:
+
+            @T.prim_func
+            def dsa_decode(
+                q: q_type,
+                kv: kv_type,
+                k_pe: k_pe_type,
+                quant_scales: quant_scales_type,
+                indices: indices_type,
+                attn_sink: T.Tensor([num_heads], T.float32),
+                tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),
+                num_splits: T.Tensor([batch + 1], T.int32),
+                glse: glse_type,
+                output_partial: output_partial_type,
+                output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
+                lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+            ):
+                run_decode(
+                    q,
+                    kv,
+                    k_pe,
+                    quant_scales,
+                    indices,
+                    None,
+                    attn_sink,
+                    tile_scheduler_metadata,
+                    num_splits,
+                    glse,
+                    output_partial,
+                    output,
+                    lse,
+                )
+
+        else:
+
+            @T.prim_func
+            def dsa_decode(
+                q: q_type,
+                kv: kv_type,
+                k_pe: k_pe_type,
+                quant_scales: quant_scales_type,
+                indices: indices_type,
+                tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),
+                num_splits: T.Tensor([batch + 1], T.int32),
+                glse: glse_type,
+                output_partial: output_partial_type,
+                output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
+                lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+            ):
+                run_decode(
+                    q,
+                    kv,
+                    k_pe,
+                    quant_scales,
+                    indices,
+                    None,
+                    None,
+                    tile_scheduler_metadata,
+                    num_splits,
+                    glse,
+                    output_partial,
+                    output,
+                    lse,
+                )
+    elif has_topk_length and has_attn_sink:
+
+        @T.prim_func
+        def dsa_decode(
+            q: q_type,
+            kv: kv_type,
+            k_pe: k_pe_type,
+            quant_scales: quant_scales_type,
+            indices: indices_type,
+            topk_length: T.Tensor([batch], T.int32),
+            attn_sink: T.Tensor([num_heads], T.float32),
+            tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),
+            num_splits: T.Tensor([batch + 1], T.int32),
+            output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
+            lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+        ):
+            run_decode(
+                q,
+                kv,
+                k_pe,
+                quant_scales,
+                indices,
+                topk_length,
+                attn_sink,
+                tile_scheduler_metadata,
+                num_splits,
+                None,
+                None,
+                output,
+                lse,
+            )
+
+    elif has_topk_length:
+
+        @T.prim_func
+        def dsa_decode(
+            q: q_type,
+            kv: kv_type,
+            k_pe: k_pe_type,
+            quant_scales: quant_scales_type,
+            indices: indices_type,
+            topk_length: T.Tensor([batch], T.int32),
+            tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),
+            num_splits: T.Tensor([batch + 1], T.int32),
+            output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
+            lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+        ):
+            run_decode(
+                q,
+                kv,
+                k_pe,
+                quant_scales,
+                indices,
+                topk_length,
+                None,
+                tile_scheduler_metadata,
+                num_splits,
+                None,
+                None,
+                output,
+                lse,
+            )
+
+    elif has_attn_sink:
+
+        @T.prim_func
+        def dsa_decode(
+            q: q_type,
+            kv: kv_type,
+            k_pe: k_pe_type,
+            quant_scales: quant_scales_type,
+            indices: indices_type,
+            attn_sink: T.Tensor([num_heads], T.float32),
+            tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),
+            num_splits: T.Tensor([batch + 1], T.int32),
+            output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
+            lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+        ):
+            run_decode(
+                q,
+                kv,
+                k_pe,
+                quant_scales,
+                indices,
+                None,
+                attn_sink,
+                tile_scheduler_metadata,
+                num_splits,
+                None,
+                None,
+                output,
+                lse,
+            )
+
+    else:
+
+        @T.prim_func
+        def dsa_decode(
+            q: q_type,
+            kv: kv_type,
+            k_pe: k_pe_type,
+            quant_scales: quant_scales_type,
+            indices: indices_type,
+            tile_scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),
+            num_splits: T.Tensor([batch + 1], T.int32),
+            output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
+            lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+        ):
+            run_decode(
+                q,
+                kv,
+                k_pe,
+                quant_scales,
+                indices,
+                None,
+                None,
+                tile_scheduler_metadata,
+                num_splits,
+                None,
+                None,
+                output,
+                lse,
+            )
 
     return dsa_decode
 
@@ -874,9 +1198,13 @@ def tilelang_flashmla_interface(
     assert q.dtype == torch.bfloat16, "q must be bfloat16"
     assert kv.dtype == torch.uint8, "kv must be uint8"
     assert indices.dtype == torch.int32, "indices must be int32"
-    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
-    b, seq_len, heads, dim_plus_tail_dim = q.shape
-    seq_len_kv, kv_group, _ = kv.shape
+    q, q_shape = prepare_sparse_mla_decode_strided_tensor("q", q, multiple=8)
+    kv, kv_shape = prepare_sparse_mla_decode_strided_tensor("kv", kv, multiple=16)
+    indices, indices_shape = prepare_sparse_mla_decode_strided_tensor(
+        "indices", indices, multiple=8
+    )
+    b, seq_len, heads, dim_plus_tail_dim = q_shape
+    seq_len_kv, kv_group, _ = kv_shape
     #  In FP8+sparse mode, each token's kv cache is 656 bytes, structured as:
     #         - The shape of the tensor `k_cache` is (num_blocks*page_block_size*num_heads_k, head_dim), and num_heads_k must be 1.
     #         - First 512 bytes: The "quantized NoPE" part, containing 512 float8_e4m3 values.
@@ -885,10 +1213,10 @@ def tilelang_flashmla_interface(
     # assert dim_plus_tail_dim == 576, "you should assign dim otherwise"
     dim = d_v
     dim_bytes = 656
-    assert kv.shape[-1] == dim_bytes
+    assert kv_shape[-1] == dim_bytes
     tail_dim = dim_plus_tail_dim - dim
-    _, _, _, topk = indices.shape
-    assert indices.shape == (b, seq_len, kv_group, topk)
+    _, _, _, topk = indices_shape
+    assert indices_shape == (b, seq_len, kv_group, topk)
     num_mp_parts = int(tile_scheduler_metadata.shape[0])
     support_split = num_mp_parts != 1
     runtime = prepare_scheduled_decode_runtime(
@@ -896,7 +1224,6 @@ def tilelang_flashmla_interface(
         seq_len=seq_len,
         heads=heads,
         dim=d_v,
-        topk=topk,
         topk_length=topk_length,
         attn_sink=attn_sink,
         tile_scheduler_metadata=tile_scheduler_metadata,
@@ -904,11 +1231,20 @@ def tilelang_flashmla_interface(
         out_dtype=q.dtype,
         device=q.device,
         variant_name="V3.2",
-        dummy_partials=not support_split,
+        support_split=support_split,
+    )
+    kv_latent_f8 = kv.view(torch.float8_e4m3fn)
+    k_rope = kv.view(torch.bfloat16)
+    scales = kv.view(torch.float32)
+    address_tensors = [q, kv, indices]
+    if runtime.out_partial is not None:
+        address_tensors.append(runtime.out_partial)
+    kernel_factory = jit_for_tensor_addressing(
+        sparse_attention_fwd_kernel, *address_tensors
     )
     # kernel = sparse_attention_fwd_kernel_v1(
     threads = 640
-    kernel = sparse_attention_fwd_kernel(
+    kernel = kernel_factory(
         heads,
         dim,
         tail_dim,
@@ -918,27 +1254,22 @@ def tilelang_flashmla_interface(
         threads=threads,
         max_nums_splits=runtime.max_nums_splits,
         has_attn_sink=runtime.has_attn_sink,
+        has_topk_length=runtime.topk_length is not None,
         support_split=support_split,
+        use_int64_cosize=kernel_factory is not sparse_attention_fwd_kernel,
     )
     if verbose:
         kernel.show_source()
     raise_complete_if_dry_run()
-    kv_latent_f8 = kv.view(torch.float8_e4m3fn)
-    k_rope = kv.view(torch.bfloat16)
-    scales = kv.view(torch.float32)
-    kernel(
-        q,
-        kv_latent_f8,
-        k_rope,
-        scales,
-        indices,
-        runtime.topk_length,
-        runtime.attn_sink,
-        tile_scheduler_metadata,
-        num_splits,
-        runtime.glse,
-        runtime.out_partial,
-        runtime.out,
-        runtime.lse,
-    )
+    args = [q, kv_latent_f8, k_rope, scales, indices]
+    if runtime.topk_length is not None:
+        args.append(runtime.topk_length)
+    if runtime.attn_sink is not None:
+        args.append(runtime.attn_sink)
+    args.extend((tile_scheduler_metadata, num_splits))
+    if support_split:
+        assert runtime.glse is not None and runtime.out_partial is not None
+        args.extend((runtime.glse, runtime.out_partial))
+    args.extend((runtime.out, runtime.lse))
+    kernel(*args)
     return runtime.out, runtime.lse

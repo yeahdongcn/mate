@@ -149,6 +149,24 @@ __device__ __forceinline__ int split_removal_cost(int num_n_blocks, int num_spli
                         : INT_MAX;
 }
 
+// Number of splits is not the more the better
+// fwd kernel gains more parallelism, but combine kernel will be much slower.
+// If a split has very few N blocks, the split is usually not worth it;
+// here we gradually reduce the number of splits until the shortest split is large enough.
+__device__ __forceinline__ int clamp_num_splits_for_min_n_blocks(int num_n_blocks,
+                                                                 int num_splits,
+                                                                 int min_n_blocks_per_split) {
+  if (num_n_blocks <= 0 || num_splits <= 1) return 1;
+  num_splits = max(min(num_splits, max(num_n_blocks / min_n_blocks_per_split, 1)), 1);
+  while (num_splits > 1) {
+    int const n_blocks_per_split = mutlass::ceil_div(num_n_blocks, num_splits);
+    int const tail_n_blocks      = num_n_blocks - (num_splits - 1) * n_blocks_per_split;
+    if (tail_n_blocks >= min_n_blocks_per_split) break;
+    --num_splits;
+  }
+  return num_splits;
+}
+
 namespace mate::attention::fmha {
 // Sort in descending order
 template <typename T>
@@ -341,6 +359,12 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
     // if (threadIdx.x == 0) printf("total_block=%d, blocks_per_mp=%d\n", total_blocks, blocks_per_mp);
     num_splits_dynamic = std::max(std::min(mutlass::ceil_div(num_n_blocks, blocks_per_mp), num_splits_static), 1);
 
+    if (num_m_blocks == 1 && num_batch * num_head <= 3) {
+      // Large number of splits is possible when total workload is small
+      // We decide each split should have at least 4 N blocks, otherwise the combine kernel will be too slow.
+      num_splits_dynamic = clamp_num_splits_for_min_n_blocks(num_n_blocks, num_splits_dynamic, 4);
+    }
+
     int valid_thread = (lane < kNumBatchPerWarp && batch_idx < num_batch) ? 1 : 0;
 
     // Start from the upstream-style base heuristic, then enforce the global
@@ -380,6 +404,10 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
 
       if (total_splits_smem == 0) break;
       overflow -= total_splits_smem;
+    }
+    if (num_m_blocks == 1 && num_batch * num_head <= 3) {
+      // ceil_div may produce low-workload splits, so check again.
+      num_splits_dynamic = clamp_num_splits_for_min_n_blocks(num_n_blocks, num_splits_dynamic, 4);
     }
     num_n_blocks = mutlass::ceil_div(num_n_blocks, num_splits_dynamic);
   }
@@ -422,13 +450,43 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
   }
 }
 
+inline bool is_valid_num_splits(int num_n_blocks, int num_splits, int min_n_blocks_per_split) {
+  if (min_n_blocks_per_split <= 0 || num_splits <= 1) return true;
+  // ceil_div may produce low-workload splits.
+  int const n_blocks_per_split = mutlass::ceil_div(num_n_blocks, num_splits);
+  int const tail_n_blocks      = num_n_blocks - (num_splits - 1) * n_blocks_per_split;
+  return tail_n_blocks >= min_n_blocks_per_split;
+}
+
+inline int get_min_n_blocks_per_split(int total_mblocks) {
+  // M blocks provide parallelism themselves
+  // The more M blocks, the coarser the N direction should be cut to avoid excessive combine workload.
+  // min value is ceil(4 * sqrt(M)); for M = 1, 2, 3, each split should have at least 4, 6, 7 N blocks respectively.
+  int const target = 16 * std::max(total_mblocks, 1);
+  int       result = 1;
+  while (result * result < target) ++result;
+  return result;
+}
+
+inline int get_combine_split_cap(int num_n_blocks, int tile_n, int max_splits) {
+  // combine templates are available for 16, 32, 64 splits
+  // once we cross a threshold, the fixed workload will increase immediately.
+  int cap = tile_n % 128 == 0 ? 32 : 16;
+  cap     = std::min(cap, max_splits);
+  while (cap < max_splits && static_cast<long long>(num_n_blocks) >= 4LL * cap * cap) {
+    cap = std::min(cap * 2, max_splits);
+  }
+  return cap;
+}
+
 inline int num_splits_heuristic(int  total_mblocks,
                                 int  num_mp,
                                 int  num_n_blocks,
                                 int  num_m_blocks,
                                 int  size_one_kv_head,
                                 bool is_causal_or_local,
-                                int  max_splits) {
+                                int  max_splits,
+                                int  min_n_blocks_per_split = 0) {
   constexpr float kMinWaveOccupancy = 0.8f;
   constexpr float kEfficiencySlack  = 0.85f;
 
@@ -462,6 +520,10 @@ inline int num_splits_heuristic(int  total_mblocks,
   std::vector<float> efficiency;
   efficiency.reserve(max_splits);
   for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+    if (!is_valid_num_splits(num_n_blocks, num_splits, min_n_blocks_per_split)) {
+      efficiency.push_back(0.f);
+      continue;
+    }
     float n_waves = float(total_mblocks * num_splits) / num_mp;
     float eff     = n_waves / ceil(n_waves);
     // printf("num_splits = %d, eff = %f\n", num_splits, eff);
@@ -472,7 +534,8 @@ inline int num_splits_heuristic(int  total_mblocks,
   }
   int chosen = 1;
   for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-    if (efficiency[num_splits - 1] >= kEfficiencySlack * max_efficiency) {
+    if (is_valid_num_splits(num_n_blocks, num_splits, min_n_blocks_per_split) &&
+        efficiency[num_splits - 1] >= kEfficiencySlack * max_efficiency) {
       chosen = num_splits;
       break;
     }
@@ -507,13 +570,25 @@ inline int get_num_splits(FmhaFwdParams const& params, int tile_m, int tile_n, b
     printf("size_one_kv_head: %d, total_mblocks: %d\n", size_one_kv_head, total_mblocks);
   }
 
+  int max_splits             = 128;
+  int min_n_blocks_per_split = 0;
+  if (num_m_blocks == 1 && total_mblocks <= 3) {
+    // Small workload case: when each request has only 1 M block, and the total is no more than 3
+    // the original rule tends to increase splits to fill the GPU.
+    min_n_blocks_per_split    = get_min_n_blocks_per_split(total_mblocks);
+    int const combine_cap     = get_combine_split_cap(num_n_blocks, tile_n, max_splits);
+    int const granularity_cap = std::max(num_n_blocks / min_n_blocks_per_split, 1);
+    max_splits                = std::min(combine_cap, granularity_cap);
+  }
+
   return num_splits_heuristic(total_mblocks,
                               params.num_mp,
                               num_n_blocks,
                               num_m_blocks,
                               size_one_kv_head,
                               params.is_causal || params.is_local,
-                              128);
+                              max_splits,
+                              min_n_blocks_per_split);
 }
 
 }  // namespace mate::attention::fmha

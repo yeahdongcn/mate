@@ -36,6 +36,7 @@ comprehensive logging, and environment inspection tools.
    FlashAttention Wrapper <wrappers/flash_attention_wrapper>
    SageAttention Wrapper <wrappers/sageattention_wrapper>
    FlashMLA Wrapper <wrappers/flash_mla_wrapper>
+   MSA Wrapper <wrappers/fmha_sm100_wrapper>
    FlashKDA Wrapper <wrappers/flash_kda_wrapper>
    DeepGEMM Wrapper <wrappers/deep_gemm_wrapper>
 

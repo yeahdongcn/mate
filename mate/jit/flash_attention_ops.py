@@ -33,11 +33,7 @@ INCLUDE_PATHS = [
 
 def gen_flash_attention_ops_spec() -> JitSpec:
     sources = [
-        jit_env.MATE_CSRC_DIR / "flash_atten_asm.mu",
         jit_env.MATE_CSRC_DIR / "flash_atten_bwd.mu",
-        *sorted(
-            (jit_env.MATE_CSRC_DIR / "mubin" / "mp31" / "flash_atten").glob("*.cpp")
-        ),
     ]
     return gen_jit_spec(
         "flash_attention_ops",

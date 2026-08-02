@@ -22,9 +22,10 @@ from ...utils import cosize
 from .sparse_mla_prefill_common import (
     SPARSE_PREFILL_COMPILE_FLAGS,
     SPARSE_PREFILL_PASS_CONFIGS,
-    optional_prefill_attn_sink,
-    require_token_lengths,
+    validate_prefill_attn_sink,
+    validate_token_lengths,
 )
+from .sparse_mla_index_type import jit_for_tensor_addressing
 from ...execution_context import raise_complete_if_dry_run
 
 
@@ -32,7 +33,7 @@ from ...execution_context import raise_complete_if_dry_run
 
 
 @tilelang.jit(
-    out_idx=[-3, -2, -1],
+    out_idx=[3, 4, 5],
     pass_configs=SPARSE_PREFILL_PASS_CONFIGS,
     compile_flags=SPARSE_PREFILL_COMPILE_FLAGS,
 )
@@ -98,17 +99,17 @@ def sparse_attention_fwd_kernel_model1_pack(
     heads_per_block = padded_head_kv if head_repeats == 1 else 64
     has_dynamic_lengths = has_topk_length
 
-    @T.prim_func
-    def dsa_prefill(
-        q: T.Tensor(q_shape, dtype),
-        kv: T.Tensor(kv_shape, dtype),
-        indices: T.Tensor(indices_shape, indices_dtype),
-        topk_length: T.Tensor([seq_len], indices_dtype),
-        row_masks: T.Tensor(row_masks_shape, indices_dtype),
-        attn_sink: T.Tensor([num_heads], accum_dtype),
-        output: T.Tensor(o_shape, dtype),
-        max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
-        lse: T.Tensor(lse_shape, accum_dtype),
+    @T.macro
+    def dsa_prefill_body(
+        q,
+        kv,
+        indices,
+        topk_length,
+        row_masks,
+        attn_sink,
+        output,
+        max_logits_out,
+        lse,
     ):
         with T.Kernel(seq_len * head_repeats, kv_group, threads=threads) as (bx, by):
             q_shared_l = T.alloc_shared([heads_per_block, dim_qk // 2], dtype)
@@ -718,6 +719,202 @@ def sparse_attention_fwd_kernel_model1_pack(
                         T.ptx_wait_group(0)
                         T.barrier_arrive(bar_kv1_ready)
 
+    if has_topk_length and has_row_mask and has_attn_sink:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: T.Tensor(q_shape, dtype),
+            kv: T.Tensor(kv_shape, dtype),
+            indices: T.Tensor(indices_shape, indices_dtype),
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            topk_length: T.Tensor([seq_len], indices_dtype),
+            row_masks: T.Tensor(row_masks_shape, indices_dtype),
+            attn_sink: T.Tensor([num_heads], accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                topk_length,
+                row_masks,
+                attn_sink,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_topk_length and has_row_mask:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: T.Tensor(q_shape, dtype),
+            kv: T.Tensor(kv_shape, dtype),
+            indices: T.Tensor(indices_shape, indices_dtype),
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            topk_length: T.Tensor([seq_len], indices_dtype),
+            row_masks: T.Tensor(row_masks_shape, indices_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                topk_length,
+                row_masks,
+                None,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_topk_length and has_attn_sink:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: T.Tensor(q_shape, dtype),
+            kv: T.Tensor(kv_shape, dtype),
+            indices: T.Tensor(indices_shape, indices_dtype),
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            topk_length: T.Tensor([seq_len], indices_dtype),
+            attn_sink: T.Tensor([num_heads], accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                topk_length,
+                None,
+                attn_sink,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_topk_length:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: T.Tensor(q_shape, dtype),
+            kv: T.Tensor(kv_shape, dtype),
+            indices: T.Tensor(indices_shape, indices_dtype),
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            topk_length: T.Tensor([seq_len], indices_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                topk_length,
+                None,
+                None,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_row_mask and has_attn_sink:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: T.Tensor(q_shape, dtype),
+            kv: T.Tensor(kv_shape, dtype),
+            indices: T.Tensor(indices_shape, indices_dtype),
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            row_masks: T.Tensor(row_masks_shape, indices_dtype),
+            attn_sink: T.Tensor([num_heads], accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                None,
+                row_masks,
+                attn_sink,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_row_mask:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: T.Tensor(q_shape, dtype),
+            kv: T.Tensor(kv_shape, dtype),
+            indices: T.Tensor(indices_shape, indices_dtype),
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            row_masks: T.Tensor(row_masks_shape, indices_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                None,
+                row_masks,
+                None,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_attn_sink:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: T.Tensor(q_shape, dtype),
+            kv: T.Tensor(kv_shape, dtype),
+            indices: T.Tensor(indices_shape, indices_dtype),
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            attn_sink: T.Tensor([num_heads], accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                None,
+                None,
+                attn_sink,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    else:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: T.Tensor(q_shape, dtype),
+            kv: T.Tensor(kv_shape, dtype),
+            indices: T.Tensor(indices_shape, indices_dtype),
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                None,
+                None,
+                None,
+                output,
+                max_logits_out,
+                lse,
+            )
+
     return dsa_prefill
 
 
@@ -846,50 +1043,45 @@ def sparse_mla_fwd_interface_model1_pack(
         if row_masks is not None:
             assert row_masks.dtype == torch.int32 and row_masks.is_contiguous()
             assert row_masks.shape == indices.shape
-        if topk_length is None:
-            topk_length = torch.full(
-                (packed_seq,), topk, dtype=torch.int32, device=device
-            )
-        else:
-            assert topk_length.dtype == torch.int32 and topk_length.shape == (
-                packed_seq,
-            )
-            topk_length = topk_length.contiguous()
+
+    topk_length = validate_token_lengths(topk_length, packed_seq, "topk_length")
+    attn_sink = validate_prefill_attn_sink(attn_sink, heads)
+    attn_sink_pack = (
+        attn_sink.repeat(pack_s).contiguous() if attn_sink is not None else None
+    )
 
     kernel_kwargs = {
         "kv_group": kv_group,
         "sm_scale": sm_scale,
         "is_causal": True,
         "threads": threads,
-        "has_attn_sink": attn_sink is not None,
-        "has_topk_length": True,
+        "has_attn_sink": attn_sink_pack is not None,
+        "has_topk_length": topk_length is not None,
         "has_row_mask": row_masks is not None,
         "causal_window": causal_window,
         "compressed_kv_len": compressed_kv_len,
         "compress_ratio": compress_ratio,
     }
-    kernel = sparse_attention_fwd_kernel_model1_pack(
-        packed_heads, dim, topk, pack_s, **kernel_kwargs
+    # These inputs dominate the contiguous output and auxiliary tensor spans.
+    kernel_factory = jit_for_tensor_addressing(
+        sparse_attention_fwd_kernel_model1_pack,
+        q_pack,
+        kv,
+        indices,
     )
+    kernel = kernel_factory(packed_heads, dim, topk, pack_s, **kernel_kwargs)
     if verbose:
         kernel.show_source()
     raise_complete_if_dry_run()
 
-    attn_sink_pack = torch.empty((packed_heads,), dtype=torch.float32, device=device)
-    if attn_sink is None:
-        attn_sink_pack.zero_()
-    else:
-        attn_sink_pack.copy_(attn_sink.repeat(pack_s))
-    if row_masks is None:
-        row_masks = torch.empty((packed_seq, 1, topk), dtype=torch.int32, device=device)
-    out = kernel(
-        q_pack,
-        kv,
-        indices,
-        topk_length,
-        row_masks,
-        attn_sink_pack,
-    )
+    args = [q_pack, kv, indices]
+    if topk_length is not None:
+        args.append(topk_length)
+    if row_masks is not None:
+        args.append(row_masks)
+    if attn_sink_pack is not None:
+        args.append(attn_sink_pack)
+    out = kernel(*args)
     out_tensor, max_logits, lse_tensor = out
     out_tensor = out_tensor.view(seq_len, heads, dim)
     lse_tensor = lse_tensor.view(seq_len, heads)

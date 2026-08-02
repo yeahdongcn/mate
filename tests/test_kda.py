@@ -7,14 +7,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-
 CHUNK_SIZE = 32
 HEAD_SIZE = 128
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get("MATE_MUSA_ARCH_LIST") is None,
-    reason="Set MATE_MUSA_ARCH_LIST=3.1 to run JIT-backed KDA tests.",
-)
 
 
 def exclusive_cumsum(seq_lens: list[int]) -> list[int]:
@@ -53,6 +47,7 @@ def _assert_close(
     value_dtype: torch.dtype,
     state_dtype: torch.dtype,
     is_output: bool,
+    min_cosine: float | None = None,
 ) -> None:
     dtype = value_dtype if is_output else state_dtype
     if dtype == torch.bfloat16:
@@ -61,9 +56,25 @@ def _assert_close(
     else:
         rtol = 1.5e-2
         atol = 1.25e-2 if is_output else 6e-2
+    actual_f = actual.detach().float().cpu()
+    expected_f = expected.detach().float().cpu()
+    diff = (actual_f - expected_f).abs()
+    threshold = atol + rtol * expected_f.abs()
+    bad = int((diff > threshold).sum().item())
+    max_abs = float(diff.max().item())
+    max_rel = float((diff / expected_f.abs().clamp_min(1.0e-12)).max().item())
+    cosine = float(
+        F.cosine_similarity(actual_f.reshape(1, -1), expected_f.reshape(1, -1)).item()
+    )
+    print(
+        f"{'output' if is_output else 'state'}: "
+        f"max_abs={max_abs:.6g} max_rel={max_rel:.6g} bad={bad}/{diff.numel()} cosine={cosine:.9f}"
+    )
+    if min_cosine is not None:
+        assert cosine >= min_cosine, f"cosine {cosine:.9f} is below {min_cosine:.9f}"
     torch.testing.assert_close(
-        actual.detach().float().cpu(),
-        expected.detach().float().cpu(),
+        actual_f,
+        expected_f,
         rtol=rtol,
         atol=atol,
     )
@@ -458,6 +469,8 @@ def _test_kda_kernel(
     seed: int,
     lower_bound: float,
     use_qk_l2norm_in_kernel: bool,
+    zero_v: bool = False,
+    min_output_cosine: float | None = None,
 ) -> None:
     device = _get_runtime_device()
     _manual_seed(seed, device)
@@ -473,6 +486,9 @@ def _test_kda_kernel(
         device,
         normalize_qk=not use_qk_l2norm_in_kernel,
     )
+    if zero_v:
+        v.zero_()
+        v_ref.zero_()
     A_log, dt_bias = gen_gate_params(num_v_heads, device)
     initial_state = gen_initial_state(
         len(seq_lens),
@@ -542,7 +558,12 @@ def _test_kda_kernel(
     )
 
     _assert_close(
-        actual_o, expected_o, value_dtype=dtype, state_dtype=state_dtype, is_output=True
+        actual_o,
+        expected_o,
+        value_dtype=dtype,
+        state_dtype=state_dtype,
+        is_output=True,
+        min_cosine=min_output_cosine,
     )
     _assert_close(
         actual_state,
@@ -803,6 +824,40 @@ def test_kda_fused_varlen_int32_cu_seqlens_matches_reference() -> None:
         varlen=True,
         cu_seqlens_dtype=torch.int32,
         seed=_resolve_seed(105),
+        lower_bound=-5.0,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+
+def test_kda_fused_single_chunk_zero_v_with_initial_state_matches_reference() -> None:
+    _test_kda_kernel(
+        dtype_name="bfloat16",
+        seq_lens=[32],
+        num_qk_heads=1,
+        num_v_heads=1,
+        use_initial_state=True,
+        state_dtype_name="float32",
+        varlen=False,
+        cu_seqlens_dtype=torch.int64,
+        seed=_resolve_seed(107),
+        lower_bound=-5.0,
+        use_qk_l2norm_in_kernel=True,
+        zero_v=True,
+        min_output_cosine=0.999,
+    )
+
+
+def test_kda_fused_varlen_single_sequence_four_chunks_matches_reference() -> None:
+    _test_kda_kernel(
+        dtype_name="bfloat16",
+        seq_lens=[128],
+        num_qk_heads=2,
+        num_v_heads=2,
+        use_initial_state=True,
+        state_dtype_name="float32",
+        varlen=True,
+        cu_seqlens_dtype=torch.int32,
+        seed=_resolve_seed(106),
         lower_bound=-5.0,
         use_qk_l2norm_in_kernel=True,
     )

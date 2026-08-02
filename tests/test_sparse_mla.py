@@ -777,6 +777,67 @@ MODEL1_PREFILL_SELF_COMPARE_STRESS_CASES = [
 ]
 
 
+@pytest.mark.parametrize(
+    "seq_len,num_heads,have_topk_length,expected_persistence",
+    [
+        (65535, 64, True, True),
+        (65536, 64, True, False),
+        (70000, 64, False, True),
+        (70000, 128, True, True),
+    ],
+)
+def test_model1_sparse_prefill_persistence_selector(
+    seq_len,
+    num_heads,
+    have_topk_length,
+    expected_persistence,
+):
+    from mate.sparse_mla.tilelang import sparse_mla_prefill
+
+    topk_length = (
+        torch.empty((seq_len,), dtype=torch.int32, device="meta")
+        if have_topk_length
+        else None
+    )
+
+    assert (
+        sparse_mla_prefill._use_model1_persistence(
+            seq_len,
+            num_heads,
+            topk_length,
+        )
+        is expected_persistence
+    )
+
+
+def test_v32_sparse_prefill_dispatch_ignores_model1_persistence_selector(monkeypatch):
+    from mate.sparse_mla.tilelang import sparse_mla_prefill
+
+    calls = []
+
+    def fake_v32(*args, **kwargs):
+        calls.append((args, kwargs))
+        return object(), object(), object()
+
+    monkeypatch.setattr(sparse_mla_prefill, "_prefill_v32", fake_v32)
+    seq_len = 70000
+    q = torch.empty((seq_len, 64, 576), dtype=torch.bfloat16, device="meta")
+    kv = torch.empty((256, 1, 576), dtype=torch.bfloat16, device="meta")
+    indices = torch.empty((seq_len, 1, 256), dtype=torch.int32, device="meta")
+    topk_length = torch.empty((seq_len,), dtype=torch.int32, device="meta")
+
+    sparse_mla_prefill.sparse_mla_prefill_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=576**-0.5,
+        topk_length=topk_length,
+    )
+
+    assert len(calls) == 1
+    assert "is_persistence" not in calls[0][1]
+
+
 MODEL1_DECODE_CASES = [
     # (tag, B, S, SKV, topk, SKV_EXTRA, extra_topk, H, topk_len, extra_topk_len, sink)
     ("basic", 128, 1, 8192, 2048, 0, 0, 128, False, False, False),
@@ -1446,3 +1507,270 @@ def test_model1_sparse_mla_decode_heads64_default():
 @maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 def test_model1_sparse_mla_decode_heads16_auto_bm16():
     _check_model1_sparse_mla_decode_auto_heads(16)
+
+
+def _padded_last_dim_view(tensor: torch.Tensor, padding: int) -> torch.Tensor:
+    storage = torch.empty(
+        (*tensor.shape[:-1], tensor.shape[-1] + padding),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    result = storage[..., : tensor.shape[-1]]
+    result.copy_(tensor)
+    assert not result.is_contiguous()
+    return result
+
+
+def test_sparse_mla_factories_keep_strides_runtime():
+    from mate.sparse_mla.tilelang.sparse_mla_model1_decode_fwd_scheduled import (
+        sparse_attention_decode_fwd_scheduled_kernel_model1,
+    )
+    from mate.sparse_mla.tilelang.sparse_mla_model1_fwd_pipelined import (
+        sparse_attention_fwd_kernel_model1,
+    )
+    from mate.sparse_mla.tilelang.sparse_mla_v32_decode_fwd_scheduled import (
+        sparse_attention_fwd_kernel as sparse_attention_v32_decode_kernel,
+    )
+    from mate.sparse_mla.tilelang.sparse_mla_v32_fwd_pipelined import (
+        sparse_attention_fwd_kernel as sparse_attention_v32_prefill_kernel,
+    )
+
+    factories = (
+        sparse_attention_fwd_kernel_model1,
+        sparse_attention_v32_prefill_kernel,
+        sparse_attention_decode_fwd_scheduled_kernel_model1,
+        sparse_attention_v32_decode_kernel,
+    )
+    for factory in factories:
+        factory_args = set(factory.func.arg_names)
+        assert not [name for name in factory_args if "stride" in name]
+        assert not {"page_block_bytes", "extra_page_block_bytes"} & factory_args
+
+
+def test_sparse_mla_index_promotion_follows_tensor_byte_span():
+    import tilelang
+
+    from mate.sparse_mla.tilelang.sparse_mla_index_type import (
+        INT32_ADDRESS_SPACE_BYTES,
+        jit_for_tensor_addressing,
+        needs_index_type_promotion,
+        tensor_byte_span,
+    )
+    from mate.sparse_mla.tilelang.sparse_mla_v32_fwd_pipelined import (
+        sparse_attention_fwd_kernel,
+    )
+
+    small = torch.empty_strided((2, 8), (16, 1), dtype=torch.uint8, device="meta")
+    at_limit = torch.empty_strided(
+        (2, 1),
+        (INT32_ADDRESS_SPACE_BYTES - 1, 1),
+        dtype=torch.uint8,
+        device="meta",
+    )
+    over_limit = torch.empty_strided(
+        (2, 1),
+        (INT32_ADDRESS_SPACE_BYTES, 1),
+        dtype=torch.uint8,
+        device="meta",
+    )
+    small_view_of_large_storage = torch.empty(
+        (INT32_ADDRESS_SPACE_BYTES + 1,), dtype=torch.uint8, device="meta"
+    )[:1]
+
+    assert tensor_byte_span(at_limit) == INT32_ADDRESS_SPACE_BYTES
+    assert not needs_index_type_promotion(small, at_limit)
+    assert tensor_byte_span(over_limit) == INT32_ADDRESS_SPACE_BYTES + 1
+    assert needs_index_type_promotion(small, over_limit)
+    assert not needs_index_type_promotion(small_view_of_large_storage)
+
+    base = jit_for_tensor_addressing(sparse_attention_fwd_kernel, small)
+    promoted = jit_for_tensor_addressing(sparse_attention_fwd_kernel, over_limit)
+    assert base is sparse_attention_fwd_kernel
+    assert promoted is jit_for_tensor_addressing(
+        sparse_attention_fwd_kernel, over_limit
+    )
+    config_key = tilelang.PassConfigKey.TL_DISABLE_INDEX_TYPE_PROMOTION
+    assert base.pass_configs[config_key] is True
+    assert promoted.pass_configs[config_key] is False
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("head_dim", [512, 576], ids=["model1", "v32"])
+def test_sparse_mla_prefill_strided_inputs(head_dim):
+    torch.random.manual_seed(0)
+    device = get_test_device()
+    seq_len = 4
+    seq_len_kv = 128
+    heads = 64
+    topk = 64
+    sm_scale = head_dim**-0.5
+    q = torch.randn((seq_len, heads, head_dim), dtype=torch.bfloat16, device=device)
+    kv = torch.randn((seq_len_kv, 1, head_dim), dtype=torch.bfloat16, device=device)
+    indices = torch.full((seq_len, 1, topk), -1, dtype=torch.int32, device=device)
+    for token_idx in range(seq_len):
+        valid = torch.randperm(token_idx + 1, device=device)
+        indices[token_idx, 0, : valid.numel()] = valid
+
+    compact = mate.flashmla.flash_mla_sparse_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=512,
+    )
+    for padding in (8, 16):
+        strided = mate.flashmla.flash_mla_sparse_fwd(
+            q=_padded_last_dim_view(q, padding),
+            kv=_padded_last_dim_view(kv, padding),
+            indices=_padded_last_dim_view(indices, padding),
+            sm_scale=sm_scale,
+            d_v=512,
+        )
+
+        for compact_tensor, strided_tensor in zip(compact, strided):
+            torch.testing.assert_close(
+                strided_tensor, compact_tensor, rtol=1e-2, atol=1e-2
+            )
+
+
+def _sparse_decode_metadata(q: torch.Tensor, topk: int):
+    batch, seq_len, heads, _ = q.shape
+    return mate.flashmla.get_mla_metadata(
+        cache_seqlens=None,
+        num_q_tokens_per_head_k=seq_len * heads,
+        num_heads_k=1,
+        num_heads_q=heads,
+        topk=topk,
+        is_fp8_kvcache=True,
+        q=q,
+        bs=batch,
+    )
+
+
+@supported_musa_compute_capability([31])
+def test_v32_sparse_mla_decode_strided_inputs():
+    from mate.sparse_mla.tilelang.sparse_mla_v32_decode_fwd_scheduled import (
+        tilelang_flashmla_interface,
+    )
+
+    torch.random.manual_seed(0)
+    device = get_test_device()
+    batch = 2
+    seq_len = 1
+    seq_len_kv = 128
+    heads = 64
+    topk = 64
+    page_size = 64
+    q = torch.randn((batch, seq_len, heads, 576), dtype=torch.bfloat16, device=device)
+    kv = torch.randn(
+        (seq_len_kv // page_size, page_size, 1, 576),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    indices = torch.randint(
+        0,
+        seq_len_kv,
+        (batch, seq_len, 1, topk),
+        dtype=torch.int32,
+        device=device,
+    )
+    cache = (
+        quantize_k_cache(kv, FP8KVCacheLayout.V32_FP8Sparse)
+        .contiguous()
+        .view(torch.uint8)
+        .view(seq_len_kv, 1, 656)
+    )
+    metadata, num_splits = _sparse_decode_metadata(q, topk)
+    kwargs = {
+        "tile_scheduler_metadata": metadata,
+        "num_splits": num_splits,
+        "sm_scale": 576**-0.5,
+        "d_v": 512,
+    }
+    compact = tilelang_flashmla_interface(q, cache, indices, **kwargs)
+    for q_padding, cache_padding, indices_padding in ((8, 16, 8), (16, 32, 16)):
+        strided = tilelang_flashmla_interface(
+            _padded_last_dim_view(q, q_padding),
+            _padded_last_dim_view(cache, cache_padding),
+            _padded_last_dim_view(indices, indices_padding),
+            **kwargs,
+        )
+
+        for compact_tensor, strided_tensor in zip(compact, strided):
+            torch.testing.assert_close(
+                strided_tensor, compact_tensor, rtol=1e-2, atol=1e-2
+            )
+
+
+@supported_musa_compute_capability([31])
+def test_model1_sparse_mla_decode_strided_inputs():
+    from mate.sparse_mla.tilelang.sparse_mla_model1_decode_fwd_scheduled import (
+        sparse_mla_decode_fwd_scheduled_interface_model1,
+    )
+
+    torch.random.manual_seed(0)
+    device = get_test_device()
+    batch = 2
+    seq_len = 1
+    page_size = 69
+    seq_len_kv = page_size * 2
+    heads = 64
+    topk = 64
+    num_pages = seq_len_kv // page_size
+    q = torch.randn((batch, seq_len, heads, 512), dtype=torch.bfloat16, device=device)
+    kv = torch.randn(
+        (num_pages, page_size, 1, 512), dtype=torch.bfloat16, device=device
+    )
+    indices = torch.randint(
+        0,
+        seq_len_kv,
+        (batch, seq_len, 1, topk),
+        dtype=torch.int32,
+        device=device,
+    )
+    cache = quantize_k_cache(kv, FP8KVCacheLayout.MODEL1_FP8Sparse).view(torch.uint8)
+    logical_page_bytes = page_size * 584
+    page_stride_bytes = cache.stride(0)
+    cache_bytes = torch.as_strided(
+        cache,
+        (num_pages, logical_page_bytes),
+        (page_stride_bytes, 1),
+    )
+    compact_bytes = cache_bytes.contiguous()
+
+    def cache_views(cache_rows):
+        return (
+            cache_rows.view(torch.float8_e4m3fn),
+            cache_rows.view(torch.bfloat16),
+            cache_rows,
+        )
+
+    compact_cache = cache_views(compact_bytes)
+    metadata, num_splits = _sparse_decode_metadata(q, topk)
+    kwargs = {
+        "tile_scheduler_metadata": metadata,
+        "num_splits": num_splits,
+        "sm_scale": 512**-0.5,
+        "d_v": 512,
+        "page_block_size": page_size,
+    }
+    compact = sparse_mla_decode_fwd_scheduled_interface_model1(
+        q, *compact_cache, indices, **kwargs
+    )
+    assert compact_bytes.stride(0) % 16 == 8
+    strided_rows = (
+        _padded_last_dim_view(compact_bytes, 8),
+        _padded_last_dim_view(compact_bytes, 16),
+    )
+    for padding, cache_rows in zip((8, 16), strided_rows):
+        strided = sparse_mla_decode_fwd_scheduled_interface_model1(
+            _padded_last_dim_view(q, padding),
+            *cache_views(cache_rows),
+            _padded_last_dim_view(indices, padding),
+            **kwargs,
+        )
+
+        for compact_tensor, strided_tensor in zip(compact, strided):
+            torch.testing.assert_close(
+                strided_tensor, compact_tensor, rtol=1e-2, atol=1e-2
+            )

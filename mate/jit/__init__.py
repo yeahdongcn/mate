@@ -77,12 +77,12 @@ from .mega_moe import (
     get_fp8_fp8_mega_moe_stage2_module as get_fp8_fp8_mega_moe_stage2_module,
     get_mega_moe_runtime_utils_module as get_mega_moe_runtime_utils_module,
 )
+from .msa_ops import gen_msa_ops_aot as gen_msa_ops_aot
+from .msa_ops import gen_msa_ops_spec as gen_msa_ops_spec
+from .msa_ops import get_msa_ops_module as get_msa_ops_module
 from .moe_fused_gate import gen_moe_fused_gate_aot as gen_moe_fused_gate_aot
 from .moe_fused_gate import gen_moe_fused_gate_spec as gen_moe_fused_gate_spec
 from .moe_fused_gate import get_moe_fused_gate_module as get_moe_fused_gate_module
-from .sage_attention import gen_sage_attention_aot as gen_sage_attention_aot
-from .sage_attention import gen_sage_attention_spec as gen_sage_attention_spec
-from .sage_attention import get_sage_attention_module as get_sage_attention_module
 
 __all__ = [
     "env",
@@ -130,14 +130,14 @@ __all__ = [
     "get_fp8_fp8_mega_moe_stage1_module",
     "get_fp8_fp8_mega_moe_stage2_module",
     "get_mega_moe_runtime_utils_module",
+    "gen_msa_ops_aot",
+    "gen_msa_ops_spec",
+    "get_msa_ops_module",
     "gen_jit_spec",
     "jit_spec_registry",
     "gen_moe_fused_gate_aot",
     "gen_moe_fused_gate_spec",
     "get_moe_fused_gate_module",
-    "gen_sage_attention_aot",
-    "gen_sage_attention_spec",
-    "get_sage_attention_module",
     "prewarm_modules",
     "temporary_max_jobs",
 ]
@@ -162,6 +162,7 @@ def prewarm_modules(
     include_paged_mqa_logits: bool = False,
     include_kda: bool = False,
     include_mla: bool = False,
+    include_msa: bool = False,
     include_moe_fused_gate: bool = False,
     include_sage_attention: bool = False,
     jobs=None,
@@ -213,15 +214,14 @@ def prewarm_modules(
         from .mla_ops import gen_mla_ops_spec
 
         specs.append(gen_mla_ops_spec())
+    if include_msa:
+        from .msa_ops import gen_msa_ops_aot
+
+        specs.extend(gen_msa_ops_aot())
     if include_moe_fused_gate:
         from .moe_fused_gate import gen_moe_fused_gate_spec
 
         specs.append(gen_moe_fused_gate_spec())
-    if include_sage_attention:
-        from .sage_attention import gen_sage_attention_spec
-
-        specs.append(gen_sage_attention_spec())
-
     build_jit_specs(
         specs,
         jobs=jobs,

@@ -9,6 +9,8 @@ Compared with the DeepSeek V3.2 sparse prefill kernel:
 - This remains a bf16 prefill-only research kernel.
 """
 
+from typing import Any
+
 import torch
 import tilelang
 from tilelang import language as T
@@ -19,9 +21,11 @@ from ...mate_runtime import resolve_num_mps
 from .sparse_mla_prefill_common import (
     SPARSE_PREFILL_COMPILE_FLAGS,
     SPARSE_PREFILL_PASS_CONFIGS,
-    optional_prefill_attn_sink,
-    require_token_lengths,
+    prepare_sparse_mla_strided_tensor,
+    validate_prefill_attn_sink,
+    validate_token_lengths,
 )
+from .sparse_mla_index_type import jit_for_tensor_addressing
 from ...execution_context import raise_complete_if_dry_run
 
 
@@ -35,7 +39,7 @@ MODEL1_SPARSE_PREFILL_PASS_CONFIGS = {
 
 
 @tilelang.jit(
-    out_idx=[-3, -2, -1],
+    out_idx=[3, 4, 5],
     pass_configs=MODEL1_SPARSE_PREFILL_PASS_CONFIGS,
     compile_flags=SPARSE_PREFILL_COMPILE_FLAGS,
 )
@@ -43,13 +47,13 @@ def sparse_attention_fwd_kernel_model1(
     num_heads,
     dim,
     *,
-    has_extra=False,
     kv_group=1,
     sm_scale=None,
     is_causal=True,
     block_i=64,
     threads=640,
     has_attn_sink=False,
+    has_topk_length=False,
     is_persistence=True,
     persistent_blocks=None,
 ):
@@ -62,10 +66,14 @@ def sparse_attention_fwd_kernel_model1(
         logits_scale = sm_scale
     sm_scale = logits_scale * 1.44269504
     topk = T.dynamic("topk")
-    extra_topk = T.dynamic("extra_topk")
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
-    seq_len_kv_extra = T.dynamic("seq_len_kv_extra")
+    q_stride_s = T.dynamic("q_stride_s")
+    q_stride_h = T.dynamic("q_stride_h")
+    kv_stride_s = T.dynamic("kv_stride_s")
+    kv_stride_g = T.dynamic("kv_stride_g")
+    indices_stride_s = T.dynamic("indices_stride_s")
+    indices_stride_g = T.dynamic("indices_stride_g")
 
     head_kv = num_heads // kv_group
     q_shape = [seq_len, num_heads, dim]
@@ -74,14 +82,18 @@ def sparse_attention_fwd_kernel_model1(
     lse_shape = [seq_len, num_heads]
     max_logits_shape = [seq_len, num_heads]
     indices_shape = [seq_len, kv_group, topk]
-    extra_indices_shape = [seq_len, kv_group, extra_topk]
     indices_dtype = "int32"
     dtype = "bfloat16"
     accum_dtype = "float"
     dtype_bytes = 2
-    q_cosize = cosize(q_shape)
-    kv_cosize = cosize(kv_shape)
-    extra_kv_cosize = cosize([seq_len_kv_extra, kv_group, dim])
+    q_strides = (q_stride_s, q_stride_h, 1)
+    kv_strides = (kv_stride_s, kv_stride_g, 1)
+    indices_strides = (indices_stride_s, indices_stride_g, 1)
+    q_cosize = cosize(q_shape, q_strides)
+    kv_cosize = cosize(kv_shape, kv_strides)
+    q_type: Any = T.StridedTensor(q_shape, q_strides, dtype)
+    kv_type: Any = T.StridedTensor(kv_shape, kv_strides, dtype)
+    indices_type: Any = T.StridedTensor(indices_shape, indices_strides, indices_dtype)
 
     padded_head_kv = max(tilelang.math.next_power_of_2(head_kv), 64)
     if padded_head_kv != head_kv:
@@ -105,21 +117,24 @@ def sparse_attention_fwd_kernel_model1(
     consumer0_threads = 256
     consumer1_threads = 256
 
-    @T.prim_func
-    def dsa_prefill(
-        q: T.Tensor(q_shape, dtype),
-        kv: T.Tensor(kv_shape, dtype),
-        indices: T.Tensor(indices_shape, indices_dtype),
-        topk_length: T.Tensor([seq_len], indices_dtype),
-        extra_kv: T.Tensor([seq_len_kv_extra, kv_group, dim], dtype),
-        extra_indices: T.Tensor(extra_indices_shape, indices_dtype),
-        extra_topk_length: T.Tensor([seq_len], indices_dtype),
-        attn_sink: T.Tensor([num_heads], accum_dtype),
-        output: T.Tensor(o_shape, dtype),
-        max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
-        lse: T.Tensor(lse_shape, accum_dtype),
+    @T.macro
+    def dsa_prefill_body(
+        q,
+        kv,
+        indices,
+        topk_length,
+        attn_sink,
+        output,
+        max_logits_out,
+        lse,
     ):
         with T.Kernel(launch_blocks, kv_group, threads=threads) as (bx, by):
+            T.assume(q_stride_s % 8 == 0)
+            T.assume(q_stride_h % 8 == 0)
+            T.assume(kv_stride_s % 8 == 0)
+            T.assume(kv_stride_g % 8 == 0)
+            T.assume(indices_stride_s % 8 == 0)
+            T.assume(indices_stride_g % 8 == 0)
             q_shared_l = T.alloc_shared([heads_per_block, dim_qk // 2], dtype)
             q_shared_r = T.alloc_shared([heads_per_block, dim_qk // 2], dtype)
             kv_shared_l = T.alloc_shared([block_i, dim_qk // 2], dtype)
@@ -161,11 +176,6 @@ def sparse_attention_fwd_kernel_model1(
                 T.address_of(kv[0, 0, 0]),
                 kv_cosize * dtype_bytes,
             )
-            extra_kv_robust_desc = T.make_robust_desc(
-                T.address_of(extra_kv[0, 0, 0]),
-                extra_kv_cosize * dtype_bytes,
-            )
-
             T.sync_threads()
 
             tid = T.get_thread_binding()
@@ -184,12 +194,11 @@ def sparse_attention_fwd_kernel_model1(
                     0 if head_repeats == 1 else (logical_bx % head_repeats) * 64
                 )
                 h1 = h0 + heads_per_block
-                dynamic_main_blocks = T.alloc_var(T.int32)
                 dynamic_total_blocks = T.alloc_var(T.int32)
-                dynamic_main_blocks = T.ceildiv(topk_length[s_i], block_i)
-                dynamic_total_blocks = dynamic_main_blocks
-                if has_extra:
-                    dynamic_total_blocks += T.ceildiv(extra_topk_length[s_i], block_i)
+                if has_topk_length:
+                    dynamic_total_blocks = T.ceildiv(topk_length[s_i], block_i)
+                else:
+                    dynamic_total_blocks = T.ceildiv(topk, block_i)
 
                 if tid < 256:
                     sumexp = T.alloc_fragment([heads_per_block], accum_dtype)
@@ -574,213 +583,206 @@ def sparse_attention_fwd_kernel_model1(
                     kperm_mask_local = T.alloc_local([4], "bool")
                     kperm_indices_local = T.alloc_local([4], indices_dtype)
                     topk_len_local = T.alloc_local([1], indices_dtype)
-                    extra_topk_len_local = T.alloc_local([1], indices_dtype)
                     producer_ldg_tx = (tid - 512) % 8
                     producer_ldg_ty = (tid - 512) // 8
-                    topk_len_local[0] = topk_length[s_i]
-                    extra_topk_len_local[0] = extra_topk_length[s_i]
+                    if has_topk_length:
+                        topk_len_local[0] = topk_length[s_i]
+                    else:
+                        topk_len_local[0] = topk
 
                     for i_i in range(dynamic_total_blocks):
-                        if i_i < dynamic_main_blocks:
-                            orig_block_index = i_i
-                            for r in T.unroll(4):
-                                token_pos = (
-                                    orig_block_index * block_i
-                                    + ((r * 16 + producer_ldg_ty) % 8) * (block_i // 8)
-                                    + (r * 16 + producer_ldg_ty) // 8
-                                )
-                                kperm_indices_local[r] = indices[s_i, g_i, token_pos]
-                                kperm_mask_local[r] = (
-                                    kperm_indices_local[r] >= 0
-                                    and kperm_indices_local[r] < seq_len_kv
-                                    and token_pos < topk_len_local[0]
-                                )
-                                kperm_indices_local[r] = T.if_then_else(
-                                    kperm_mask_local[r],
-                                    kperm_indices_local[r],
-                                    0,
-                                )
-
-                            T.barrier_wait(bar_kv0_free, (phase_count[0] & 1) ^ 1)
-                            T.annotate_layout(
-                                {
-                                    kv_shared_l[
-                                        :, :
-                                    ]: tilelang.layout.make_sqmma_swizzled_layout(
-                                        kv_shared_l[:, :],
-                                        k_major=True,
-                                    )
-                                },
-                                allow_reannotation=True,
-                                allow_buffer_region=True,
+                        orig_block_index = i_i
+                        for r in T.unroll(4):
+                            token_pos = (
+                                orig_block_index * block_i
+                                + ((r * 16 + producer_ldg_ty) % 8) * (block_i // 8)
+                                + (r * 16 + producer_ldg_ty) // 8
                             )
-                            for r in T.unroll(4):
-                                for u in T.unroll(4):
-                                    for v in T.vectorized(8):
-                                        T.copy(
-                                            kv[
-                                                kperm_indices_local[r],
-                                                g_i,
-                                                64 * u + producer_ldg_tx * 8 + v,
-                                            ],
-                                            kv_shared_l[
-                                                r * 16 + producer_ldg_ty,
-                                                64 * u + producer_ldg_tx * 8 + v,
-                                            ],
-                                            force_async_copy=True,
-                                            src_robust_desc=kv_robust_desc,
-                                        )
-                            for r in T.unroll(4):
-                                is_kv_valid[
-                                    ((r * 16 + producer_ldg_ty) % 8) * (block_i // 8)
-                                    + (r * 16 + producer_ldg_ty) // 8
-                                ] = kperm_mask_local[r]
-                            T.ptx_commit_group()
-                            T.ptx_wait_group(0)
-                            T.lma_wait()
-                            T.barrier_arrive(bar_kv0_ready)
-
-                            T.barrier_wait(bar_kv1_free, (phase_count[0] & 1) ^ 1)
-                            T.annotate_layout(
-                                {
-                                    kv_shared_r[
-                                        :, :
-                                    ]: tilelang.layout.make_sqmma_swizzled_layout(
-                                        kv_shared_r[:, :],
-                                        k_major=True,
-                                    )
-                                },
-                                allow_reannotation=True,
-                                allow_buffer_region=True,
+                            kperm_indices_local[r] = indices[s_i, g_i, token_pos]
+                            kperm_mask_local[r] = (
+                                kperm_indices_local[r] >= 0
+                                and kperm_indices_local[r] < seq_len_kv
+                                and token_pos < topk_len_local[0]
                             )
-                            for r in T.unroll(4):
-                                for u in T.unroll(4):
-                                    for v in T.vectorized(8):
-                                        T.copy(
-                                            kv[
-                                                kperm_indices_local[r],
-                                                g_i,
-                                                dim_qk // 2
-                                                + 64 * u
-                                                + producer_ldg_tx * 8
-                                                + v,
-                                            ],
-                                            kv_shared_r[
-                                                r * 16 + producer_ldg_ty,
-                                                64 * u + producer_ldg_tx * 8 + v,
-                                            ],
-                                            force_async_copy=True,
-                                            src_robust_desc=kv_robust_desc,
-                                        )
-                            T.ptx_commit_group()
-                            T.ptx_wait_group(0)
-                            T.barrier_arrive(bar_kv1_ready)
-                            T.sync_threads(1, 128)
-                            phase_count[0] = phase_count[0] ^ 1
-                        else:
-                            extra_block_index = i_i - dynamic_main_blocks
-                            for r in T.unroll(4):
-                                token_pos = (
-                                    extra_block_index * block_i
-                                    + ((r * 16 + producer_ldg_ty) % 8) * (block_i // 8)
-                                    + (r * 16 + producer_ldg_ty) // 8
-                                )
-                                kperm_indices_local[r] = extra_indices[
-                                    s_i, g_i, token_pos
-                                ]
-                                kperm_mask_local[r] = (
-                                    kperm_indices_local[r] >= 0
-                                    and kperm_indices_local[r] < seq_len_kv_extra
-                                    and token_pos < extra_topk_len_local[0]
-                                )
-                                kperm_indices_local[r] = T.if_then_else(
-                                    kperm_mask_local[r],
-                                    kperm_indices_local[r],
-                                    seq_len_kv_extra,
-                                )
-
-                            T.barrier_wait(bar_kv0_free, (phase_count[0] & 1) ^ 1)
-                            T.annotate_layout(
-                                {
-                                    kv_shared_l[
-                                        :, :
-                                    ]: tilelang.layout.make_sqmma_swizzled_layout(
-                                        kv_shared_l[:, :],
-                                        k_major=True,
-                                    )
-                                },
-                                allow_reannotation=True,
-                                allow_buffer_region=True,
+                            kperm_indices_local[r] = T.if_then_else(
+                                kperm_mask_local[r],
+                                kperm_indices_local[r],
+                                0,
                             )
-                            for r in T.unroll(4):
-                                for u in T.unroll(4):
-                                    for v in T.vectorized(8):
-                                        T.copy(
-                                            extra_kv[
-                                                kperm_indices_local[r],
-                                                g_i,
-                                                64 * u + producer_ldg_tx * 8 + v,
-                                            ],
-                                            kv_shared_l[
-                                                r * 16 + producer_ldg_ty,
-                                                64 * u + producer_ldg_tx * 8 + v,
-                                            ],
-                                            force_async_copy=True,
-                                            src_robust_desc=extra_kv_robust_desc,
-                                        )
-                            for r in T.unroll(4):
-                                is_kv_valid[
-                                    ((r * 16 + producer_ldg_ty) % 8) * (block_i // 8)
-                                    + (r * 16 + producer_ldg_ty) // 8
-                                ] = kperm_mask_local[r]
-                            T.ptx_commit_group()
-                            T.ptx_wait_group(0)
-                            T.lma_wait()
-                            T.barrier_arrive(bar_kv0_ready)
 
-                            T.barrier_wait(bar_kv1_free, (phase_count[0] & 1) ^ 1)
-                            T.annotate_layout(
-                                {
-                                    kv_shared_r[
-                                        :, :
-                                    ]: tilelang.layout.make_sqmma_swizzled_layout(
-                                        kv_shared_r[:, :],
-                                        k_major=True,
+                        T.barrier_wait(bar_kv0_free, (phase_count[0] & 1) ^ 1)
+                        T.annotate_layout(
+                            {
+                                kv_shared_l[
+                                    :, :
+                                ]: tilelang.layout.make_sqmma_swizzled_layout(
+                                    kv_shared_l[:, :],
+                                    k_major=True,
+                                )
+                            },
+                            allow_reannotation=True,
+                            allow_buffer_region=True,
+                        )
+                        for r in T.unroll(4):
+                            for u in T.unroll(4):
+                                for v in T.vectorized(8):
+                                    T.copy(
+                                        kv[
+                                            kperm_indices_local[r],
+                                            g_i,
+                                            64 * u + producer_ldg_tx * 8 + v,
+                                        ],
+                                        kv_shared_l[
+                                            r * 16 + producer_ldg_ty,
+                                            64 * u + producer_ldg_tx * 8 + v,
+                                        ],
+                                        force_async_copy=True,
+                                        src_robust_desc=kv_robust_desc,
                                     )
-                                },
-                                allow_reannotation=True,
-                                allow_buffer_region=True,
-                            )
-                            for r in T.unroll(4):
-                                for u in T.unroll(4):
-                                    for v in T.vectorized(8):
-                                        T.copy(
-                                            extra_kv[
-                                                kperm_indices_local[r],
-                                                g_i,
-                                                dim_qk // 2
-                                                + 64 * u
-                                                + producer_ldg_tx * 8
-                                                + v,
-                                            ],
-                                            kv_shared_r[
-                                                r * 16 + producer_ldg_ty,
-                                                64 * u + producer_ldg_tx * 8 + v,
-                                            ],
-                                            force_async_copy=True,
-                                            src_robust_desc=extra_kv_robust_desc,
-                                        )
-                            T.ptx_commit_group()
-                            T.ptx_wait_group(0)
-                            T.barrier_arrive(bar_kv1_ready)
-                            T.sync_threads(1, 128)
-                            phase_count[0] = phase_count[0] ^ 1
+                        for r in T.unroll(4):
+                            is_kv_valid[
+                                ((r * 16 + producer_ldg_ty) % 8) * (block_i // 8)
+                                + (r * 16 + producer_ldg_ty) // 8
+                            ] = kperm_mask_local[r]
+                        T.ptx_commit_group()
+                        T.ptx_wait_group(0)
+                        T.lma_wait()
+                        T.barrier_arrive(bar_kv0_ready)
 
+                        T.barrier_wait(bar_kv1_free, (phase_count[0] & 1) ^ 1)
+                        T.annotate_layout(
+                            {
+                                kv_shared_r[
+                                    :, :
+                                ]: tilelang.layout.make_sqmma_swizzled_layout(
+                                    kv_shared_r[:, :],
+                                    k_major=True,
+                                )
+                            },
+                            allow_reannotation=True,
+                            allow_buffer_region=True,
+                        )
+                        for r in T.unroll(4):
+                            for u in T.unroll(4):
+                                for v in T.vectorized(8):
+                                    T.copy(
+                                        kv[
+                                            kperm_indices_local[r],
+                                            g_i,
+                                            dim_qk // 2
+                                            + 64 * u
+                                            + producer_ldg_tx * 8
+                                            + v,
+                                        ],
+                                        kv_shared_r[
+                                            r * 16 + producer_ldg_ty,
+                                            64 * u + producer_ldg_tx * 8 + v,
+                                        ],
+                                        force_async_copy=True,
+                                        src_robust_desc=kv_robust_desc,
+                                    )
+                        T.ptx_commit_group()
+                        T.ptx_wait_group(0)
+                        T.barrier_arrive(bar_kv1_ready)
+                        T.sync_threads(1, 128)
+                        phase_count[0] = phase_count[0] ^ 1
                 if is_persistence:
                     logical_phase[0] = logical_phase[0] ^ 1
                     logical_bx += persistent_blocks
                 else:
                     logical_bx = seq_len * head_repeats
+
+    if has_topk_length and has_attn_sink:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: q_type,
+            kv: kv_type,
+            indices: indices_type,
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            topk_length: T.Tensor([seq_len], indices_dtype),
+            attn_sink: T.Tensor([num_heads], accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                topk_length,
+                attn_sink,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_topk_length:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: q_type,
+            kv: kv_type,
+            indices: indices_type,
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            topk_length: T.Tensor([seq_len], indices_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                topk_length,
+                None,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    elif has_attn_sink:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: q_type,
+            kv: kv_type,
+            indices: indices_type,
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+            attn_sink: T.Tensor([num_heads], accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                None,
+                attn_sink,
+                output,
+                max_logits_out,
+                lse,
+            )
+
+    else:
+
+        @T.prim_func
+        def dsa_prefill(
+            q: q_type,
+            kv: kv_type,
+            indices: indices_type,
+            output: T.Tensor(o_shape, dtype),
+            max_logits_out: T.Tensor(max_logits_shape, accum_dtype),
+            lse: T.Tensor(lse_shape, accum_dtype),
+        ):
+            dsa_prefill_body(
+                q,
+                kv,
+                indices,
+                None,
+                None,
+                output,
+                max_logits_out,
+                lse,
+            )
 
     return dsa_prefill
 
@@ -805,65 +807,65 @@ def sparse_mla_fwd_interface_model1(
     assert q.dtype == torch.bfloat16, "q must be bfloat16"
     assert kv.dtype == torch.bfloat16, "kv must be bfloat16"
     assert indices.dtype == torch.int32, "indices must be int32"
-    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
-    seq_len, heads, dim_q = q.shape
-    seq_len_kv, kv_group, _ = kv.shape
+    q, q_shape = prepare_sparse_mla_strided_tensor("q", q, multiple=8)
+    kv, kv_shape = prepare_sparse_mla_strided_tensor("kv", kv, multiple=8)
+    indices, indices_shape = prepare_sparse_mla_strided_tensor(
+        "indices", indices, multiple=8
+    )
+    seq_len, heads, dim_q = q_shape
+    seq_len_kv, kv_group, _ = kv_shape
 
     dim = d_v
     assert kv_group == 1, (
         "Only MQA (kv_group == 1) is validated for model1 sparse prefill"
     )
     assert dim_q == dim, (
-        f"MODEL1 expects q last_dim == kv last_dim == {dim}, got q={dim_q}, kv={kv.shape[-1]}"
+        f"MODEL1 expects q last_dim == kv last_dim == {dim}, got q={dim_q}, kv={kv_shape[-1]}"
     )
-    assert kv.shape[-1] == dim, (
-        f"MODEL1 expects kv last_dim == {dim}, got {kv.shape[-1]}"
+    assert kv_shape[-1] == dim, (
+        f"MODEL1 expects kv last_dim == {dim}, got {kv_shape[-1]}"
     )
     assert dim == 512, f"MODEL1 kernel currently expects dim == d_v == 512, got {dim}"
 
-    _, _, topk = indices.shape
-    assert indices.shape == (seq_len, kv_group, topk)
+    _, _, topk = indices_shape
+    assert indices_shape == (seq_len, kv_group, topk)
     assert topk % 64 == 0, "MODEL1 sparse prefill requires topk to be a multiple of 64"
     if is_persistence:
         persistent_blocks = resolve_num_mps(q.device, persistent_blocks)
     else:
         persistent_blocks = 0
 
-    topk_length = require_token_lengths(
-        topk_length, seq_len, topk, q.device, "topk_length"
-    )
-    # Keep one TileLang body. With extra_topk == 0 the extra branch is
-    # compile-time dead; these alias arguments are not touched by math.
-    extra_kv = kv
-    extra_indices = indices[:, :, :0]
-    extra_topk_length = topk_length
+    topk_length = validate_token_lengths(topk_length, seq_len, "topk_length")
+    attn_sink = validate_prefill_attn_sink(attn_sink, heads)
 
     kernel_kwargs = {
-        "has_extra": False,
         "kv_group": kv_group,
         "sm_scale": sm_scale,
         "is_causal": is_causal,
         "threads": threads,
         "has_attn_sink": attn_sink is not None,
+        "has_topk_length": topk_length is not None,
         "is_persistence": is_persistence,
         "persistent_blocks": persistent_blocks,
     }
-    kernel = sparse_attention_fwd_kernel_model1(heads, dim, **kernel_kwargs)
+    # These inputs dominate the contiguous output and auxiliary tensor spans.
+    kernel_factory = jit_for_tensor_addressing(
+        sparse_attention_fwd_kernel_model1,
+        q,
+        kv,
+        indices,
+    )
+    kernel = kernel_factory(heads, dim, **kernel_kwargs)
     if verbose:
         kernel.show_source()
     raise_complete_if_dry_run()
 
-    attn_sink_arg, _ = optional_prefill_attn_sink(attn_sink, heads, q.device)
-    out = kernel(
-        q,
-        kv,
-        indices,
-        topk_length,
-        extra_kv,
-        extra_indices,
-        extra_topk_length,
-        attn_sink_arg,
-    )
+    args = [q, kv, indices]
+    if topk_length is not None:
+        args.append(topk_length)
+    if attn_sink is not None:
+        args.append(attn_sink)
+    out = kernel(*args)
 
     out_tensor, max_logits, lse_tensor = out
     if return_max_logits:

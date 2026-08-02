@@ -8,6 +8,20 @@ For runtime, API, and compatibility changes, see
 
 The current docs site history starts at ``0.2.2``.
 
+0.2.5
+-----
+
+- Added Kimi Delta Attention (KDA) decode coverage to
+  :doc:`Python APIs <api_reference>` and :doc:`KDA <api/kda>`.
+- Expanded :doc:`Attention <api/attention>` for FMHA ``only_qv`` and MLA
+  head-ratio coverage.
+- Added the :doc:`MSA/fmha_sm100 wrapper <wrappers/fmha_sm100_wrapper>` for
+  MiniMax Sparse Attention (MSA) workflows on MUSA.
+- Updated :doc:`Installing MATE <install>` for the MUSA simple package index.
+- Added MUBIN artifact management commands to :doc:`Command Line Interface
+  <cli>`.
+- Refined FlashMLA/DenseMLA support for multiple head-ratio configurations.
+
 0.2.4
 -----
 

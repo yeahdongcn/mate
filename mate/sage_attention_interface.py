@@ -14,7 +14,10 @@ from typing import Optional, Tuple, Union
 import torch
 
 from mate.api_logging import mate_api
-from mate.jit.sage_attention import get_sage_attention_module
+from mate.jit.mubin.sage_attention import (
+    sage_attn_quantized_mubin,
+    sage_attn_quantized_with_kvcache_mubin,
+)
 from mate.jit.utils import maybe_contiguous
 
 
@@ -72,10 +75,6 @@ def _resolve_supported_asm_quant_mode(
             f"Supported values: {supported_str}."
         )
     return int(_ASM_QUANT_MODE_BY_RECIPE[quant_recipe])
-
-
-def _get_module():
-    return get_sage_attention_module()
 
 
 @mate_api
@@ -189,7 +188,6 @@ def sage_attn_quantized(
     batch, seqlen_q, nheads, _ = q.shape
     headdim_v = v.shape[-1]
 
-    module = _get_module()
     out_dtype = v.dtype if fp8_output else torch.bfloat16
     out = torch.empty(
         (batch, seqlen_q, nheads, headdim_v), dtype=out_dtype, device=q.device
@@ -205,7 +203,7 @@ def sage_attn_quantized(
         device=q.device,
     )
 
-    module.sage_attn_quantized_asm(
+    sage_attn_quantized_mubin(
         out,
         maybe_contiguous(out_scale),
         lse,
@@ -342,7 +340,6 @@ def sage_attn_quantized_with_kvcache(
     batch, seqlen_q, nheads, _ = q.shape
     headdim_v = v_cache.shape[-1]
 
-    module = _get_module()
     out_dtype = v_cache.dtype if fp8_output else torch.bfloat16
     out = torch.empty(
         (batch, seqlen_q, nheads, headdim_v), dtype=out_dtype, device=q.device
@@ -358,7 +355,7 @@ def sage_attn_quantized_with_kvcache(
         device=q.device,
     )
 
-    module.sage_attn_quantized_with_kvcache_asm(
+    sage_attn_quantized_with_kvcache_mubin(
         out,
         maybe_contiguous(out_scale),
         lse,

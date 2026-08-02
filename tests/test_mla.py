@@ -335,7 +335,6 @@ def test_mla_decode_varlen(
     kv_len,
     max_seqlen_q,
 ) -> None:
-    torch.set_printoptions(sci_mode=False)
     device = torch.device("musa")
 
     num_heads_k = 1
@@ -442,7 +441,6 @@ def test_mla_q_not_contig(
     kv_len,
     max_seqlen_q,
 ) -> None:
-    torch.set_printoptions(sci_mode=False)
     device = torch.device("musa")
 
     head_dim_ckv = 512

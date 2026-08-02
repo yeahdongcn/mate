@@ -223,6 +223,7 @@ def flash_attn_with_kvcache(
     cp_world_size: int = 1,
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
+    only_qv: bool = False,
 ):
     resolved_sink = _resolve_sink(sinks=sinks, s_aux=s_aux)
 
@@ -261,6 +262,7 @@ def flash_attn_with_kvcache(
         cp_world_size=cp_world_size,
         cp_rank=cp_rank,
         cp_tot_seqused_k=cp_tot_seqused_k,
+        only_qv=only_qv,
     )
 
 
@@ -286,6 +288,7 @@ def get_scheduler_metadata(
     num_splits=0,
     pack_gqa=None,
     sm_margin=0,
+    has_qv=False,
 ):
     return mate_get_scheduler_metadata(
         batch_size=batch_size,
@@ -302,6 +305,7 @@ def get_scheduler_metadata(
         cu_seqlens_k=None,
         cu_seqlens_k_new=cu_seqlens_k_new,
         cache_leftpad=cache_leftpad,
+        page_size=page_size,
         max_seqlen_k_new=max_seqlen_k_new,
         causal=causal,
         window_size=window_size,
@@ -309,5 +313,6 @@ def get_scheduler_metadata(
         has_softcap=has_softcap,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
+        has_qv=has_qv,
         mp_margin=sm_margin,
     )

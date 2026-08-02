@@ -42,6 +42,14 @@ Wrapper support at a glance
 
 Select a wrapper package to open its documentation page.
 
+MSA (MiniMax Sparse Attention) workloads map to the ``fmha_sm100`` wrapper.
+Use it when your project already targets the ``fmha_sm100`` package surface
+and you want the same import path on MUSA.
+
+KDA (Kimi Delta Attention) workloads map to the ``flash_kda`` wrapper. Use it
+when your project already targets the ``flash_kda`` package surface and you
+want the same import path on MUSA.
+
 .. list-table::
    :header-rows: 1
 
@@ -61,9 +69,13 @@ Select a wrapper package to open its documentation page.
      - ``flash_mla``
      - FlashMLA style APIs
      - MLA metadata, decode, sparse prefill
+   * - :doc:`fmha_sm100 <wrappers/fmha_sm100_wrapper>`
+     - ``fmha_sm100``
+     - MSA style APIs
+     - MSA planning, sparse prefill/decode, sparse top-k selection
    * - :doc:`flash_kda <wrappers/flash_kda_wrapper>`
      - ``flash_kda``
-     - FlashKDA style APIs
+     - FlashKDA / KDA style APIs
      - KDA forward, workspace-size compatibility helper
    * - :doc:`deep-gemm <wrappers/deep_gemm_wrapper>`
      - ``deep_gemm``

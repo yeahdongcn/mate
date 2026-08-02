@@ -38,15 +38,13 @@ SPARSE_PREFILL_COMPILE_FLAGS = [
 ]
 
 
-def require_token_lengths(
+def validate_token_lengths(
     lengths: Optional[torch.Tensor],
     seq_len: int,
-    fill: int,
-    device,
     name: str,
-) -> torch.Tensor:
+) -> Optional[torch.Tensor]:
     if lengths is None:
-        return torch.full((seq_len,), fill, dtype=torch.int32, device=device)
+        return None
     assert lengths.dtype == torch.int32, f"{name} must be int32"
     assert lengths.shape == (seq_len,), f"{name} must have shape [S_q]"
     if lengths.shape[-1] != 1:
@@ -54,32 +52,46 @@ def require_token_lengths(
     return lengths.contiguous()
 
 
-def optional_prefill_attn_sink(
+def validate_prefill_attn_sink(
     attn_sink: Optional[torch.Tensor],
     heads: int,
-    device,
-):
+) -> Optional[torch.Tensor]:
     if attn_sink is None:
-        return torch.empty((heads,), dtype=torch.float32, device=device), False
+        return None
     assert attn_sink.dtype == torch.float32, "attn_sink must be float32"
     assert attn_sink.shape == (heads,), "attn_sink must have shape [H_q]"
     if attn_sink.shape[-1] != 1:
         assert attn_sink.stride(-1) == 1, "attn_sink last dimension must be contiguous"
-    return attn_sink.contiguous(), True
+    return attn_sink.contiguous()
 
 
-def check_sparse_mla_strides(
-    name: str, tensor: torch.Tensor, multiple: Optional[int] = None
-) -> None:
-    if tensor.is_contiguous():
-        return
-    if tensor.shape[-1] != 1:
-        assert tensor.stride(-1) == 1, f"{name} last dimension must be contiguous"
-    for dim, (size, stride) in enumerate(zip(tensor.shape[:-1], tensor.stride()[:-1])):
-        if size == 1:
+def prepare_sparse_mla_strided_tensor(
+    name: str, tensor: torch.Tensor, multiple: int
+) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """Validate a runtime-strided input once and normalize singleton strides."""
+
+    shape = tensor.shape
+    strides = tensor.stride()
+    normalized = None
+    if strides[-1] != 1:
+        assert shape[-1] == 1, f"{name} last dimension must be contiguous"
+        normalized = list(strides)
+        normalized[-1] = 1
+    for dim in range(len(strides) - 1):
+        stride = strides[dim]
+        if stride > 0 and stride % multiple == 0:
             continue
-        assert stride > 0, f"{name} stride({dim}) must be positive, got {stride}"
-        if multiple is not None:
-            assert stride % multiple == 0, (
+        if shape[dim] != 1:
+            assert stride > 0, f"{name} stride({dim}) must be positive, got {stride}"
+            raise AssertionError(
                 f"{name} stride({dim}) must be divisible by {multiple}, got {stride}"
             )
+        if normalized is None:
+            normalized = list(strides)
+        normalized[dim] = multiple
+    if normalized is None:
+        return tensor, shape
+    return (
+        torch.as_strided(tensor, shape, normalized, tensor.storage_offset()),
+        shape,
+    )

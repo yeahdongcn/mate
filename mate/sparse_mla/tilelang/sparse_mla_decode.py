@@ -24,7 +24,6 @@ from ..flashmla_checks import (
 from .sparse_mla_v32_decode_fwd_scheduled import (
     tilelang_flashmla_interface as _decode_v32,
 )
-from .sparse_mla_decode_scheduled_common import check_sparse_mla_decode_strides
 from .sparse_mla_model1_decode_fwd_scheduled import (
     sparse_mla_decode_fwd_scheduled_interface_model1 as _decode_model1,
 )
@@ -77,9 +76,6 @@ def sparse_mla_decode_fwd(
     if extra_k_cache is not None:
         extra_k_cache = _byte_view_k_cache(extra_k_cache, "extra_k_cache")
     assert indices.dtype == torch.int32, "indices must be int32"
-    check_sparse_mla_decode_strides("q", q, multiple=8)
-    check_sparse_mla_decode_strides("indices", indices)
-
     if head_dim_q == 576:
         return _sparse_decode_v32(
             q=q,
@@ -215,6 +211,9 @@ def _sparse_decode_model1(
         k_cache, check=False
     )
     extra_indices = None
+    extra_k_cache_nope = None
+    extra_k_cache_rope = None
+    extra_k_cache_scales = None
     if extra_k_cache is not None:
         assert extra_indices_in_kvcache is not None, (
             "extra_indices_in_kvcache must be provided with extra_k_cache"
@@ -240,11 +239,6 @@ def _sparse_decode_model1(
             "extra_indices_in_kvcache requires extra_k_cache"
         )
         assert extra_topk_length is None, "extra_topk_length requires extra_k_cache"
-        extra_k_cache_nope, extra_k_cache_rope, extra_k_cache_scales = (
-            k_cache_nope,
-            k_cache_rope,
-            k_cache_scales,
-        )
 
     if tile_scheduler_metadata is None or num_splits is None:
         assert tile_scheduler_metadata is None and num_splits is None, (
@@ -304,6 +298,7 @@ def _sparse_decode_model1(
         producer_threads=producer_threads,
         page_block_size=k_cache.shape[1],
         extra_page_block_size=(
-            extra_k_cache.shape[1] if extra_k_cache is not None else k_cache.shape[1]
+            extra_k_cache.shape[1] if extra_k_cache is not None else None
         ),
+        _cache_strides_prepared=True,
     )

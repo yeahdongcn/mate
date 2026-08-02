@@ -94,11 +94,12 @@ Direct Gated Delta Network APIs for decode and prefill. See the
 KDA
 ---
 
-Direct :doc:`KDA <api/kda>` entrypoints for fused chunked KDA when the
-``flash_kda`` wrapper is not the right integration surface.
+Direct :doc:`KDA <api/kda>` entrypoints for fused chunked KDA and decode when
+the ``flash_kda`` wrapper is not the right integration surface.
 
 - ``mate.chunk_kda``
 - ``mate.kda.chunk_kda``
+- ``mate.kda.gated_delta_rule_decode``
 
 MoE Routing & Gating
 --------------------

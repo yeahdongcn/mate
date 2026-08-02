@@ -5,6 +5,7 @@ import torch
 
 from mate.api_logging import mate_api
 from mate.jit.mla_ops import get_mla_ops_module
+from mate.jit.mubin.flash_mla import flash_mla_asm_mubin
 from mate.jit.runtime import ffi_to_torch
 from .sparse_mla.flashmla_sparse import (
     flashmla_sparse_decode,
@@ -330,7 +331,7 @@ def flash_mla_with_kvcache(
 
     if should_run_with_asm:
         raise_complete_if_dry_run()
-        _get_module().get_function("flash_mla_asm")(
+        flash_mla_asm_mubin(
             q_nope,
             q_pe,
             k_cache[:, :, :, :head_dim_v],

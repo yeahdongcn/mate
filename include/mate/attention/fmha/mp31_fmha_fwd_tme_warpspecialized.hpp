@@ -54,6 +54,7 @@ template <class Element_,
           bool HasSoftcap_,
           bool IsAppendKV_,
           bool HasQv_,
+          bool OnlyQv_,
           int  HeadRatio_,
           bool IsPackGQA_,
           bool Split_,
@@ -99,7 +100,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr bool HasSequsedK       = HasSequsedK_;
   static constexpr bool HasLeftpadK       = HasLeftpadK_;
   static constexpr bool HasQv             = HasQv_;
+  static constexpr bool OnlyQv            = OnlyQv_;
   static constexpr bool InKernelTranspose = HasQv;
+  static_assert(!OnlyQv || HasQv, "OnlyQv requires HasQv");
 
   static constexpr bool HasQDescale = HasQDscale_;
   static constexpr bool HasKDescale = HasKDscale_;
@@ -1409,11 +1412,13 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       qk_descale = q_descale * k_descale;
       qv_descale = q_descale * v_descale;
 
-      if constexpr (HasSoftcap) {
-        softcap_scale *= qk_descale;
-      } else {
-        effective_scale *= qk_descale;
-        effective_scale_log2 *= qk_descale;
+      if constexpr (!HasQv) {
+        if constexpr (HasSoftcap) {
+          softcap_scale *= qk_descale;
+        } else {
+          effective_scale *= qk_descale;
+          effective_scale_log2 *= qk_descale;
+        }
       }
     }
 
@@ -1544,7 +1549,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       pipeline_k.consumer_wait(smem_pipe_read_k);
 
       // MMA QK
-      mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), acc_qk);
+      if constexpr (!OnlyQv) {
+        mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), acc_qk);
+      }
 
       // MMA QV
       gemm_qv(acc_qk);
@@ -1585,7 +1592,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         clear(acc_qk);
 
         pipeline_k.consumer_wait(smem_pipe_read_k);
-        mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), acc_qk);
+        if constexpr (!OnlyQv) {
+          mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), acc_qk);
+        }
 
         gemm_qv(acc_qk);
 
@@ -1679,7 +1688,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
         pipeline_k.consumer_wait(smem_pipe_read_k);
         // MMA QK
-        mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), acc_qk);
+        if constexpr (!OnlyQv) {
+          mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), acc_qk);
+        }
 
         gemm_qv(acc_qk);
 

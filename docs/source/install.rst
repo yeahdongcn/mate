@@ -11,7 +11,7 @@ Steps at a glance
 1. Check requirements.
 2. Choose a package source.
 3. Install a delivered package or build from source.
-4. Validate installation.
+4. Validate installation and MUBIN artifact availability.
 5. Build a wrapper from source if needed.
 6. Optionally pre-build AOT kernels.
 
@@ -49,8 +49,6 @@ For delivered packages, use the external MUSA wheel source.
 
 - Index:
   ``https://dl.mthreads.com/repo/api/pypi/pypi/simple``
-- Wheel root:
-  ``https://dl.mthreads.com/repo/repository/public-release-pypi/``
 
 Choose one configuration method:
 
@@ -78,17 +76,17 @@ One-off install
 
 Optional:
 
-Direct wheel URL
-   Use this when you need one exact wheel. The URL format is
-   ``<package>/<version>/<wheel-file>`` under ``public-release-pypi``.
+Pinned version install
+   Use this when you need one exact version.
 
    .. code-block:: bash
 
       python -m pip install \
-        https://dl.mthreads.com/repo/repository/public-release-pypi/<package>/<version>/<wheel-file>
+        <package>==<version> \
+        --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 
    Keep one ``index-url`` configured for dependency resolution, or add
-   ``--no-deps`` if dependencies are already installed.
+      ``--no-deps`` if dependencies are already installed.
 
 Check available versions
    .. code-block:: bash
@@ -107,10 +105,37 @@ Choose one installation path:
   ``flash_attn_3``, ``flash_mla``, ``flash_kda``, ``deep-gemm``, or
   ``sageattention``. Each delivered wrapper installs the matching ``mate``
   dependency automatically.
+- Local wrapper install: use this for wrapper surfaces that are not part of
+  the delivered package set, such as ``fmha_sm100``.
 - Direct MATE install: use this when you need direct ``mate`` APIs without a
   wrapper.
 - Build from source: use this when you are developing MATE locally or need a
   local build artifact.
+
+MUBIN package options
+~~~~~~~~~~~~~~~~~~~~~
+
+MATE provides two packages for MUBIN-backed workloads:
+
+- ``mate``: core package that compiles or downloads MUBIN kernels on first use.
+- ``mate-mubin``: prebuilt kernels and runtime artifacts for faster startup and
+  offline use.
+
+To install both packages:
+
+.. code-block:: bash
+
+   python -m pip install mate mate-mubin \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+
+To preload artifacts:
+
+.. code-block:: bash
+
+   mate download-mubin
+   mate list-mubins
+
+If only ``mate`` is installed, MATE downloads MUBIN artifacts on demand.
 
 Delivered wrapper install
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -215,6 +240,60 @@ install:
    python -m build --wheel --no-isolation
    python -m pip install --no-deps dist/mate-*.whl
 
+Optional MUBIN wheel
+""""""""""""""""""""
+
+Build the optional package containing the complete pre-generated MUBIN payload
+after installing the local MATE checkout:
+
+.. code-block:: bash
+
+   cd mate-mubin
+   python -m build --no-isolation --wheel
+   python -m pip install --no-deps dist/mate_mubin-*.whl
+
+By default, the build backend downloads and verifies all artifacts pinned by
+the current MATE source. To build from an existing complete cache, set
+``MATE_MUBIN_SOURCE_DIR`` to its absolute root path before invoking the build.
+
+MUBIN artifact availability
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+MATE uses external MUBIN artifacts for selected ``gemm``,
+``flash_attention``, ``flash_mla``, and ``sage_attention`` execution paths.
+The public Python APIs remain in ``mate``, but those paths require one of the
+following artifact sources at runtime:
+
+- An installed ``mate-mubin`` package.
+- A downloaded artifact cache, selected by ``MATE_MUBIN_DIR`` and defaulting
+  to ``~/.cache/mate/mubin``.
+
+An installed ``mate-mubin`` package takes precedence over the downloaded
+cache and its contents are trusted at runtime. The main ``mate`` source build
+and wheel do not themselves contain the external MUBIN payload.
+
+Install the optional wheel that matches the running MATE version with:
+
+.. code-block:: bash
+
+   mate install-mubin-wheel
+
+This command installs ``mate-mubin`` from the MUSA wheel source with
+``--no-deps``. Use ``mate install-mubin-wheel --dry-run`` to inspect the exact
+pip command, or pass ``--index-url`` when the optional wheel is hosted on a
+different Python package index.
+
+When ``mate-mubin`` is not installed, first use requires access to the
+configured artifact repository. MATE first downloads ``kernel_map.json`` for
+the selected module. It then downloads the required ``.o`` kernel object
+lazily. All downloaded files are verified by default.
+
+Use ``mate download-mubin`` when the complete payload must be available before
+the first operator call, such as when preparing an offline host or container
+image. See :doc:`Command Line Interface <mate_cli>` for command behavior and
+:doc:`Environment Variables <environment_variables>` for cache and repository
+controls.
+
 Step 4. Validate Installation
 -----------------------------
 
@@ -234,12 +313,38 @@ MATE runtime first.
    mate check
    mate show-config
    mate env
+   mate list-mubins
 
 If the ``mate`` executable entrypoint is not available in your environment,
 use ``python -m mate ...`` for supported subcommands.
 
 If you installed a wrapper package in Step 3, follow that wrapper page for the
 wrapper import path and package-specific validation snippet.
+
+Prepare an offline environment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the ``mate-mubin`` wheel is unavailable, populate a dedicated artifact
+directory while repository access is available:
+
+.. code-block:: bash
+
+   export MATE_MUBIN_DIR="$HOME/mate-mubin-cache"
+   mate download-mubin
+   mate list-mubins
+
+Confirm that every required module reports ``Downloaded``. Preserve that
+directory in the offline environment, keep ``MATE_MUBIN_DIR`` set to the same
+path, and then disable runtime retrieval:
+
+.. code-block:: bash
+
+   export MATE_MUBIN_DIR="$HOME/mate-mubin-cache"
+   export MATE_MUBIN_NO_DOWNLOAD=1
+
+A ``Metadata only`` status is insufficient for an offline workload that selects
+a kernel which has not already been fetched. Do not disable kernel-map and
+object hash verification as part of the offline workflow.
 
 Step 5. Build a Wrapper from Source if Needed
 ---------------------------------------------
@@ -269,6 +374,10 @@ installs, not the delivered wheel source.
      - ``flash_mla``
      - ``flash_mla``
      - FlashMLA style integration
+   * - ``wrappers/MSA``
+     - ``fmha_sm100``
+     - ``fmha_sm100``
+     - MSA fmha_sm100 style integration
    * - ``wrappers/FlashKDA``
      - ``flash_kda``
      - ``flash_kda``
@@ -301,9 +410,9 @@ Wheel install pattern:
    python -m build --wheel
    python -m pip install --no-deps dist/flash_attn_3-*.whl
 
-Repeat the same workflow for ``wrappers/FlashMLA``, ``wrappers/FlashKDA``,
-``wrappers/DeepGEMM``, or ``wrappers/SageAttention`` when those package
-surfaces match your framework.
+Repeat the same workflow for ``wrappers/FlashMLA``, ``wrappers/MSA``,
+``wrappers/FlashKDA``, ``wrappers/DeepGEMM``, and ``wrappers/SageAttention``
+when those package surfaces match your framework.
 
 Optional Step 6. Pre-Build AOT Kernels
 --------------------------------------
@@ -320,6 +429,10 @@ Customize AOT coverage when needed:
 .. code-block:: bash
 
    python -m mate.aot --attention-aot-level 0 --add-gemm true --add-moe false
+
+The AOT build command does not prefetch external MUBIN artifacts. Run
+``mate download-mubin`` separately when an offline deployment also uses
+MUBIN-backed operator paths.
 
 Next Steps
 ----------

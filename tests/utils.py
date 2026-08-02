@@ -25,8 +25,6 @@ def init_dist(local_rank: int, num_local_ranks: int):
         rank=node_rank * num_local_ranks + local_rank,
         device_id=device,
     )
-    torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("musa")
     torch.musa.set_device(local_rank)
     return (
         dist.get_rank(),

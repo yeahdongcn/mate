@@ -12,8 +12,7 @@ from mate.testing import supported_musa_compute_capability
 
 
 # Keep the reference path numerically aligned with gdn_unified_tilelang testing.
-if hasattr(torch.backends, "mudnn"):
-    torch.backends.mudnn.allow_tf32 = False
+pytestmark = pytest.mark.usefixtures("disable_mudnn_tf32")
 
 
 @torch.inference_mode
@@ -173,7 +172,10 @@ def decode_delta_rule(
             #
             # Equivalent to: k^T @ h where h is [K, V]
             # [K] @ [K, V] = [V]
-            v_new = v_h - (k_h @ h_state)
+            # Match the kernel's explicit FP32 reduction for k * state rather
+            # than dispatching a backend GEMV with an implementation-defined
+            # reduction order.
+            v_new = v_h - torch.sum(h_state * k_h[:, None], dim=0)
 
             # Step 3: Apply beta gating: v *= beta
             # Triton kernel line 128: b_v *= b_beta
@@ -184,7 +186,10 @@ def decode_delta_rule(
             # Triton: [BK, BV] += [BK, 1] * [1, BV]
             # This is outer product: k @ v^T
             # [K, V] += [K, 1] @ [1, V]
-            h_state = h_state + k_h.unsqueeze(1) @ v_new.unsqueeze(0)
+            # Keep the reference as element-wise FP32 arithmetic.  Expressing
+            # this outer product with ``@`` dispatches to MUBLAS, whose TF32
+            # override changes the reference values.
+            h_state = h_state + k_h[:, None] * v_new[None, :]
 
             # Step 5: Compute output: o = sum(h * q, dim=0)
             # Triton kernel line 134: b_o = tl.sum(b_h * b_q[:, None], 0)
@@ -195,7 +200,12 @@ def decode_delta_rule(
             #
             # Equivalent to: q^T @ h where h is [K, V]
             # [K] @ [K, V] = [V]
-            output[b_idx, h_idx] = q_h @ h_state
+            # Keep the reference reduction explicit instead of dispatching a
+            # MUSA GEMV.  The kernel accumulates q * state in a fixed FP32
+            # warp-reduction order; using ``q_h @ h_state`` can select a
+            # backend reduction with a different order near low-precision
+            # output rounding boundaries.
+            output[b_idx, h_idx] = torch.sum(h_state * q_h[:, None], dim=0)
 
             # Store updated state (cast back to state_dtype)
             new_state[b_idx, h_idx] = h_state.to(state_dtype)

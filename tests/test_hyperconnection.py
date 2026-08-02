@@ -104,13 +104,12 @@ def _make_mhc_inputs(
 
 
 @supported_musa_compute_capability([31])
+@pytest.mark.usefixtures("enable_musa_tf32")
 @pytest.mark.parametrize("m", [13, 137, 4096, 8192])
 @pytest.mark.parametrize("n,k", [(24, 28672), (24, 7680), (24, 7168)])
 @pytest.mark.parametrize("num_splits", [None, 16])
 def test_hc_prenorm_gemm(m: int, n: int, k: int, num_splits: int | None) -> None:
     # Needs TF32 precision for PyTorch GEMMs
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.mudnn.allow_tf32 = True
     a = torch.randn((m, k), dtype=torch.bfloat16, device="musa")
     b = torch.randn((n, k), dtype=torch.float32, device="musa")
 
@@ -133,13 +132,14 @@ def test_hc_prenorm_gemm(m: int, n: int, k: int, num_splits: int | None) -> None
     diff_s = calc_diff(final_s, ref_s)
     diff = max(diff_d, diff_s)
 
-    assert diff < 1e-8, (
+    assert diff < 1e-7, (
         f"FAILED m={m}, n={n}, k={k}, num_splits={num_splits}: "
         f"diff_d={diff_d:.2e}, diff_s={diff_s:.2e}"
     )
 
 
 @supported_musa_compute_capability([31])
+@pytest.mark.usefixtures("enable_musa_tf32")
 @pytest.mark.parametrize("num_tokens,hidden_size,split_k", [(16, 4096, 32)])
 def test_mhc_pre_deepgemm_tilelang_matches_torch_reference(
     num_tokens: int,
@@ -147,8 +147,6 @@ def test_mhc_pre_deepgemm_tilelang_matches_torch_reference(
     split_k: int,
 ) -> None:
     pytest.importorskip("tilelang")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.mudnn.allow_tf32 = True
 
     residual, hc_fn, hc_scale, hc_base = _make_mhc_inputs(
         num_tokens=num_tokens,

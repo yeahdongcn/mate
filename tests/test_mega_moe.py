@@ -3,8 +3,6 @@ import functools
 import os
 import random
 
-os.environ["NVSHMEM_IBGDA_NIC_HANDLER"] = "cpu"
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -573,6 +571,7 @@ def assert_exact_y(
 
 
 def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    os.environ["NVSHMEM_IBGDA_NIC_HANDLER"] = "cpu"
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     torch.manual_seed(rank_idx)
     random.seed(rank_idx)
@@ -640,7 +639,13 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     l1_weight_sf = []
     for _ in range(num_experts_per_rank):
         w_bf16 = (
-            torch.rand((intermediate_hidden * 2, hidden), device="musa") * 2 - 1
+            torch.rand(
+                (intermediate_hidden * 2, hidden),
+                dtype=torch.bfloat16,
+                device="musa",
+            )
+            * 2
+            - 1
         ).to(torch.bfloat16)
         w_fp8, w_sf = per_block_cast_to_fp8(w_bf16)
         l1_weight_fp8.append(w_fp8)
@@ -653,9 +658,15 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     l2_weight_fp8 = []
     l2_weight_sf = []
     for _ in range(num_experts_per_rank):
-        w_bf16 = (torch.rand((hidden, intermediate_hidden), device="musa") * 2 - 1).to(
-            torch.bfloat16
-        )
+        w_bf16 = (
+            torch.rand(
+                (hidden, intermediate_hidden),
+                dtype=torch.bfloat16,
+                device="musa",
+            )
+            * 2
+            - 1
+        ).to(torch.bfloat16)
         w_fp8, w_sf = per_block_cast_to_fp8(w_bf16)
         l2_weight_fp8.append(w_fp8)
         l2_weight_sf.append(w_sf)

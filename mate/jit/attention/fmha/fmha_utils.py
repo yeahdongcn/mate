@@ -1,8 +1,18 @@
 from functools import lru_cache
+
+import torch
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from ... import env as jit_env
 from ....utils import ceil_div
+
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_ELEMENT_NAME_SUFFIX = {
+    "mutlass::float_e4m3_t": "fp8_e4m3",
+    "mutlass::float_e5m2_t": "fp8_e5m2",
+    "mutlass::bfloat16_t": "bf16",
+    "mutlass::half_t": "fp16",
+}
 
 FMHA_EXTRA_CUDA_CFLAGS = [
     "-Od3",

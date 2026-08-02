@@ -36,9 +36,7 @@ def gen_mla_ops_spec() -> JitSpec:
     sources = [
         jit_env.MATE_CSRC_DIR / "attention_scheduler.mu",
         jit_env.MATE_CSRC_DIR / "attention_combine.mu",
-        jit_env.MATE_CSRC_DIR / "flash_mla_asm.mu",
         jit_env.MATE_CSRC_DIR / "mla_pybind.mu",
-        *sorted((jit_env.MATE_CSRC_DIR / "mubin" / "mp31" / "flash_mla").glob("*.cpp")),
     ]
     return gen_jit_spec(
         "mla_ops",

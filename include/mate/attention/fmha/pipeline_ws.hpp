@@ -51,30 +51,28 @@ struct Mp31PipelineStateWarpSpecialized {
   static constexpr uint32_t InitialProducerPhase = 1;
   static_assert(BarPerStageRatio > 0);
 
-  int      index_ = 0;
-  uint32_t phase_ = 0;
-  uint32_t count_ = 0;
+  int      stage_index_   = 0;
+  uint32_t barrier_index_ = 0;
+  uint32_t phase_         = 0;
+  uint32_t count_         = 0;
 
   MUTLASS_DEVICE
-  Mp31PipelineStateWarpSpecialized() : index_{}, phase_{}, count_{} {
+  Mp31PipelineStateWarpSpecialized() : stage_index_{}, barrier_index_{}, phase_{}, count_{} {
   }
 
   MUTLASS_DEVICE
-  Mp31PipelineStateWarpSpecialized(int index, uint32_t phase, uint32_t count)
-      : index_(index), phase_(phase), count_(count) {
+  Mp31PipelineStateWarpSpecialized(int stage_index, uint32_t barrier_index, uint32_t phase, uint32_t count)
+      : stage_index_(stage_index), barrier_index_(barrier_index), phase_(phase), count_(count) {
   }
 
   MUTLASS_DEVICE
   int index() const {
-    if constexpr (Stages > 0) {
-      return index_ % Stages;
-    }
-    return 0;
+    return stage_index_;
   }
 
   MUTLASS_DEVICE
   uint32_t barrier_index() const {
-    return index_;
+    return barrier_index_;
   }
 
   MUTLASS_DEVICE
@@ -89,11 +87,17 @@ struct Mp31PipelineStateWarpSpecialized {
 
   MUTLASS_DEVICE
   void operator++() {
-    ++index_;
-    ++count_;
-    if (index_ == BarrierRingSize) {
-      index_ = 0;
-      phase_ ^= 1;
+    if constexpr (Stages > 0) {
+      ++barrier_index_;
+      ++count_;
+      ++stage_index_;
+      if (stage_index_ == static_cast<int>(Stages)) {
+        stage_index_ = 0;
+      }
+      if (barrier_index_ == BarrierRingSize) {
+        barrier_index_ = 0;
+        phase_ ^= 1;
+      }
     }
   }
 
@@ -104,18 +108,23 @@ struct Mp31PipelineStateWarpSpecialized {
 
   MUTLASS_DEVICE
   Mp31PipelineStateWarpSpecialized& operator=(Mp31PipelineStateWarpSpecialized const& other) {
-    index_ = other.barrier_index();
-    phase_ = other.phase();
-    count_ = other.count();
+    stage_index_   = other.index();
+    barrier_index_ = other.barrier_index();
+    phase_         = other.phase();
+    count_         = other.count();
     return *this;
   }
 
   MUTLASS_DEVICE
   Mp31PipelineStateWarpSpecialized& advance(uint32_t num_iterations) {
-    uint32_t const next_index = uint32_t(index_) + num_iterations;
-    index_                    = next_index % BarrierRingSize;
-    phase_ ^= (next_index / BarrierRingSize) & 1;
-    count_ += num_iterations;
+    if constexpr (Stages > 0) {
+      uint32_t const next_barrier_index = barrier_index_ + num_iterations;
+      uint32_t const next_stage_index   = static_cast<uint32_t>(stage_index_) + num_iterations;
+      barrier_index_                    = next_barrier_index % BarrierRingSize;
+      stage_index_                      = next_stage_index % Stages;
+      phase_ ^= (next_barrier_index / BarrierRingSize) & 1;
+      count_ += num_iterations;
+    }
     return *this;
   }
 
@@ -128,10 +137,11 @@ struct Mp31PipelineStateWarpSpecialized {
 
 template <class Pipeline>
 MUTLASS_DEVICE typename Pipeline::PipelineState make_producer_start_state_warpspecialized() {
-  constexpr int      InitialProducerStage = 0;
-  constexpr uint32_t InitialProducerPhase = 1;
-  constexpr uint32_t InitialProducerCount = 0;
-  return {InitialProducerStage, InitialProducerPhase, InitialProducerCount};
+  constexpr int      InitialProducerStage   = 0;
+  constexpr uint32_t InitialProducerBarrier = 0;
+  constexpr uint32_t InitialProducerPhase   = 1;
+  constexpr uint32_t InitialProducerCount   = 0;
+  return {InitialProducerStage, InitialProducerBarrier, InitialProducerPhase, InitialProducerCount};
 }
 
 template <int MaxBarPerStageRatio_, int AdditionalBarrier_, int... PipelineStages_>

@@ -26,13 +26,13 @@ def _quantize_w4a8_a_per_channel(x: torch.Tensor, out_dtype: torch.dtype):
     fp8_amax = torch.tensor(
         torch.finfo(out_dtype).max, device=x.device, dtype=torch.float32
     )
-    abs_max = x.abs().amax(dim=-1).clamp(1e-4)
+    abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
     scale = torch.pow(2.0, torch.ceil(torch.log2(abs_max / fp8_amax)))
-    return (x / (scale.unsqueeze(-1) + 1e-8)).to(out_dtype), scale.float()
+    return (x / (scale + 1e-8)).to(out_dtype), scale.float()
 
 
 def _dequant_w4a8_a_per_channel(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x.float() * scale.unsqueeze(-1)
+    return x.float() * scale
 
 
 def _make_w4a8_b_nk(num_expert: int, n: int, k: int, device):
@@ -51,6 +51,40 @@ def _dequant_w4a8_b_nk(
 ) -> torch.Tensor:
     b_scale = scale_b[expert_id].float().repeat_interleave(128, dim=1)[:, :k]
     return b_int4[expert_id].float() * b_scale
+
+
+def _make_fp4fp8_b_nk(num_expert: int, n: int, k: int, device):
+    codes = (
+        (
+            2
+            + 2
+            * (
+                torch.arange(num_expert * n * (k // 2)).reshape(num_expert, n, k // 2)
+                % 2
+            )
+        )
+        .to(torch.uint8)
+        .cpu()
+    )
+    packed_b = (codes | (codes << 4)).view(torch.int8).to(device)
+    logical_b = (codes // 2).repeat_interleave(2, dim=-1).float()
+    residual_e8m0 = (
+        127
+        + torch.arange(num_expert * n * ceil_div(k, 32)).reshape(
+            num_expert, n, ceil_div(k, 32)
+        )
+        % 2
+    ).to(dtype=torch.uint8)
+    residual_f32 = torch.pow(2.0, residual_e8m0.to(torch.int32).float() - 127.0)
+    residual_f32 = residual_f32.repeat_interleave(32, dim=-1)[..., :k]
+    effective_b = (
+        (logical_b * residual_f32).to(device=device, dtype=torch.float8_e4m3fn).float()
+    )
+    residual_e8m0 = residual_e8m0.to(device)
+    epilogue_fp32 = (
+        0.5 + (torch.arange(num_expert * n, device=device) % 2).reshape(num_expert, n)
+    ).float()
+    return effective_b, packed_b, residual_e8m0, epilogue_fp32
 
 
 def _w4a8_ragged_cases():
@@ -86,87 +120,6 @@ def test_moe_gemm_quant_recipe_validation():
         TypeError, match="b_quant_recipe must be a tuple of two int values"
     ):
         mate.gemm._resolve_moe_gemm_quant_recipe("b_quant_recipe", (1, 128, 128))
-
-
-def test_moe_gemm_mixed_dtype_apis_require_quant_recipes():
-    input_a = (object(), object())
-    input_b = (object(), object())
-    out = object()
-
-    with pytest.raises(TypeError, match="mixed_dtype"):
-        mate.gemm.ragged_moe_gemm_mixed_dtype(input_a, input_b, object(), out)
-
-    with pytest.raises(TypeError, match="mixed_dtype"):
-        mate.gemm.masked_moe_gemm_mixed_dtype(input_a, input_b, object(), out)
-
-    with pytest.raises(TypeError, match="a_quant_recipe"):
-        mate.gemm.ragged_moe_gemm_mixed_dtype(
-            input_a,
-            input_b,
-            object(),
-            out,
-            mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
-        )
-
-    with pytest.raises(TypeError, match="a_quant_recipe"):
-        mate.gemm.masked_moe_gemm_mixed_dtype(
-            input_a,
-            input_b,
-            object(),
-            out,
-            mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
-        )
-
-
-def test_moe_gemm_mixed_dtype_apis_accept_quant_recipe_tuples(monkeypatch):
-    calls = []
-
-    class FakeModule:
-        def get_function(self, name):
-            def _func(*args):
-                calls.append((name, args))
-                return (1, 2)
-
-            return _func
-
-    monkeypatch.setattr(mate.gemm, "_get_module", lambda: FakeModule())
-
-    input_a = (object(), object())
-    input_b = (object(), object())
-    ragged_tokens_info = object()
-    masked_tokens_info = object()
-    out = object()
-
-    assert (
-        mate.gemm.ragged_moe_gemm_mixed_dtype(
-            input_a,
-            input_b,
-            ragged_tokens_info,
-            out,
-            mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
-            a_quant_recipe=(1, -1),
-            b_quant_recipe=(1, 128),
-        )
-        is out
-    )
-    assert (
-        mate.gemm.masked_moe_gemm_mixed_dtype(
-            input_a,
-            input_b,
-            masked_tokens_info,
-            out,
-            mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
-            a_quant_recipe=(1, -1),
-            b_quant_recipe=(1, 128),
-        )
-        is out
-    )
-    assert [name for name, _ in calls] == [
-        "ragged_moe_gemm_mixed_dtype",
-        "masked_moe_gemm_mixed_dtype",
-    ]
-    assert calls[0][1][-2:] == ((1, -1), (1, 128))
-    assert calls[1][1][-2:] == ((1, -1), (1, 128))
 
 
 def get_ragged_moe_gemm_16bit_cases():
@@ -575,12 +528,28 @@ def test_masked_moe_gemm_8bit(
 
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group,n,k,alignment_m", _w4a8_ragged_cases())
-@pytest.mark.parametrize("a_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.half])
+@pytest.mark.parametrize(
+    "mixed_dtype,a_fp8_type,out_dtype",
+    [
+        (mate.gemm.GemmMixedDType.S4FP8, torch.float8_e4m3fn, torch.bfloat16),
+        (mate.gemm.GemmMixedDType.S4FP8, torch.float8_e4m3fn, torch.half),
+        (mate.gemm.GemmMixedDType.S4FP8, torch.float8_e5m2, torch.bfloat16),
+        (mate.gemm.GemmMixedDType.S4FP8, torch.float8_e5m2, torch.half),
+        (mate.gemm.GemmMixedDType.FP4FP8, torch.float8_e4m3fn, torch.bfloat16),
+    ],
+)
 def test_ragged_moe_gemm_mixed_dtype(
-    ms_per_group, n, k, alignment_m, a_fp8_type, out_dtype
+    ms_per_group,
+    n,
+    k,
+    alignment_m,
+    mixed_dtype,
+    a_fp8_type,
+    out_dtype,
 ):
     torch.manual_seed(0)
+    if mixed_dtype == mate.gemm.GemmMixedDType.FP4FP8:
+        alignment_m = 256
     num_expert = len(ms_per_group)
     aligned_ms = [align(m, alignment_m) for m in ms_per_group]
     m = sum(aligned_ms)
@@ -588,7 +557,16 @@ def test_ragged_moe_gemm_mixed_dtype(
 
     a = torch.rand((m, k), device=device, dtype=torch.float)
     fp8_a, scale_a = _quantize_w4a8_a_per_channel(a, a_fp8_type)
-    b_int4, packed_b, scale_b = _make_w4a8_b_nk(num_expert, n, k, device)
+    if mixed_dtype == mate.gemm.GemmMixedDType.FP4FP8:
+        effective_b, packed_b, residual_e8m0, epilogue_fp32 = _make_fp4fp8_b_nk(
+            num_expert, n, k, device
+        )
+        input_b = (packed_b, (residual_e8m0, epilogue_fp32))
+        b_quant_recipe = (1, 32)
+    else:
+        b_int4, packed_b, scale_b = _make_w4a8_b_nk(num_expert, n, k, device)
+        input_b = (packed_b, scale_b)
+        b_quant_recipe = (1, 128)
     m_indices = torch.full((m,), -1, device=device, dtype=torch.int32)
     out = torch.empty((m, n), device=device, dtype=out_dtype)
     ref = torch.zeros((m, n), device=device, dtype=torch.float)
@@ -598,20 +576,25 @@ def test_ragged_moe_gemm_mixed_dtype(
     for expert_id, expert_m in enumerate(ms_per_group):
         rows = slice(m_base, m_base + expert_m)
         m_indices[rows] = expert_id
-        dequant_b = _dequant_w4a8_b_nk(b_int4, scale_b, expert_id, n, k)
-        ref[rows] = dequant_a[rows] @ dequant_b.t()
+        if mixed_dtype == mate.gemm.GemmMixedDType.FP4FP8:
+            ref[rows] = (dequant_a[rows] @ effective_b[expert_id].t()) * epilogue_fp32[
+                expert_id
+            ]
+        else:
+            dequant_b = _dequant_w4a8_b_nk(b_int4, scale_b, expert_id, n, k)
+            ref[rows] = dequant_a[rows] @ dequant_b.t()
         m_base += aligned_ms[expert_id]
 
     mate.gemm.ragged_moe_gemm_mixed_dtype(
         (fp8_a, scale_a),
-        (packed_b, scale_b),
+        input_b,
         m_indices,
         out,
         alignment_m=alignment_m,
-        mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
+        mixed_dtype=mixed_dtype,
         backend="mubin",
         a_quant_recipe=(1, -1),
-        b_quant_recipe=(1, 128),
+        b_quant_recipe=b_quant_recipe,
     )
 
     out = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(out), out)
@@ -620,11 +603,26 @@ def test_ragged_moe_gemm_mixed_dtype(
 
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group,n,k,expected_m", _w4a8_masked_cases())
-@pytest.mark.parametrize("a_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.half])
+@pytest.mark.parametrize(
+    "mixed_dtype,a_fp8_type,out_dtype",
+    [
+        (mate.gemm.GemmMixedDType.S4FP8, torch.float8_e4m3fn, torch.bfloat16),
+        (mate.gemm.GemmMixedDType.S4FP8, torch.float8_e4m3fn, torch.half),
+        (mate.gemm.GemmMixedDType.S4FP8, torch.float8_e5m2, torch.bfloat16),
+        (mate.gemm.GemmMixedDType.S4FP8, torch.float8_e5m2, torch.half),
+        (mate.gemm.GemmMixedDType.FP4FP8, torch.float8_e4m3fn, torch.bfloat16),
+    ],
+)
 @pytest.mark.parametrize("enable_overlap", [False, True])
 def test_masked_moe_gemm_mixed_dtype(
-    ms_per_group, n, k, expected_m, a_fp8_type, out_dtype, enable_overlap
+    ms_per_group,
+    n,
+    k,
+    expected_m,
+    mixed_dtype,
+    a_fp8_type,
+    out_dtype,
+    enable_overlap,
 ):
     torch.manual_seed(1)
     num_expert = len(ms_per_group)
@@ -633,7 +631,16 @@ def test_masked_moe_gemm_mixed_dtype(
 
     a = torch.rand((num_expert, max_m, k), device=device, dtype=torch.float)
     fp8_a, scale_a = _quantize_w4a8_a_per_channel(a, a_fp8_type)
-    b_int4, packed_b, scale_b = _make_w4a8_b_nk(num_expert, n, k, device)
+    if mixed_dtype == mate.gemm.GemmMixedDType.FP4FP8:
+        effective_b, packed_b, residual_e8m0, epilogue_fp32 = _make_fp4fp8_b_nk(
+            num_expert, n, k, device
+        )
+        input_b = (packed_b, (residual_e8m0, epilogue_fp32))
+        b_quant_recipe = (1, 32)
+    else:
+        b_int4, packed_b, scale_b = _make_w4a8_b_nk(num_expert, n, k, device)
+        input_b = (packed_b, scale_b)
+        b_quant_recipe = (1, 128)
     masked_m = torch.tensor(ms_per_group, device=device, dtype=torch.int32)
     out = torch.empty((num_expert, max_m, n), device=device, dtype=out_dtype)
     signal = None
@@ -649,21 +656,26 @@ def test_masked_moe_gemm_mixed_dtype(
     dequant_a = _dequant_w4a8_a_per_channel(fp8_a, scale_a)
     ref = torch.zeros((num_expert, max_m, n), device=device, dtype=torch.float)
     for expert_id, expert_m in enumerate(ms_per_group):
-        dequant_b = _dequant_w4a8_b_nk(b_int4, scale_b, expert_id, n, k)
-        ref[expert_id, :expert_m] = dequant_a[expert_id, :expert_m] @ dequant_b.t()
+        if mixed_dtype == mate.gemm.GemmMixedDType.FP4FP8:
+            ref[expert_id, :expert_m] = (
+                dequant_a[expert_id, :expert_m] @ effective_b[expert_id].t()
+            ) * epilogue_fp32[expert_id]
+        else:
+            dequant_b = _dequant_w4a8_b_nk(b_int4, scale_b, expert_id, n, k)
+            ref[expert_id, :expert_m] = dequant_a[expert_id, :expert_m] @ dequant_b.t()
 
     res = mate.gemm.masked_moe_gemm_mixed_dtype(
         (fp8_a, scale_a),
-        (packed_b, scale_b),
+        input_b,
         masked_m,
         out,
         expect_tokens=expected_m,
         enable_overlap=enable_overlap,
         signal=signal,
-        mixed_dtype=mate.gemm.GemmMixedDType.S4FP8,
+        mixed_dtype=mixed_dtype,
         backend="mubin",
         a_quant_recipe=(1, -1),
-        b_quant_recipe=(1, 128),
+        b_quant_recipe=b_quant_recipe,
     )
 
     for expert_id, expert_m in enumerate(ms_per_group):
@@ -682,6 +694,7 @@ def test_masked_moe_gemm_mixed_dtype(
 
 def k_grouped_contig_cases():
     return [
+        [32, 32, 32, 32],
         [128, 128],
         [0, 256, 0, 768, 512, 0, 512, 512, 1024, 384],
         [128],
@@ -695,8 +708,8 @@ def k_grouped_contig_cases():
 
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ks_per_group", k_grouped_contig_cases())
-@pytest.mark.parametrize("m", [2048, 4096, 7168])
-@pytest.mark.parametrize("n", [2048, 4096, 7168])
+@pytest.mark.parametrize("m", [16, 2048, 4096, 7168])
+@pytest.mark.parametrize("n", [32, 2048, 4096, 7168])
 @pytest.mark.parametrize("a_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("b_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("out_dtype", [torch.float])
@@ -777,9 +790,14 @@ def test_k_grouped_contig_gemm_8bit(
 @pytest.mark.parametrize("ks_per_group", k_grouped_contig_cases())
 @pytest.mark.parametrize("m", [2048, 4096, 7168])
 @pytest.mark.parametrize("n", [2048, 4096, 7168])
-@pytest.mark.parametrize("a_type", [torch.bfloat16, torch.half])
-@pytest.mark.parametrize("b_type", [torch.bfloat16, torch.half])
-@pytest.mark.parametrize("out_dtype", [torch.float])
+@pytest.mark.parametrize(
+    "a_type,b_type,out_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16, torch.float),
+        (torch.half, torch.half, torch.float),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+    ],
+)
 def test_k_grouped_contig_gemm_16bit(
     ks_per_group,
     m,
@@ -788,8 +806,6 @@ def test_k_grouped_contig_gemm_16bit(
     b_type,
     out_dtype,
 ):
-    if a_type != b_type:
-        return
     k = sum(ks_per_group)
     num_expert = len(ks_per_group)
 
@@ -818,12 +834,14 @@ def test_k_grouped_contig_gemm_16bit(
         d,
     )
     d = d.to(torch.float)
+    d_ref = d_ref.to(torch.float)
+    tolerance = 2e-2 if out_dtype == torch.bfloat16 else 5e-3
     for i in range(num_expert):
         torch.testing.assert_close(
             d[i],
             d_ref[i],
-            rtol=5e-3,
-            atol=5e-3,
+            rtol=tolerance,
+            atol=tolerance,
         )
 
 

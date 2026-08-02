@@ -1,9 +1,12 @@
 {
-  "latest": "0.2.4",
+  "latest": "0.2.5",
   "versions": [
     {
-      "version": "0.2.4",
+      "version": "0.2.5",
       "aliases": ["latest"]
+    },
+    {
+      "version": "0.2.4"
     },
     {
       "version": "0.2.3",

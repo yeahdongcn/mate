@@ -10,6 +10,8 @@ from ...core import JitSpec, gen_jit_spec
 from ...utils import EXPORT_FUNC, TVM_HEADER, dtype_torch2mutlass_map
 from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
 from .fmha_utils import (
+    _ELEMENT_NAME_SUFFIX,
+    _FP8_DTYPES,
     FMHA_EXTRA_CUDA_CFLAGS,
     _get_fwd_kernel_config as _get_metadata_kernel_config,
     fmha_extra_include_paths,
@@ -25,13 +27,7 @@ def _fmha_get_metadata_encode(config: Mapping[str, object]) -> str:
     head_ratio = config["head_ratio"]
     num_warps = config["num_warps"]
     name_list.append(f"{head_ratio}x{num_warps}")
-    name_list.append(
-        "fp8"
-        if config["element"] in ("mutlass::float_e4m3_t",)
-        else "bf16"
-        if config["element"] in ("mutlass::bfloat16_t",)
-        else "fp16"
-    )
+    name_list.append(_ELEMENT_NAME_SUFFIX[str(config["element"])])
 
     if config["has_seqused_q"]:
         mode_q = "padded_q"
@@ -387,7 +383,7 @@ def _fmha_get_metadata(
         element_size,
         kernel_packgqa,
         has_qv,
-        qkv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2],
+        qkv_dtype in _FP8_DTYPES,
     )
 
     packgqa = enable_packgqa if kernel_packgqa is None else kernel_packgqa

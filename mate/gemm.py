@@ -1,6 +1,6 @@
 import functools
 from enum import Enum
-from typing import Literal, Optional, Tuple, cast
+from typing import Literal, Optional, Tuple, Union, cast
 
 import torch
 
@@ -12,6 +12,19 @@ from mate.jit.gemm.deep_gemm.gemm import (
     get_deep_gemm_gemm_module,
 )
 from mate.jit.gemm_ops import get_gemm_ops_module
+from mate.jit.mubin.gemm import (
+    groupwise_gemm_8bit_fp8output_mubin,
+    m_grouped_contig_gemm_16bit_mubin,
+    m_grouped_contig_gemm_8bit_mubin,
+    masked_moe_gemm_16bit_mubin,
+    masked_moe_gemm_8bit_mubin,
+    masked_moe_gemm_w4a8_mubin,
+    ragged_k_moe_gemm_16bit_mubin,
+    ragged_k_moe_gemm_8bit_mubin,
+    ragged_moe_gemm_16bit_mubin,
+    ragged_moe_gemm_8bit_mubin,
+    ragged_moe_gemm_w4a8_mubin,
+)
 from mate.mate_runtime import resolve_num_mps
 from mate.utils import ceil_div
 
@@ -23,6 +36,7 @@ def _get_module():
 
 class GemmMixedDType(str, Enum):
     S4FP8 = "s4fp8"
+    FP4FP8 = "fp4fp8"
 
 
 def _resolve_gemm_mixed_dtype(
@@ -136,7 +150,7 @@ def ragged_m_moe_gemm_16bit(
                 resolve_num_mps(input_a.device, num_mp),
             )
         else:
-            _get_module().get_function("ragged_moe_gemm_16bit")(
+            ragged_moe_gemm_16bit_mubin(
                 input_a,
                 input_b,
                 ragged_tokens_info,
@@ -144,6 +158,7 @@ def ragged_m_moe_gemm_16bit(
                 False,
                 None,
                 alignment_m,
+                num_mp,
             )
     elif gemm_mode == "per_expert":
         if backend == "mutlass":
@@ -162,7 +177,7 @@ def ragged_m_moe_gemm_16bit(
                 resolve_num_mps(input_a.device, num_mp),
             )
         else:
-            _get_module().get_function("m_grouped_contig_gemm_16bit")(
+            m_grouped_contig_gemm_16bit_mubin(
                 input_a,
                 input_b,
                 ragged_tokens_info,
@@ -270,7 +285,7 @@ def masked_moe_gemm_16bit(
         )
         return out
 
-    res = _get_module().get_function("masked_moe_gemm_16bit")(
+    res = masked_moe_gemm_16bit_mubin(
         a,
         b,
         masked_tokens_info,
@@ -381,13 +396,14 @@ def ragged_m_moe_gemm_8bit(
                 resolve_num_mps(a_fp8.device, num_mp),
             )
         else:
-            _get_module().get_function("ragged_moe_gemm_8bit")(
+            ragged_moe_gemm_8bit_mubin(
                 input_a,
                 input_b,
                 ragged_tokens_info,
                 scale_granularity_mnk,
                 out,
                 alignment_m,
+                num_mp,
             )
     elif gemm_mode == "per_expert":
         if backend == "mutlass":
@@ -410,7 +426,7 @@ def ragged_m_moe_gemm_8bit(
                 resolve_num_mps(a_fp8.device, num_mp),
             )
         else:
-            _get_module().get_function("m_grouped_contig_gemm_8bit")(
+            m_grouped_contig_gemm_8bit_mubin(
                 input_a,
                 input_b,
                 ragged_tokens_info,
@@ -536,7 +552,7 @@ def masked_moe_gemm_8bit(
         )
         return out
 
-    res = _get_module().get_function("masked_moe_gemm_8bit")(
+    res = masked_moe_gemm_8bit_mubin(
         input_a,
         input_b,
         masked_tokens_info,
@@ -552,7 +568,10 @@ def masked_moe_gemm_8bit(
 @mate_api
 def ragged_moe_gemm_mixed_dtype(
     input_a: Tuple[torch.Tensor, torch.Tensor],
-    input_b: Tuple[torch.Tensor, torch.Tensor],
+    input_b: Tuple[
+        torch.Tensor,
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    ],
     ragged_tokens_info: torch.Tensor,
     out: torch.Tensor,
     alignment_m: Optional[int] = None,
@@ -567,8 +586,9 @@ def ragged_moe_gemm_mixed_dtype(
 
     This function computes matrix multiplication between mixed-dtype tensors for MoE models
     where different experts may have variable numbers of tokens assigned to them.
-    Currently, only ``GemmMixedDType.S4FP8`` is supported, where S4 refers to
-    signed int4 weights for input B and FP8 refers to fp8 activations for input A.
+    ``GemmMixedDType.S4FP8`` selects signed int4 weights, while
+    ``GemmMixedDType.FP4FP8`` selects E2M1 FP4 weights. Both use FP8
+    activations for input A.
     The quantization recipes describe quantization block sizes for input A and
     input B separately, and must be provided explicitly.
 
@@ -577,42 +597,42 @@ def ragged_moe_gemm_mixed_dtype(
     input_a : Tuple[Tensor, Tensor]
         Tuple containing (activation_tensor, scale_tensor) for input A.
         **activation_tensor** has shape ``(total_tokens, hidden_size)``. Its dtype
-        is selected by ``mixed_dtype``. For ``GemmMixedDType.S4FP8``, it should
-        be of fp8 (e4m3/e5m2) type.
+        is selected by ``mixed_dtype``. S4FP8 accepts E4M3 or E5M2; FP4FP8
+        requires E4M3.
         **scale_tensor** shape and dtype are selected by ``a_quant_recipe``. For
-        ``a_quant_recipe=(1, -1)``, it has shape ``(total_tokens,)``.
-    input_b : Tuple[Tensor, Tensor]
-        Tuple containing (weight_tensor, scale_tensor) for input B.
-        **weight_tensor** storage shape, dtype, and layout are selected by
-        ``mixed_dtype``.
-        **scale_tensor** shape and dtype are selected by ``b_quant_recipe``. For
-        ``b_quant_recipe=(1, 128)``, it has shape ``(num_expert,
-        out_hidden_size, ceil_div(hidden_size, 128))``.
+        ``a_quant_recipe=(1, -1)``, it has shape ``(total_tokens, 1)``.
+    input_b : Tuple[Tensor, Union[Tensor, Tuple[Tensor, Tensor]]]
+        For S4FP8, scales is one BF16 tensor with shape ``(num_expert,
+        out_hidden_size, ceil_div(hidden_size, 128))``. For FP4FP8, scales is
+        ``(residual_e8m0, epilogue_fp32)`` with shapes ``(num_expert,
+        out_hidden_size, ceil_div(hidden_size, 32))`` and ``(num_expert,
+        out_hidden_size)``.
     ragged_tokens_info : Tensor
         Tensor indicating which expert each token belongs to, with shape ``(total_tokens,)``.
         Values represent expert indices, with ``-1`` for unused positions.
     out : Tensor
         Output tensor with shape ``(total_tokens, out_hidden_size)``.
-        Should be of fp16 or bf16 type.
+        S4FP8 supports FP16 or BF16; FP4FP8 requires BF16.
     alignment_m : Optional[int]
-        Alignment requirement for total_tokens (m) dimension. Must be 128 or 256.
-        Default is 128.
+        S4FP8 accepts 128 or 256 and defaults to 128. FP4FP8 requires 256 and
+        defaults to 256.
     mixed_dtype : GemmMixedDType or str
         Mixed dtype selector for input A and input B. Must be provided explicitly.
         ``GemmMixedDType.S4FP8`` and ``"s4fp8"`` mean signed int4 weights for
         input B and fp8 activations for input A.
+        ``GemmMixedDType.FP4FP8`` and ``"fp4fp8"`` mean E2M1 FP4 weights and
+        E4M3 activations.
     backend : Optional[str]
         Backend selector. Only ``"auto"`` and ``"mubin"`` are supported.
     a_quant_recipe : Tuple[int, int]
         Quantization block-size recipe for input A. The tuple is interpreted as
         ``(m, k)``. ``-1`` means the corresponding axis is not split into
-        smaller quantization blocks. Currently, only ``(1, -1)`` is supported
-        for ``GemmMixedDType.S4FP8``.
+        smaller quantization blocks. Currently, only ``(1, -1)`` is supported.
     b_quant_recipe : Tuple[int, int]
         Quantization block-size recipe for input B. The tuple is interpreted as
         ``(n, k)``. ``-1`` means the corresponding axis is not split into
-        smaller quantization blocks. Currently, only ``(1, 128)`` is supported
-        for ``GemmMixedDType.S4FP8``.
+        smaller quantization blocks. S4FP8 uses ``(1, 128)`` and FP4FP8 uses
+        ``(1, 32)``.
 
     Returns
     -------
@@ -620,9 +640,6 @@ def ragged_moe_gemm_mixed_dtype(
         Result tensor with shape ``(total_tokens, out_hidden_size)`` containing the GEMM output in fp16 or bf16 data type.
 
     """
-    if alignment_m is None:
-        alignment_m = 128
-
     backend = cast(
         Literal["auto", "mubin"],
         resolve_backend(backend, supported=("mubin",), default="auto"),
@@ -630,29 +647,32 @@ def ragged_moe_gemm_mixed_dtype(
     if backend == "auto":
         backend = "mubin"
     mixed_dtype = _resolve_gemm_mixed_dtype(mixed_dtype)
+    if alignment_m is None:
+        alignment_m = 256 if mixed_dtype == GemmMixedDType.FP4FP8 else 128
     a_quant_recipe = _resolve_moe_gemm_quant_recipe("a_quant_recipe", a_quant_recipe)
     b_quant_recipe = _resolve_moe_gemm_quant_recipe("b_quant_recipe", b_quant_recipe)
-    if not (
-        mixed_dtype == GemmMixedDType.S4FP8
-        and a_quant_recipe == (1, -1)
-        and b_quant_recipe == (1, 128)
-        and backend == "mubin"
+    expected_b_recipe = (1, 32) if mixed_dtype == GemmMixedDType.FP4FP8 else (1, 128)
+    valid_alignments = (256,) if mixed_dtype == GemmMixedDType.FP4FP8 else (128, 256)
+    if (
+        a_quant_recipe != (1, -1)
+        or b_quant_recipe != expected_b_recipe
+        or backend != "mubin"
+        or alignment_m not in valid_alignments
     ):
         raise NotImplementedError(
             f"mixed_dtype={mixed_dtype.value}, a_quant_recipe={a_quant_recipe}, "
             f"b_quant_recipe={b_quant_recipe}, backend={backend} is not supported"
         )
 
-    packed_b, scale_b = input_b
-    _get_module().get_function("ragged_moe_gemm_mixed_dtype")(
+    ragged_moe_gemm_w4a8_mubin(
         input_a,
-        packed_b,
-        scale_b,
+        input_b,
         ragged_tokens_info,
         out,
         alignment_m,
         a_quant_recipe,
         b_quant_recipe,
+        mixed_dtype=mixed_dtype.value,
     )
     return out
 
@@ -660,7 +680,10 @@ def ragged_moe_gemm_mixed_dtype(
 @mate_api
 def masked_moe_gemm_mixed_dtype(
     input_a: Tuple[torch.Tensor, torch.Tensor],
-    input_b: Tuple[torch.Tensor, torch.Tensor],
+    input_b: Tuple[
+        torch.Tensor,
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    ],
     masked_tokens_info: torch.Tensor,
     out: torch.Tensor,
     expect_tokens: Optional[int] = None,
@@ -677,9 +700,9 @@ def masked_moe_gemm_mixed_dtype(
 
     This function computes matrix multiplication between mixed-dtype tensors for MoE models
     where different experts may have variable numbers of tokens, using a mask to indicate
-    the actual number of tokens per expert. Currently, only ``GemmMixedDType.S4FP8`` is
-    supported, where S4 refers to signed int4 weights for input B and FP8 refers to
-    fp8 activations for input A.
+    the actual number of tokens per expert. ``GemmMixedDType.S4FP8`` selects
+    signed int4 weights, while ``GemmMixedDType.FP4FP8`` selects E2M1 FP4
+    weights.
     The quantization recipes describe quantization block sizes for input A and
     input B separately, and must be provided explicitly.
 
@@ -688,23 +711,21 @@ def masked_moe_gemm_mixed_dtype(
     input_a : Tuple[Tensor, Tensor]
         Tuple containing (activation_tensor, scale_tensor) for input A.
         **activation_tensor** has shape ``(num_expert, max_tokens, hidden_size)``.
-        Its dtype is selected by ``mixed_dtype``. For ``GemmMixedDType.S4FP8``,
-        it should be of fp8 (e4m3/e5m2) type.
+        Its dtype is selected by ``mixed_dtype``. S4FP8 accepts E4M3 or E5M2;
+        FP4FP8 requires E4M3.
         **scale_tensor** shape and dtype are selected by ``a_quant_recipe``. For
-        ``a_quant_recipe=(1, -1)``, it has shape ``(num_expert, max_tokens)``.
-    input_b : Tuple[Tensor, Tensor]
-        Tuple containing (weight_tensor, scale_tensor) for input B.
-        **weight_tensor** storage shape, dtype, and layout are selected by
-        ``mixed_dtype``.
-        **scale_tensor** shape and dtype are selected by ``b_quant_recipe``. For
-        ``b_quant_recipe=(1, 128)``, it has shape ``(num_expert,
-        out_hidden_size, ceil_div(hidden_size, 128))``.
+        ``a_quant_recipe=(1, -1)``, it has shape ``(num_expert, max_tokens, 1)``.
+    input_b : Tuple[Tensor, Union[Tensor, Tuple[Tensor, Tensor]]]
+        For S4FP8, scales is one BF16 tensor. For FP4FP8, scales is
+        ``(residual_e8m0, epilogue_fp32)`` with shapes ``(num_expert,
+        out_hidden_size, ceil_div(hidden_size, 32))`` and ``(num_expert,
+        out_hidden_size)``.
     masked_tokens_info : Tensor
         Tensor indicating the actual number of tokens for each expert, with shape ``(num_expert,)``.
         Values represent token counts for each expert.
     out : Tensor
         Output tensor with shape ``(num_expert, max_tokens, out_hidden_size)``.
-        Should be of fp16 or bf16 type.
+        S4FP8 supports FP16 or BF16; FP4FP8 requires BF16.
     expect_tokens : Optional[int]
         Expected number of tokens. If None, defaults to 0.
     enable_overlap : Optional[bool]
@@ -717,18 +738,19 @@ def masked_moe_gemm_mixed_dtype(
         Mixed dtype selector for input A and input B. Must be provided explicitly.
         ``GemmMixedDType.S4FP8`` and ``"s4fp8"`` mean signed int4 weights for
         input B and fp8 activations for input A.
+        ``GemmMixedDType.FP4FP8`` and ``"fp4fp8"`` mean E2M1 FP4 weights and
+        E4M3 activations.
     backend : Optional[str]
         Backend selector. Only ``"auto"`` and ``"mubin"`` are supported.
     a_quant_recipe : Tuple[int, int]
         Quantization block-size recipe for input A. The tuple is interpreted as
         ``(m, k)``. ``-1`` means the corresponding axis is not split into
-        smaller quantization blocks. Currently, only ``(1, -1)`` is supported
-        for ``GemmMixedDType.S4FP8``.
+        smaller quantization blocks. Currently, only ``(1, -1)`` is supported.
     b_quant_recipe : Tuple[int, int]
         Quantization block-size recipe for input B. The tuple is interpreted as
         ``(n, k)``. ``-1`` means the corresponding axis is not split into
-        smaller quantization blocks. Currently, only ``(1, 128)`` is supported
-        for ``GemmMixedDType.S4FP8``.
+        smaller quantization blocks. S4FP8 uses ``(1, 128)`` and FP4FP8 uses
+        ``(1, 32)``.
 
     Returns
     -------
@@ -754,11 +776,11 @@ def masked_moe_gemm_mixed_dtype(
     mixed_dtype = _resolve_gemm_mixed_dtype(mixed_dtype)
     a_quant_recipe = _resolve_moe_gemm_quant_recipe("a_quant_recipe", a_quant_recipe)
     b_quant_recipe = _resolve_moe_gemm_quant_recipe("b_quant_recipe", b_quant_recipe)
-    if not (
-        mixed_dtype == GemmMixedDType.S4FP8
-        and a_quant_recipe == (1, -1)
-        and b_quant_recipe == (1, 128)
-        and backend == "mubin"
+    expected_b_recipe = (1, 32) if mixed_dtype == GemmMixedDType.FP4FP8 else (1, 128)
+    if (
+        a_quant_recipe != (1, -1)
+        or b_quant_recipe != expected_b_recipe
+        or backend != "mubin"
     ):
         raise NotImplementedError(
             f"mixed_dtype={mixed_dtype.value}, a_quant_recipe={a_quant_recipe}, "
@@ -779,17 +801,16 @@ def masked_moe_gemm_mixed_dtype(
             device=a.device,
         )
 
-    packed_b, scale_b = input_b
-    res = _get_module().get_function("masked_moe_gemm_mixed_dtype")(
+    res = masked_moe_gemm_w4a8_mubin(
         input_a,
-        packed_b,
-        scale_b,
+        input_b,
         masked_tokens_info,
         out,
         expect_tokens,
         signal,
         a_quant_recipe,
         b_quant_recipe,
+        mixed_dtype=mixed_dtype.value,
     )
 
     return (out, signal, res[0], res[1]) if enable_overlap else out
@@ -865,7 +886,7 @@ def ragged_k_moe_gemm_8bit(
         "k_grouped_contig_gemm_8bit only support TN layout"
     )
 
-    _get_module().get_function("k_grouped_contig_gemm_8bit")(
+    ragged_k_moe_gemm_8bit_mubin(
         input_a,
         input_b,
         ragged_tokens_info,
@@ -879,8 +900,8 @@ def ragged_k_moe_gemm_8bit(
 
 @mate_api
 def ragged_k_moe_gemm_16bit(
-    input_a: Tuple[torch.Tensor, torch.Tensor],
-    input_b: Tuple[torch.Tensor, torch.Tensor],
+    input_a: torch.Tensor,
+    input_b: torch.Tensor,
     ragged_tokens_info: torch.Tensor,
     out: torch.Tensor,
     gemm_mode: Optional[Literal["per_expert"]] = "per_expert",
@@ -897,15 +918,14 @@ def ragged_k_moe_gemm_16bit(
     Parameters
     ----------
     input_a : Tensor
-        Input tensor A with shape ``(total_tokens, hidden_size)`` in fp16/bf16 format.
+        Input tensor A with shape ``(sum(ks), m)`` in FP16 or BF16 format.
     input_b : Tensor
-        Input tensor B with shape ``(num_expert, out_hidden_size, hidden_size)`` in fp16/bf16 format.
+        Input tensor B with shape ``(sum(ks), n)`` and the same dtype as A.
     ragged_tokens_info : Tensor
-        Tensor indicating the actual number of tokens for each expert, with shape ``(num_expert,)``.
-        Values represent token counts for each expert.
+        Per-expert K lengths with shape ``(num_expert,)``.
     out : Tensor
-        Output tensor with shape ``(num_expert, max_tokens, out_hidden_size)``.
-        Should be of float type. Should not be None.
+        Output tensor with shape ``(num_expert, m, n)``. FP32 is supported for
+        FP16/BF16 inputs; BF16 output requires BF16 inputs.
     gemm_mode : Optional[str],
         Indicating different meaning of ragged_tokens_info.
     major_a_mode : Optional[str]
@@ -919,7 +939,7 @@ def ragged_k_moe_gemm_16bit(
 
     Returns
     -------
-    Result tensor with shape ``(num_experts, total_tokens, out_hidden_size)`` containing the GEMM output in float data type,
+    Result tensor with shape ``(num_expert, m, n)`` containing the GEMM output in FP32 or BF16,
     Representing D = D + A * B for each expert
 
     """
@@ -930,10 +950,10 @@ def ragged_k_moe_gemm_16bit(
         major_b_mode = "N"
 
     assert major_a_mode == "M" and major_b_mode == "N", (
-        "k_grouped_contig_gemm_8bit only support TN layout"
+        "k_grouped_contig_gemm_16bit only supports TN layout"
     )
 
-    _get_module().get_function("k_grouped_contig_gemm_16bit")(
+    ragged_k_moe_gemm_16bit_mubin(
         input_a,
         input_b,
         ragged_tokens_info,
@@ -1258,7 +1278,7 @@ def gemm_fp8_nt_groupwise(
             raise ValueError("out must be contiguous at the last dimension")
 
     if output_scale is not None:
-        _get_module().get_function("groupwise_gemm_8bit_fp8output")(
+        groupwise_gemm_8bit_fp8output_mubin(
             (a, a_scale),
             (b, b_scale),
             scale_granularity_mnk,

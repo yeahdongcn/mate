@@ -10,7 +10,6 @@ import functools
 import tilelang
 import tilelang.language as T
 import torch
-
 from tvm import tir
 
 __all__ = ["run_gated_delta_rule_decode_vk_fp32"]
@@ -229,7 +228,7 @@ def _build_decode_fp32_vk_kernel_factory(
                     [num_v_tiles_per_block * v_tile], output_dtype
                 )
                 value_tile = T.alloc_shared([dim_v], "float32")
-                state_store_tile = T.alloc_shared([v_tile, dim_k], "float32")
+                state_store_stage = T.alloc_shared([2, v_tile, dim_k], "float32")
 
                 q_reg = T.alloc_local([vec_size], "float32")
                 k_reg = T.alloc_local([vec_size], "float32")
@@ -331,9 +330,13 @@ def _build_decode_fp32_vk_kernel_factory(
 
                         # Store the previous updated state tile.
                         if local_v_tile > 0:
+                            # Keep one TME store overlapped with compute, but wait before
+                            # reusing its shared-memory stage two iterations later.
+                            if local_v_tile > 1:
+                                tir.call_extern("void", "__musa_tme_store_read_wait")
                             global_prev_v_base = global_v_base - v_tile
                             T.copy(
-                                state_store_tile[:, :],
+                                state_store_stage[(local_v_tile - 1) % 2, :, :],
                                 state[
                                     state_slot,
                                     hid,
@@ -345,7 +348,7 @@ def _build_decode_fp32_vk_kernel_factory(
                                 outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                             )
                             tir.call_extern("void", "__musa_tme_store_commit")
-                            # Tma arrive only fences the issuing warp; sync before reusing smem.
+                            # Keep the CTA in step after the issuing warp commits the store.
                             T.sync_threads()
 
                         T.mbarrier_wait_parity(
@@ -382,7 +385,9 @@ def _build_decode_fp32_vk_kernel_factory(
 
                             # Stage updated state for the next TME store.
                             for i in T.vectorized(vec_size):
-                                state_store_tile[row_idx, k_start + i] = h_reg[i]
+                                state_store_stage[
+                                    local_v_tile % 2, row_idx, k_start + i
+                                ] = h_reg[i]
 
                             for offset in T.unroll(5):
                                 mask = 16 >> offset
@@ -412,7 +417,7 @@ def _build_decode_fp32_vk_kernel_factory(
                         start_v_tile + num_v_tiles_per_block - 1
                     ) * v_tile
                     T.copy(
-                        state_store_tile[:, :],
+                        state_store_stage[(num_v_tiles_per_block - 1) % 2, :, :],
                         state[
                             state_slot,
                             hid,

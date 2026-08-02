@@ -7,9 +7,9 @@ MATE (**M**USA **A**I **T**ensor **E**ngine) is a centralized library for Genera
 ## Highlights
 
 - High-performance attention and GEMM operators for MUSA
-- Mixed-dtype W4A8 MoE GEMM APIs for ragged and masked MoE paths in `0.2.4`
+- Mixed-dtype W4A8 MoE GEMM APIs for ragged and masked MoE paths.
 - Compatibility wrappers for `flash_attn_3`, `sageattention`, `flash_mla`,
-  `flash_kda`, and `deep-gemm`
+  `flash_kda`, `msa` and `deep-gemm`
 - CLI tools for environment checks, configuration inspection, and replay
 
 ## Requirements
@@ -64,6 +64,17 @@ python -m pip install mate \
   --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 ```
 
+Install the optional pre-generated kernel package to avoid lazy artifact
+downloads and prepare for offline use:
+
+```bash
+mate install-mubin-wheel
+```
+
+The command installs the `mate-mubin` wheel matching the installed MATE
+version. If that wheel is unavailable, `mate download-mubin` provides the
+existing artifact-cache alternative.
+
 Use exactly one package index per install step. Do not mix the MUSA wheel
 source with a public PyPI mirror in the same `pip install` invocation.
 
@@ -82,6 +93,25 @@ python -m build --wheel --no-isolation
 python -m pip install --no-deps dist/mate-*.whl
 ```
 
+### Build the Optional MUBIN Package
+
+Build and install the version-matched package containing the pre-generated
+kernel maps and `.o` artifacts:
+
+```bash
+cd mate-mubin
+python -m build --no-isolation --wheel
+python -m pip install --no-deps dist/mate_mubin-*.whl
+```
+
+The build backend downloads and verifies the complete pinned artifact payload.
+To build from an existing cache instead, point `MATE_MUBIN_SOURCE_DIR` at the
+cache root before running the build:
+
+```bash
+export MATE_MUBIN_SOURCE_DIR=/absolute/path/to/mate-mubin-cache
+```
+
 See [`docs/source/install.rst`](docs/source/install.rst) for the full
 wheel-source workflow, wrapper package commands, `PIP_INDEX_URL`, `pip config`,
 `pip index versions`, direct wheel URLs, and local AOT build options.
@@ -96,6 +126,7 @@ dependency automatically.
 | --- | --- | --- | --- |
 | `wrappers/flash-attention` | `flash_attn_3` | `flash_attn_interface` | FlashAttention-3 style integration |
 | `wrappers/FlashMLA` | `flash_mla` | `flash_mla` | FlashMLA style integration |
+| `wrappers/MSA` | `fmha_sm100` | `fmha_sm100` | MSA fmha_sm100 style integration |
 | `wrappers/FlashKDA` | `flash_kda` | `flash_kda` | FlashKDA style integration |
 | `wrappers/DeepGEMM` | `deep-gemm` | `deep_gemm` | DeepGEMM style integration |
 | `wrappers/SageAttention` | `sageattention` | `sageattention` | SageAttention style integration |
@@ -132,6 +163,10 @@ MATE provides a command-line interface for configuration, debugging, diagnostics
 | `mate check` | Validate the runtime environment |
 | `mate show-config` | Display installation and runtime configuration |
 | `mate env` | Show relevant environment variables |
+| `mate install-mubin-wheel` | Install the matching pre-generated kernel artifact wheel |
+| `mate download-mubin` | Download the complete MUBIN payload into the artifact cache |
+| `mate list-mubins` | Show the active MUBIN source and status by module |
+| `mate clear-mubin` | Remove the configured downloaded MUBIN cache |
 | `mate guard-run -- COMMAND` | Run a workload with the guarded MUSA allocator installed at startup |
 | `mate replay --dir PATH` | Replay API calls from Level 10 dumps |
 | `mate list-dumps PATH` | List recorded dump directories |
@@ -142,6 +177,8 @@ Example:
 mate check
 mate show-config
 mate env
+mate install-mubin-wheel
+mate list-mubins
 mate guard-run -- python your_script.py
 mate replay --dir mate_dumps/
 mate list-dumps mate_dumps/
@@ -160,6 +197,7 @@ MATE includes a guarded MUSA allocator that can replace the default `torch_musa`
 | Path | Purpose |
 | --- | --- |
 | `mate/` | Core Python package and public APIs |
+| `mate-mubin/` | Optional wheel containing pre-generated MUBIN artifacts |
 | `wrappers/` | Compatibility wrapper packages for existing Python ecosystems |
 | `docs/` | Markdown docs and Sphinx sources |
 | `tests/` | Correctness and integration tests |

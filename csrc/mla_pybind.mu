@@ -161,21 +161,6 @@ void dispatch_mla_kernel(ffi::TensorView q_nope,
       <<<grid_dim, MlaKernel::MaxThreadsPerBlock, MlaKernel::SharedStorageSize, stream>>>(params);
 }
 
-void flash_mla_asm(ffi::TensorView                q_nope,
-                   ffi::TensorView                q_pe,
-                   ffi::TensorView                ckv,
-                   ffi::TensorView                kpe,
-                   ffi::TensorView                seqlens_k,
-                   ffi::TensorView                block_table,
-                   ffi::TensorView                tile_scheduler_metadata,
-                   ffi::TensorView                num_splits,
-                   ffi::TensorView                out,
-                   ffi::TensorView                out_lse,
-                   double                         softmax_scale,
-                   bool                           is_causal,
-                   ffi::Optional<ffi::TensorView> cu_seqlens_q,
-                   ffi::Optional<int64_t>         max_seqlen_q);
-
 void mla(ffi::TensorView q_nope,
          ffi::TensorView q_pe,
          ffi::TensorView ckv,
@@ -849,112 +834,6 @@ ffi::Array<ffi::Any> get_mla_decoding_metadata(ffi::Optional<ffi::TensorView> se
   return ffi::Array<ffi::Any>{ffi::Any(tile_scheduler_metadata_result), ffi::Any(num_splits_result)};
 }
 
-void dispatch_mla_impl_for_fa_interface(ffi::TensorView                q_nope,
-                                        ffi::TensorView                q_pe,
-                                        ffi::TensorView                ckv,
-                                        ffi::TensorView                kpe,
-                                        ffi::TensorView                seqlens_k,
-                                        ffi::TensorView                block_table,
-                                        double                         softmax_scale,
-                                        bool                           is_causal,
-                                        ffi::Optional<ffi::TensorView> cu_seqlens_q,
-                                        ffi::Optional<int64_t>         max_seqlen_q,
-                                        ffi::TensorView                out,
-                                        ffi::TensorView                softmax_lse,
-                                        ffi::Optional<ffi::TensorView> workspace,
-                                        bool                           is_inited) {
-  const int  num_heads_q  = static_cast<int>(q_nope.size(-2));
-  const bool is_varlen_q  = cu_seqlens_q.has_value();
-  const int  seqlen_q     = !is_varlen_q ? static_cast<int>(q_nope.size(1)) : static_cast<int>(max_seqlen_q.value());
-  const int  num_heads_k  = ckv.dim() == 4 ? static_cast<int>(ckv.size(-2)) : 1;
-  const int  q_seq_per_hk = seqlen_q * num_heads_q / num_heads_k;
-  const int  batch_size   = static_cast<int>(seqlens_k.size(0));
-
-  check_mp31(q_nope.device(), "dispatch_mla_impl_for_fa_interface");
-  CHECK_HAS_VALUE_WITH_MSG(workspace, "workspace must be provided");
-  CHECK_MUSA(workspace.value());
-  CHECK_CONTIGUOUS(workspace.value());
-  CHECK_DEVICE(workspace.value(), q_nope);
-  CHECK_DIM(1, workspace.value());
-  CHECK_INPUT_TYPE(workspace.value(), dl_uint8);
-  if (is_varlen_q) {
-    CHECK_HAS_VALUE_WITH_MSG(max_seqlen_q, "max_seqlen_q must be provided when cu_seqlens_q is provided");
-  }
-
-  musaDeviceProp dprops{};
-  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, q_nope.device().device_id));
-  DecodingAttnImplMeta attn_impl_meta = get_attn_impl_meta({dprops.major, dprops.minor},
-                                                           dprops.multiProcessorCount,
-                                                           q_seq_per_hk,
-                                                           num_heads_k,
-                                                           ffi::Optional<int64_t>(),
-                                                           false,
-                                                           false);
-
-  const int64_t metadata_bytes =
-      static_cast<int64_t>(attn_impl_meta.num_mp_parts) * mate::flash_mla::TileSchedulerMetaDataSize * sizeof(int32_t);
-  const int64_t num_splits_bytes = static_cast<int64_t>(batch_size + 1) * sizeof(int32_t);
-  TVM_FFI_ICHECK_GE(workspace.value().numel(), metadata_bytes + num_splits_bytes)
-      << "workspace is too small for MLA scheduler metadata";
-
-  StridedTensorView tile_scheduler_metadata_view(
-      workspace.value(),
-      ffi::Shape{attn_impl_meta.num_mp_parts, mate::flash_mla::TileSchedulerMetaDataSize},
-      ffi::Shape{mate::flash_mla::TileSchedulerMetaDataSize, 1},
-      dl_int32);
-  StridedTensorView num_splits_view(
-      workspace.value(), ffi::Shape{batch_size + 1}, ffi::Shape{1}, dl_int32, ffi::Optional<int64_t>(metadata_bytes));
-
-  if (!is_inited) {
-    (void)get_mla_decoding_metadata_impl(seqlens_k,
-                                         q_seq_per_hk,
-                                         num_heads_k,
-                                         ffi::Optional<int64_t>(),
-                                         false,
-                                         ffi::Optional<int64_t>(),
-                                         tile_scheduler_metadata_view.view,
-                                         num_splits_view.view,
-                                         ffi::Optional<ffi::TensorView>(),
-                                         ffi::Optional<int64_t>(),
-                                         ffi::Optional<ffi::TensorView>(),
-                                         ffi::Optional<ffi::TensorView>(),
-                                         ffi::Optional<int64_t>());
-  }
-
-  if (num_heads_q == 128) {
-    flash_mla_asm(q_nope,
-                  q_pe,
-                  ckv,
-                  kpe,
-                  seqlens_k,
-                  block_table,
-                  tile_scheduler_metadata_view.view,
-                  num_splits_view.view,
-                  out,
-                  softmax_lse,
-                  softmax_scale,
-                  is_causal,
-                  cu_seqlens_q,
-                  max_seqlen_q);
-    return;
-  }
-  mla_with_kvcache(q_nope,
-                   q_pe,
-                   ckv,
-                   kpe,
-                   seqlens_k,
-                   cu_seqlens_q,
-                   max_seqlen_q,
-                   block_table,
-                   tile_scheduler_metadata_view.view,
-                   num_splits_view.view,
-                   out,
-                   softmax_lse,
-                   softmax_scale,
-                   is_causal);
-}
-
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mla, mla);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mla_with_kvcache, mla_with_kvcache);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_mla_decoding_metadata, get_mla_decoding_metadata);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(dispatch_mla_impl_for_fa_interface, dispatch_mla_impl_for_fa_interface);

@@ -57,6 +57,51 @@ is visible:
 MATE_MUSA_ARCH_LIST=3.1 mate module-status
 ```
 
+## MUBIN Artifacts
+
+MATE can load MUBIN metadata and kernel artifacts from an installed
+`mate-mubin` package or from a downloaded artifact cache. The following
+variables control the downloaded-artifact path and repository behavior.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MATE_MUBIN_DIR` | `~/.cache/mate/mubin` | Root directory for downloaded MUBIN artifacts. Use a directory dedicated to MATE artifacts. |
+| `MATE_MUBIN_REPOSITORY` | `sw-mate-public-generic` | Repository name or HTTP(S) URL used as the artifact source. |
+| `MATE_MUBIN_REPOSITORY_BASE_URL` | `https://sh-repo.mthreads.com/repo/repository` | Base URL prepended when `MATE_MUBIN_REPOSITORY` is a repository name rather than an HTTP(S) URL. |
+| `MATE_MUBIN_NO_DOWNLOAD` | unset | Disable automatic metadata and kernel downloads when set to any nonempty value. |
+| `MATE_MUBIN_VERIFY_DISABLED` | unset | Disable kernel-map and object hash verification when set to any nonempty value. |
+| `MATE_MUBIN_DOWNLOAD_VERBOSE` | `0` | Print artifact download, cache reuse, and refresh details when enabled. |
+
+Artifact source precedence is:
+
+1. An installed `mate-mubin` package.
+2. `MATE_MUBIN_DIR`, when set.
+3. The default `~/.cache/mate/mubin` directory.
+
+An installed `mate-mubin` package takes precedence even when `MATE_MUBIN_DIR`
+is set. MATE trusts the installed package contents and does not fall back to the
+downloaded cache. Without the package, MATE downloads the verified kernel map
+when a MUBIN-backed module is first used, then downloads the selected `.o`
+kernel object lazily.
+Use `mate download-mubin` to fetch the complete payload in advance and
+`mate list-mubins` to inspect the active source and module status.
+
+`MATE_MUBIN_NO_DOWNLOAD` and `MATE_MUBIN_VERIFY_DISABLED` use nonempty-string
+checks. Unset them to restore normal behavior; setting one to `0` still enables
+that control.
+`MATE_MUBIN_DOWNLOAD_VERBOSE` uses boolean parsing and treats an empty value,
+`0`, `false`, `no`, and `off` as disabled.
+
+```{warning}
+`MATE_MUBIN_VERIFY_DISABLED` also disables verification of downloaded `.o`
+objects before MATE loads them. Use the hash bypass only for isolated diagnosis,
+not as a persistent deployment setting.
+```
+
+`mate env` displays the cache, download, verification, and verbosity controls.
+Repository and repository-base overrides are not included in that command's
+output; inspect those shell variables directly when diagnosing a custom source.
+
 ## Runtime Wrapper Controls
 
 | Variable | Default | Meaning |
@@ -77,6 +122,7 @@ the Python process; the helper reads and caches the value on first use.
 | `MATE_EXTRA_MUSAFLAGS` | empty | Extra `mcc` flags for JIT builds. |
 | `MATE_EXTRA_LDFLAGS` | empty | Extra linker flags for JIT builds. |
 | `MATE_MCC` | auto-detected | Override the `mcc` compiler path used by JIT builds. |
+| `MATE_MUBIN_SOURCE_DIR` | unset | Build `mate-mubin` from an existing complete artifact cache instead of downloading the payload. |
 
 MATE JIT builds also honor common build-tool variables such as `CXX` for the
 host C++ compiler and `MAX_JOBS` for ninja parallelism.

@@ -371,27 +371,6 @@ def _compile_with_explicit_outputs(jit_func, *args, **kwargs):
     )
 
 
-def _length_arg(
-    lengths: torch.Tensor | None,
-    size: int,
-    fill: int,
-    device: torch.device | str,
-) -> torch.Tensor:
-    if lengths is not None:
-        return lengths
-    return torch.full((size,), fill, dtype=torch.int32, device=device)
-
-
-def _attn_sink_arg(
-    attn_sink: torch.Tensor | None,
-    heads: int,
-    device: torch.device | str,
-) -> torch.Tensor:
-    if attn_sink is not None:
-        return attn_sink
-    return torch.empty((heads,), dtype=torch.float32, device=device)
-
-
 def _parse_int_list(value: str) -> list[int]:
     vals = [int(item) for item in value.split(",") if item.strip()]
     if not vals:
@@ -488,8 +467,6 @@ def _make_v32_prefill_graph_runner(
     tail_dim = dim_plus_tail_dim - dim
     _, kv_group, _ = kv.shape
     topk = indices.shape[-1]
-    topk_arg = _length_arg(topk_length, seq_len, topk, q.device)
-    attn_sink_arg = _attn_sink_arg(attn_sink, heads, q.device)
     kernel = _compile_with_explicit_outputs(
         sparse_attention_fwd_kernel,
         heads,
@@ -501,6 +478,7 @@ def _make_v32_prefill_graph_runner(
         is_causal=False,
         threads=640,
         has_attn_sink=attn_sink is not None,
+        has_topk_length=topk_length is not None,
         is_persistence=case.is_persistence,
         persistent_blocks=case.persistent_blocks,
     )
@@ -509,7 +487,13 @@ def _make_v32_prefill_graph_runner(
     lse = torch.empty((seq_len, heads), dtype=torch.float32, device=q.device)
 
     def run_graph():
-        kernel(q, kv, indices, topk_arg, attn_sink_arg, out, max_logits, lse)
+        args = [q, kv, indices]
+        if topk_length is not None:
+            args.append(topk_length)
+        if attn_sink is not None:
+            args.append(attn_sink)
+        args.extend((out, max_logits, lse))
+        kernel(*args)
         return out, max_logits, lse
 
     return run_graph
@@ -532,31 +516,17 @@ def _make_model1_prefill_graph_runner(
 
     seq_len, heads, dim = q.shape
     _, kv_group, _ = kv.shape
-    topk = indices.shape[-1]
-    topk_arg = _length_arg(topk_length, seq_len, topk, q.device)
-    attn_sink_arg = _attn_sink_arg(attn_sink, heads, q.device)
-    has_extra = extra_kv is not None
-    extra_topk = 0
-    extra_kv_arg = extra_kv
-    extra_indices_arg = extra_indices
-    extra_topk_arg = topk_arg
-    if has_extra:
-        assert extra_indices is not None
-        extra_topk = extra_indices.shape[-1]
-        extra_topk_arg = _length_arg(extra_topk_length, seq_len, extra_topk, q.device)
-    else:
-        extra_kv_arg = kv
-        extra_indices_arg = indices[:, :, :0]
-    assert extra_kv_arg is not None
-    assert extra_indices_arg is not None
+    assert extra_kv is None and extra_indices is None and extra_topk_length is None, (
+        "MODEL1 prefill graph runner has no extra-KV ABI"
+    )
 
     kernel_kwargs = {
-        "has_extra": extra_topk > 0,
         "kv_group": kv_group,
         "sm_scale": case.d_qk**-0.5,
         "is_causal": True,
         "threads": 640,
         "has_attn_sink": attn_sink is not None,
+        "has_topk_length": topk_length is not None,
         "is_persistence": case.is_persistence,
         "persistent_blocks": case.persistent_blocks,
     }
@@ -571,19 +541,13 @@ def _make_model1_prefill_graph_runner(
     lse = torch.empty((seq_len, heads), dtype=torch.float32, device=q.device)
 
     def run_graph():
-        kernel(
-            q,
-            kv,
-            indices,
-            topk_arg,
-            extra_kv_arg,
-            extra_indices_arg,
-            extra_topk_arg,
-            attn_sink_arg,
-            out,
-            max_logits,
-            lse,
-        )
+        args = [q, kv, indices]
+        if topk_length is not None:
+            args.append(topk_length)
+        if attn_sink is not None:
+            args.append(attn_sink)
+        args.extend((out, max_logits, lse))
+        kernel(*args)
         return out, max_logits, lse
 
     return run_graph
@@ -618,10 +582,6 @@ def _run_prefill_case(
             (case.seq_len_q,), case.topk, dtype=torch.int32, device=device
         )
         topk_length[::17] = max(1, case.topk // 2)
-    elif use_graph:
-        topk_length = torch.full(
-            (case.seq_len_q,), case.topk, dtype=torch.int32, device=device
-        )
     attn_sink = (
         torch.randn((case.num_heads,), dtype=torch.float32, device=device)
         if case.attn_sink
@@ -638,10 +598,6 @@ def _run_prefill_case(
         extra_indices = _make_indices(
             case.seq_len_q, case.extra_topk, case.extra_seq_len_kv, device
         )
-        if use_graph:
-            extra_topk_length = torch.full(
-                (case.seq_len_q,), case.extra_topk, dtype=torch.int32, device=device
-            )
 
     if case.direct_tilelang:
         if case.d_qk == 512:
@@ -754,7 +710,7 @@ def _run_prefill_case(
             print(f"  {time_us:8.1f} us  [{role}] {name}")
 
 
-def _make_decode_inputs(case: DecodeCase, use_graph: bool):
+def _make_decode_inputs(case: DecodeCase):
     device = _device()
     torch.manual_seed(20260503 + case.d_qk + case.batch_size)
     layout = (
@@ -783,10 +739,6 @@ def _make_decode_inputs(case: DecodeCase, use_graph: bool):
             (case.batch_size,), case.topk, dtype=torch.int32, device=device
         )
         topk_length[::5] = max(1, case.topk // 2)
-    elif use_graph:
-        topk_length = torch.full(
-            (case.batch_size,), case.topk, dtype=torch.int32, device=device
-        )
     attn_sink = (
         torch.randn((case.num_heads,), dtype=torch.float32, device=device)
         if case.attn_sink
@@ -819,16 +771,6 @@ def _make_decode_inputs(case: DecodeCase, use_graph: bool):
                 (case.batch_size,), case.extra_topk, dtype=torch.int32, device=device
             )
             extra_topk_length[::7] = max(1, case.extra_topk // 2)
-        elif use_graph:
-            extra_topk_length = torch.full(
-                (case.batch_size,), case.extra_topk, dtype=torch.int32, device=device
-            )
-    elif use_graph and case.d_qk == 512:
-        extra_k_cache = k_cache
-        extra_indices = indices[:, :, :, :0]
-        extra_topk_length = torch.zeros(
-            (case.batch_size,), dtype=torch.int32, device=device
-        )
 
     return (
         q,
@@ -906,9 +848,7 @@ def _make_v32_temp_decode_inputs(case: DecodeCase):
         mp_count=case.mp_count,
         TILE_M=case.tile_m,
     )
-    topk_length = torch.full(
-        (case.batch_size,), case.topk, dtype=torch.int32, device=device
-    )
+    topk_length = None
     return q, k_cache, indices, sched_meta, num_splits, topk_length
 
 
@@ -917,7 +857,7 @@ def _make_v32_decode_graph_runner(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     indices: torch.Tensor,
-    topk_length: torch.Tensor,
+    topk_length: torch.Tensor | None,
     attn_sink: torch.Tensor | None,
     sched_meta: torch.Tensor,
     num_splits: torch.Tensor,
@@ -940,7 +880,6 @@ def _make_v32_decode_graph_runner(
         seq_len=seq_len,
         heads=heads,
         dim=dim,
-        topk=indices.shape[-1],
         topk_length=topk_length,
         attn_sink=attn_sink,
         tile_scheduler_metadata=sched_meta,
@@ -948,7 +887,7 @@ def _make_v32_decode_graph_runner(
         out_dtype=q.dtype,
         device=q.device,
         variant_name="V3.2",
-        dummy_partials=not support_split,
+        support_split=support_split,
     )
     kernel = sparse_attention_fwd_kernel(
         heads,
@@ -960,6 +899,7 @@ def _make_v32_decode_graph_runner(
         threads=640,
         max_nums_splits=runtime.max_nums_splits,
         has_attn_sink=runtime.has_attn_sink,
+        has_topk_length=runtime.topk_length is not None,
         support_split=support_split,
     )
     kv_latent_f8 = kv_flat.view(torch.float8_e4m3fn)
@@ -967,21 +907,17 @@ def _make_v32_decode_graph_runner(
     scales = kv_flat.view(torch.float32)
 
     def run_graph():
-        kernel(
-            q,
-            kv_latent_f8,
-            k_rope,
-            scales,
-            indices,
-            runtime.topk_length,
-            runtime.attn_sink,
-            sched_meta,
-            num_splits,
-            runtime.glse,
-            runtime.out_partial,
-            runtime.out,
-            runtime.lse,
-        )
+        args = [q, kv_latent_f8, k_rope, scales, indices]
+        if runtime.topk_length is not None:
+            args.append(runtime.topk_length)
+        if runtime.attn_sink is not None:
+            args.append(runtime.attn_sink)
+        args.extend((sched_meta, num_splits))
+        if support_split:
+            assert runtime.glse is not None and runtime.out_partial is not None
+            args.extend((runtime.glse, runtime.out_partial))
+        args.extend((runtime.out, runtime.lse))
+        kernel(*args)
         return runtime.out, runtime.lse
 
     return run_graph
@@ -992,11 +928,11 @@ def _make_model1_decode_graph_runner(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     indices: torch.Tensor,
-    topk_length: torch.Tensor,
+    topk_length: torch.Tensor | None,
     attn_sink: torch.Tensor | None,
-    extra_k_cache: torch.Tensor,
-    extra_indices: torch.Tensor,
-    extra_topk_length: torch.Tensor,
+    extra_k_cache: torch.Tensor | None,
+    extra_indices: torch.Tensor | None,
+    extra_topk_length: torch.Tensor | None,
     sched_meta: torch.Tensor,
     num_splits: torch.Tensor,
 ) -> Callable[[], object]:
@@ -1010,16 +946,23 @@ def _make_model1_decode_graph_runner(
 
     batch, seq_len, heads, _ = q.shape
     kv_nope, kv_rope, kv_scales = model1_cache_page_views(k_cache)
-    extra_kv_nope, extra_kv_rope, extra_kv_scales = model1_cache_page_views(
-        extra_k_cache
-    )
+    has_extra = extra_k_cache is not None
+    assert (extra_indices is not None) == has_extra
+    assert has_extra or extra_topk_length is None
+    if has_extra:
+        extra_kv_nope, extra_kv_rope, extra_kv_scales = model1_cache_page_views(
+            extra_k_cache
+        )
+    else:
+        extra_kv_nope = None
+        extra_kv_rope = None
+        extra_kv_scales = None
     support_split = int(sched_meta.shape[0]) != 1
     runtime = prepare_scheduled_decode_runtime(
         batch=batch,
         seq_len=seq_len,
         heads=heads,
         dim=DV,
-        topk=indices.shape[-1],
         topk_length=topk_length,
         attn_sink=attn_sink,
         tile_scheduler_metadata=sched_meta,
@@ -1027,45 +970,46 @@ def _make_model1_decode_graph_runner(
         out_dtype=q.dtype,
         device=q.device,
         variant_name="MODEL1",
-        dummy_partials=not support_split,
+        support_split=support_split,
     )
     kernel = sparse_attention_decode_fwd_scheduled_kernel_model1(
         heads,
         DV,
-        has_extra=extra_indices.shape[-1] > 0,
+        has_extra=has_extra,
         kv_group=1,
         sm_scale=case.d_qk**-0.5,
         threads=640,
         max_nums_splits=runtime.max_nums_splits,
         has_attn_sink=runtime.has_attn_sink,
+        has_topk_length=runtime.topk_length is not None,
+        has_extra_topk_length=extra_topk_length is not None,
         page_block_size=k_cache.shape[1],
-        extra_page_block_size=extra_k_cache.shape[1],
-        page_stride_bytes=kv_nope.shape[1],
-        extra_page_stride_bytes=extra_kv_nope.shape[1],
+        extra_page_block_size=(
+            extra_k_cache.shape[1] if extra_k_cache is not None else None
+        ),
+        use_8byte_kv_loads=(
+            kv_rope.stride(0) % 8 != 0
+            or (extra_kv_rope is not None and extra_kv_rope.stride(0) % 8 != 0)
+        ),
         support_split=support_split,
     )
 
     def run_graph():
-        kernel(
-            q,
-            kv_nope,
-            kv_rope,
-            kv_scales,
-            indices,
-            runtime.topk_length,
-            extra_kv_nope,
-            extra_kv_rope,
-            extra_kv_scales,
-            extra_indices,
-            extra_topk_length,
-            runtime.attn_sink,
-            sched_meta,
-            num_splits,
-            runtime.glse,
-            runtime.out_partial,
-            runtime.out,
-            runtime.lse,
-        )
+        args = [q, kv_nope, kv_rope, kv_scales, indices]
+        if runtime.topk_length is not None:
+            args.append(runtime.topk_length)
+        if has_extra:
+            args.extend((extra_kv_nope, extra_kv_rope, extra_kv_scales, extra_indices))
+            if extra_topk_length is not None:
+                args.append(extra_topk_length)
+        if runtime.attn_sink is not None:
+            args.append(runtime.attn_sink)
+        args.extend((sched_meta, num_splits))
+        if support_split:
+            assert runtime.glse is not None and runtime.out_partial is not None
+            args.extend((runtime.glse, runtime.out_partial))
+        args.extend((runtime.out, runtime.lse))
+        kernel(*args)
         return runtime.out, runtime.lse
 
     return run_graph
@@ -1140,7 +1084,7 @@ def _run_decode_case(
                 print(f"  {time_us:8.1f} us  [{role}] {name}")
         return
 
-    inputs = _make_decode_inputs(case, use_graph)
+    inputs = _make_decode_inputs(case)
     (
         q,
         k_cache,

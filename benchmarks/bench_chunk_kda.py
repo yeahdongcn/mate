@@ -113,12 +113,15 @@ def run_case(
     l2_flush_size_mb: int,
     seed: int,
     state_mode: str,
+    varlen: bool,
+    cu_seqlens_dtype,
 ) -> None:
     device = torch.device("musa")
     lower_bound = -5.0
     scale = 1.0 / math.sqrt(D)
+    if not varlen and len(seq_lens) != 1:
+        raise ValueError("fixed benchmark mode requires exactly one sequence length")
 
-    varlen = len(seq_lens) > 1
     total = sum(seq_lens)
     nseq = len(seq_lens)
 
@@ -128,7 +131,7 @@ def run_case(
     if varlen:
         cu_seqlens = torch.tensor(
             [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
-            dtype=torch.long,
+            dtype=cu_seqlens_dtype,
             device=device,
         )
         bench_desc = (
@@ -256,12 +259,26 @@ def main() -> None:
     parser.add_argument("--repeat-time-ms", type=int, default=1000)
     parser.add_argument("--no-l2-flush", action="store_true")
     parser.add_argument("--l2-flush-size-mb", type=int, default=512)
-    parser.add_argument("--mode", choices=["fixed", "varlen", "all"], default="all")
+    parser.add_argument(
+        "--mode",
+        choices=["fixed", "varlen", "all"],
+        default="all",
+        help=(
+            "Select default cases and, with --seq-lens, force fixed/varlen layout; "
+            "'all' infers varlen when multiple lengths are supplied."
+        ),
+    )
     parser.add_argument("--H", type=int, default=96)
     parser.add_argument("--D", type=int, default=128)
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seq-lens", action="append", type=_parse_seq_lens)
+    parser.add_argument(
+        "--cu-seqlens-dtype",
+        choices=["int32", "int64"],
+        default="int64",
+        help="Cumulative sequence-length dtype used in varlen mode.",
+    )
     parser.add_argument(
         "--state-mode", choices=["bf16", "fp32", "both", "none", "all"], default="bf16"
     )
@@ -298,21 +315,27 @@ def main() -> None:
         raise RuntimeError("MUSA device is not available.")
 
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    cu_seqlens_dtype = torch.int32 if args.cu_seqlens_dtype == "int32" else torch.int64
 
     print(f"MUSA_VISIBLE_DEVICES={os.environ.get('MUSA_VISIBLE_DEVICES')}")
     print(f"MUSA: {torch.musa.get_device_name(0)}")
     print("Kernel: fused")
 
-    cases: list[list[int]] = []
+    cases: list[tuple[list[int], bool]] = []
     if args.seq_lens:
-        cases.extend(args.seq_lens)
+        if args.mode == "fixed":
+            cases.extend((seq_lens, False) for seq_lens in args.seq_lens)
+        elif args.mode == "varlen":
+            cases.extend((seq_lens, True) for seq_lens in args.seq_lens)
+        else:
+            cases.extend((seq_lens, len(seq_lens) > 1) for seq_lens in args.seq_lens)
     else:
         if args.mode in ("fixed", "all"):
-            cases.extend(FIXED_CASES)
+            cases.extend((seq_lens, False) for seq_lens in FIXED_CASES)
         if args.mode in ("varlen", "all"):
-            cases.extend(VARLEN_CASES)
+            cases.extend((seq_lens, True) for seq_lens in VARLEN_CASES)
 
-    for seq_lens in cases:
+    for seq_lens, varlen in cases:
         run_case(
             torch,
             F,
@@ -330,6 +353,8 @@ def main() -> None:
             args.l2_flush_size_mb,
             args.seed,
             args.state_mode,
+            varlen,
+            cu_seqlens_dtype,
         )
 
 

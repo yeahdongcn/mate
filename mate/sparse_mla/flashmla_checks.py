@@ -68,17 +68,24 @@ def model1_cache_page_views(k_cache: torch.Tensor, *, check: bool = True):
     num_blocks = k_cache.shape[0]
     logical_block_bytes = k_cache.shape[1] * MODEL1_KV_BYTES_PER_TOKEN
     if num_blocks == 1:
-        block_bytes = logical_block_bytes
+        # A singleton page never advances stride(0), so preserve the wider load path.
+        page_stride_bytes = (logical_block_bytes + 15) // 16 * 16
     else:
-        block_bytes = k_cache.view(torch.uint8).stride(0)
-        assert block_bytes > 0, f"k_cache stride(0) must be positive, got {block_bytes}"
-        assert block_bytes >= logical_block_bytes, (
-            f"k_cache stride(0) must cover a page, got {block_bytes} < {logical_block_bytes}"
+        page_stride_bytes = k_cache.view(torch.uint8).stride(0)
+        assert page_stride_bytes > 0, (
+            f"k_cache stride(0) must be positive, got {page_stride_bytes}"
         )
+        assert page_stride_bytes >= logical_block_bytes, (
+            "k_cache stride(0) must cover a page, "
+            f"got {page_stride_bytes} < {logical_block_bytes}"
+        )
+    assert page_stride_bytes % 8 == 0, (
+        f"k_cache page stride must be divisible by 8 bytes, got {page_stride_bytes}"
+    )
     cache_bytes = torch.as_strided(
         k_cache.view(torch.uint8),
-        (num_blocks, block_bytes),
-        (block_bytes, 1),
+        (num_blocks, logical_block_bytes),
+        (page_stride_bytes, 1),
     )
     return (
         cache_bytes.view(torch.float8_e4m3fn),

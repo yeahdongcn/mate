@@ -1,6 +1,6 @@
 # MATE CLI Reference
 
-MATE CLI provides command-line utilities for installation checks, configuration inspection, environment diagnostics, guarded-memory debugging, and Level 10 dump replay.
+MATE CLI provides command-line utilities for installation checks, configuration inspection, environment diagnostics, MUBIN artifact management, guarded-memory debugging, and Level 10 dump replay.
 
 All examples below use `mate`, but `python -m mate` is equivalent after MATE is installed correctly.
 
@@ -69,6 +69,10 @@ Notes:
 | `mate list-modules [MODULE]` | List registered JIT/AOT modules or inspect one module |
 | `mate export-compile-commands [PATH]` | Export compile commands for registered JIT modules |
 | `mate clear-cache` | Remove the runtime JIT cache directory only |
+| `mate install-mubin-wheel` | Install the `mate-mubin` wheel matching MATE |
+| `mate download-mubin` | Download complete MUBIN artifacts for all supported modules |
+| `mate list-mubins` | Show the active MUBIN source and artifact status by module |
+| `mate clear-mubin` | Remove the configured downloaded MUBIN artifact directory |
 | `mate env` | Show relevant environment variables and their current values |
 | `mate check` | Validate a usable MATE runtime environment |
 | `mate guard-run -- COMMAND` | Launch a child command with the guarded MUSA allocator |
@@ -143,6 +147,99 @@ Remove runtime JIT cache files without touching AOT libraries:
 ```bash
 mate clear-cache
 ```
+
+This command only clears the runtime JIT cache. It does not remove packaged or
+downloaded MUBIN artifacts.
+
+### MUBIN artifact management
+
+MUBIN-backed operators use artifacts from an installed `mate-mubin` package
+when one is available. Otherwise, MATE uses the directory selected by
+`MATE_MUBIN_DIR`, which defaults to `~/.cache/mate/mubin`.
+
+#### `install-mubin-wheel`
+
+Install the `mate-mubin` package matching the running MATE public version:
+
+```bash
+mate install-mubin-wheel
+```
+
+The command runs the active Python interpreter's pip with `--upgrade`,
+`--no-deps`, and the MUSA wheel index. It does not modify the installed MATE or
+PyTorch packages. Use `--dry-run` to inspect the exact command:
+
+```bash
+mate install-mubin-wheel --dry-run
+```
+
+Use `--mate-version VERSION` to select an explicit MATE version and
+`--index-url URL` when the optional wheel is hosted on another Python package
+index. The installed MATE distribution contains the external kernel maps and
+`.o` artifacts.
+
+#### `download-mubin`
+
+Download complete metadata and kernel payloads for `gemm`, `flash_attention`,
+`flash_mla`, and `sage_attention`:
+
+```bash
+mate download-mubin
+```
+
+The command writes to `MATE_MUBIN_DIR` or the default downloaded-artifact
+cache. It downloads the cache even when an installed `mate-mubin` package is
+the active artifact source; it does not modify that package.
+
+#### `list-mubins`
+
+Show the active artifact source, root directory, and status of each supported
+module:
+
+```bash
+mate list-mubins
+```
+
+The reported statuses are:
+
+| Status | Meaning |
+| --- | --- |
+| `Downloaded` | Metadata and the complete kernel payload are present and verified |
+| `Metadata only` | The kernel map is verified, but the complete kernel payload is not present and verified |
+| `Incomplete` | The module directory exists but the kernel map is missing or fails verification |
+| `Missing` | No artifact directory exists for the module |
+
+An installed `mate-mubin` package takes precedence over `MATE_MUBIN_DIR` and
+the default cache. Installed package contents are trusted and MATE does not
+fall back to downloaded artifacts.
+
+#### `clear-mubin`
+
+Remove the configured downloaded-artifact root recursively:
+
+```bash
+mate clear-mubin
+```
+
+This command removes `MATE_MUBIN_DIR`, or `~/.cache/mate/mubin` when the
+variable is unset. Point `MATE_MUBIN_DIR` at a directory dedicated to MUBIN
+artifacts. An installed `mate-mubin` package is not modified or uninstalled.
+
+#### Prepare an offline runtime
+
+When `mate-mubin` is not installed, prefetch the complete cache before network
+access is removed:
+
+```bash
+export MATE_MUBIN_DIR=/opt/mate/mubin
+mate download-mubin
+mate list-mubins
+export MATE_MUBIN_NO_DOWNLOAD=1
+```
+
+Keep `MATE_MUBIN_DIR` set to the same location in the runtime environment.
+Every required module should report `Downloaded`; `Metadata only` is not enough
+for kernels that have not already been fetched.
 
 ### `check`
 
@@ -369,6 +466,7 @@ Command exit behavior is not identical across all subcommands:
 
 - `mate show-config`: returns `0` on successful execution
 - `mate env`: returns `0` on successful execution
+- `mate download-mubin`, `mate list-mubins`, and `mate clear-mubin`: currently report ordinary failures in command output and do not guarantee a non-zero exit code
 - `mate check`: returns `1` only when hard errors are found
 - `mate guard-run`: returns the child process exit code, including signal-based termination
 - `mate replay`: returns `1` on replay failure, execution failure, mismatch, or invalid replay setup
@@ -382,6 +480,9 @@ Command exit behavior is not identical across all subcommands:
 - `No dumps found`: `mate list-dumps` and batch replay only scan immediate child directories, not nested trees recursively
 - `compare_outputs=True but no output file found`: the dump is incomplete, often because the original process crashed after saving inputs
 - `AOT libraries not found`: MATE may still work in JIT mode, but startup behavior can differ from an AOT-enabled installation
+- `Kernel map hash mismatch` or `Hash mismatch for MATE MUBIN artifact`: clear and redownload the MUBIN cache, then confirm the configured repository; do not disable hash verification as a normal workaround
+- `MATE MUBIN artifact is not available locally`: unset `MATE_MUBIN_NO_DOWNLOAD` to permit retrieval, or run `mate download-mubin` before entering the offline environment
+- MUBIN download failures: set `MATE_MUBIN_DOWNLOAD_VERBOSE=1`, then check `MATE_MUBIN_REPOSITORY`, `MATE_MUBIN_REPOSITORY_BASE_URL`, and network access
 - Replay mismatches do not always mean argument reconstruction failed; they can also reflect runtime differences, device differences, or numerical drift
 - Guard allocator failures, pytest defaults, and graph-capture limitations are documented in [Guard Allocator Debugging](guard_allocator.md)
 

@@ -46,21 +46,36 @@ SCHEDULED_DECODE_COMPILE_FLAGS = [
 ]
 
 
-def check_sparse_mla_decode_strides(
-    name: str, tensor: torch.Tensor, multiple: Optional[int] = None
-) -> None:
-    if tensor.is_contiguous():
-        return
-    if tensor.shape[-1] != 1:
-        assert tensor.stride(-1) == 1, f"{name} last dimension must be contiguous"
-    for dim, (size, stride) in enumerate(zip(tensor.shape[:-1], tensor.stride()[:-1])):
-        if size == 1:
+def prepare_sparse_mla_decode_strided_tensor(
+    name: str, tensor: torch.Tensor, multiple: int
+) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """Validate a runtime-strided input once and normalize singleton strides."""
+
+    shape = tensor.shape
+    strides = tensor.stride()
+    normalized = None
+    if strides[-1] != 1:
+        assert shape[-1] == 1, f"{name} last dimension must be contiguous"
+        normalized = list(strides)
+        normalized[-1] = 1
+    for dim in range(len(strides) - 1):
+        stride = strides[dim]
+        if stride > 0 and stride % multiple == 0:
             continue
-        assert stride > 0, f"{name} stride({dim}) must be positive, got {stride}"
-        if multiple is not None:
-            assert stride % multiple == 0, (
+        if shape[dim] != 1:
+            assert stride > 0, f"{name} stride({dim}) must be positive, got {stride}"
+            raise AssertionError(
                 f"{name} stride({dim}) must be divisible by {multiple}, got {stride}"
             )
+        if normalized is None:
+            normalized = list(strides)
+        normalized[dim] = multiple
+    if normalized is None:
+        return tensor, shape
+    return (
+        torch.as_strided(tensor, shape, normalized, tensor.storage_offset()),
+        shape,
+    )
 
 
 def make_scheduled_decode_combine(
@@ -693,15 +708,13 @@ def scheduled_max_num_splits(num_mp_parts: int, name: str) -> int:
     return 32 if num_mp_parts <= 32 else 64
 
 
-def require_batch_lengths(
+def validate_batch_lengths(
     lengths: Optional[torch.Tensor],
     batch: int,
-    fill: int,
-    device,
     name: str,
-) -> torch.Tensor:
+) -> Optional[torch.Tensor]:
     if lengths is None:
-        return torch.full((batch,), fill, dtype=torch.int32, device=device)
+        return None
     assert lengths.dtype == torch.int32, f"{name} must be int32"
     assert lengths.shape == (batch,), f"{name} must have shape [batch]"
     if lengths.shape[-1] != 1:
@@ -709,15 +722,16 @@ def require_batch_lengths(
     return lengths.contiguous()
 
 
-def optional_attn_sink(attn_sink: Optional[torch.Tensor], heads: int, device):
-    has_attn_sink = attn_sink is not None
+def validate_attn_sink(
+    attn_sink: Optional[torch.Tensor], heads: int
+) -> Optional[torch.Tensor]:
     if attn_sink is None:
-        attn_sink = torch.empty((heads,), dtype=torch.float32, device=device)
+        return None
     assert attn_sink.dtype == torch.float32
     assert attn_sink.shape == (heads,)
     if attn_sink.shape[-1] != 1:
         assert attn_sink.stride(-1) == 1, "attn_sink last dimension must be contiguous"
-    return attn_sink.contiguous(), has_attn_sink
+    return attn_sink.contiguous()
 
 
 def allocate_scheduled_decode_outputs(
@@ -728,12 +742,9 @@ def allocate_scheduled_decode_outputs(
     num_mp_parts: int,
     dtype: torch.dtype,
     device,
-    dummy_partials: bool = False,
+    support_split: bool,
 ):
-    if dummy_partials:
-        glse = torch.empty((1,), dtype=torch.float32, device=device)
-        out_partial = torch.empty((1,), dtype=torch.float32, device=device)
-    else:
+    if support_split:
         glse = torch.empty(
             (batch + num_mp_parts, seq_len, heads),
             dtype=torch.float32,
@@ -744,6 +755,9 @@ def allocate_scheduled_decode_outputs(
             dtype=torch.float32,
             device=device,
         )
+    else:
+        glse = None
+        out_partial = None
     out = torch.empty((batch, seq_len, heads, dim), dtype=dtype, device=device)
     lse = torch.empty((batch, heads, seq_len), dtype=torch.float32, device=device)
     return glse, out_partial, out, lse
@@ -753,12 +767,12 @@ def allocate_scheduled_decode_outputs(
 class ScheduledDecodeRuntime:
     """Host-side objects shared by scheduled sparse decode variants."""
 
-    topk_length: torch.Tensor
-    attn_sink: torch.Tensor
+    topk_length: Optional[torch.Tensor]
+    attn_sink: Optional[torch.Tensor]
     has_attn_sink: bool
     max_nums_splits: int
-    glse: torch.Tensor
-    out_partial: torch.Tensor
+    glse: Optional[torch.Tensor]
+    out_partial: Optional[torch.Tensor]
     out: torch.Tensor
     lse: torch.Tensor
 
@@ -769,7 +783,6 @@ def prepare_scheduled_decode_runtime(
     seq_len: int,
     heads: int,
     dim: int,
-    topk: int,
     topk_length: Optional[torch.Tensor],
     attn_sink: Optional[torch.Tensor],
     tile_scheduler_metadata: torch.Tensor,
@@ -777,24 +790,22 @@ def prepare_scheduled_decode_runtime(
     out_dtype: torch.dtype,
     device,
     variant_name: str,
-    dummy_partials: bool = False,
+    support_split: bool,
 ) -> ScheduledDecodeRuntime:
     num_mp_parts = int(tile_scheduler_metadata.shape[0])
     assert tile_scheduler_metadata.shape == (num_mp_parts, 8)
     assert num_splits.shape == (batch + 1,)
 
-    topk_length_arg = require_batch_lengths(
-        topk_length, batch, topk, device, "topk_length"
-    )
-    attn_sink_arg, has_attn_sink = optional_attn_sink(attn_sink, heads, device)
+    topk_length_arg = validate_batch_lengths(topk_length, batch, "topk_length")
+    attn_sink_arg = validate_attn_sink(attn_sink, heads)
     max_nums_splits = scheduled_max_num_splits(num_mp_parts, variant_name)
     glse, out_partial, out, lse = allocate_scheduled_decode_outputs(
-        batch, seq_len, heads, dim, num_mp_parts, out_dtype, device, dummy_partials
+        batch, seq_len, heads, dim, num_mp_parts, out_dtype, device, support_split
     )
     return ScheduledDecodeRuntime(
         topk_length=topk_length_arg,
         attn_sink=attn_sink_arg,
-        has_attn_sink=has_attn_sink,
+        has_attn_sink=attn_sink_arg is not None,
         max_nums_splits=max_nums_splits,
         glse=glse,
         out_partial=out_partial,

@@ -737,6 +737,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    only_qv=False,
 ):
     """
     Adapted from FlashAttention
@@ -761,12 +762,15 @@ def attention_ref(
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]
     dv = v.shape[-1]
-    softmax_scale = 1.0 / math.sqrt(d if qv is None else d + dv)
-    if not reorder_ops:
+    softmax_scale = 1.0 / math.sqrt(dv if only_qv else d if qv is None else d + dv)
+    if only_qv:
+        assert qv is not None
+        scores = torch.einsum("bthd,bshd->bhts", qv * softmax_scale, v)
+    elif not reorder_ops:
         scores = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-    if qv is not None:
+    if qv is not None and not only_qv:
         scores = scores + torch.einsum("bthd,bshd->bhts", qv * softmax_scale, v)
     if softcap > 0:
         scores = torch.tanh(scores / softcap) * softcap

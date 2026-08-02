@@ -45,7 +45,6 @@ from torch.testing import assert_close as cmp  # noqa: F401
 from mate.jit.attention.fmha.fmha_utils import round_multiple
 
 # from mate.jit.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
-torch.set_printoptions(sci_mode=False, precision=4, linewidth=200)
 
 USE_FAKE_MODE = is_dry_run_enabled()
 
@@ -1827,7 +1826,6 @@ def test_combine(
             out[batch_idx, cur_seqlen_q:] = 0
             lse[batch_idx, cur_seqlen_q:] = 0
 
-    torch.set_printoptions(sci_mode=False)
     atol, rtol = 1.5e-2, 1e-2
     torch.testing.assert_close(lse, ref_lse, atol=atol, rtol=rtol)
     torch.testing.assert_close(out, ref_out.to(out.dtype), atol=atol, rtol=rtol)
@@ -1936,7 +1934,11 @@ def test_combine_high_splits(
         "d64_512",
     ],
 )
-@pytest.mark.parametrize("has_qv", [False, True], ids=lambda x: "qv" if x else "no_qv")
+@pytest.mark.parametrize(
+    "has_qv,only_qv",
+    [(False, False), (True, False), (True, True)],
+    ids=["no_qv", "qv", "only_qv"],
+)
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1967,6 +1969,7 @@ def test_advance_features(
     heads,
     headdim,
     has_qv,
+    only_qv,
     varlen_q,
     pack_gqa,
     has_batch_idx,
@@ -2005,6 +2008,7 @@ def test_advance_features(
         new_kv,
         num_splits,
         has_qv,
+        only_qv,
         dtype,
         attention_chunk,
         softcap,
@@ -2031,6 +2035,7 @@ def _run_test_advance_features(
     new_kv,
     num_splits,
     has_qv,
+    only_qv,
     dtype,
     attention_chunk,
     softcap,
@@ -2047,7 +2052,10 @@ def _run_test_advance_features(
         if has_rotary_seqlens or not rotary_interleaved:
             pytest.skip()
     if dtype == torch.float8_e4m3fn and has_qv:
-        pytest.skip("float8 qv is not supported yet")
+        if headdim not in ((64, 256), (64, 512)):
+            pytest.skip("float8 qv only supports headdim (64, 256) and (64, 512)")
+        if new_kv or rotary_fraction > 0.0:
+            pytest.skip("float8 qv does not support append KV or rotary yet")
 
     input_dtype = dtype
     ref_dtype = torch.bfloat16
@@ -2351,6 +2359,7 @@ def _run_test_advance_features(
         attention_chunk=attention_chunk,
         key_leftpad=cache_leftpad,
         softcap=softcap,
+        only_qv=only_qv,
     )
     out_pt, _, _ = attention_ref(
         q_ro,
@@ -2370,6 +2379,7 @@ def _run_test_advance_features(
         upcast=False,
         reorder_ops=True,
         intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+        only_qv=only_qv,
     )
     # Handle dtype conversion
     q = q.to(input_dtype)
@@ -2454,6 +2464,7 @@ def _run_test_advance_features(
         num_splits=num_splits,
         return_softmax_lse=True,
         pack_gqa=pack_gqa,
+        only_qv=only_qv,
     )
     torch.musa.synchronize()
     if varlen_q:

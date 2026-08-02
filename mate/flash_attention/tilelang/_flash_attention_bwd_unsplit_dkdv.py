@@ -23,22 +23,22 @@ from tvm import tir
 def flashattn_bwd_ws_unsplit_dkdv(
     dim,
     is_causal,
+    has_window_left,
+    has_window_right,
+    has_softcap,
     is_varlen,
     is_bhsd=False,
     heads_q_eq_heads_kv=False,
+    has_seqused_q=False,
+    has_seqused_k=False,
     block_M=64,
     block_N=128,
-    smscale=None,
     dtype="bfloat16",
     consumer0_threads=256,
     consumer1_threads=256,
     producer_threads=128,
+    use_static_dims=False,
 ):
-    if smscale is not None:
-        rln2_scale = smscale * 1.44269504  # log2(e)
-    else:
-        smscale = 1.0 / (dim**0.5)
-        rln2_scale = smscale * 1.44269504  # log2(e)
     max_seq_kv = T.dynamic("max_seq_kv")
     log2e = 1.44269504
     batch = T.dynamic("batch")
@@ -81,16 +81,39 @@ def flashattn_bwd_ws_unsplit_dkdv(
     dv_stride_b = T.dynamic("dv_stride_b")
     dv_stride_s = T.dynamic("dv_stride_s")
     dv_stride_h = T.dynamic("dv_stride_h")
+    qk_dim = dim if use_static_dims else T.dynamic("qk_dim")
+    v_dim = dim if use_static_dims else T.dynamic("v_dim")
+    dk_dim = dim if use_static_dims else T.dynamic("dk_dim")
+    dv_dim = dim if use_static_dims else T.dynamic("dv_dim")
     q_shape = (
-        (total_seq_q, heads_q, dim) if is_varlen else (batch, seqlen_q, heads_q, dim)
-    )
-    kv_shape = (
-        (total_seq_kv, heads_kv, dim) if is_varlen else (batch, seqlen_k, heads_kv, dim)
-    )
-    kv_grad_shape = (
-        (total_seq_kv, kv_grad_heads, dim)
+        (total_seq_q, heads_q, qk_dim)
         if is_varlen
-        else (batch, seqlen_k, kv_grad_heads, dim)
+        else (batch, seqlen_q, heads_q, qk_dim)
+    )
+    k_shape = (
+        (total_seq_kv, heads_kv, qk_dim)
+        if is_varlen
+        else (batch, seqlen_k, heads_kv, qk_dim)
+    )
+    v_shape = (
+        (total_seq_kv, heads_kv, v_dim)
+        if is_varlen
+        else (batch, seqlen_k, heads_kv, v_dim)
+    )
+    o_shape = (
+        (total_seq_q, heads_q, v_dim)
+        if is_varlen
+        else (batch, seqlen_q, heads_q, v_dim)
+    )
+    dk_shape = (
+        (total_seq_kv, kv_grad_heads, dk_dim)
+        if is_varlen
+        else (batch, seqlen_k, kv_grad_heads, dk_dim)
+    )
+    dv_shape = (
+        (total_seq_kv, kv_grad_heads, dv_dim)
+        if is_varlen
+        else (batch, seqlen_k, kv_grad_heads, dv_dim)
     )
     q_strides = (
         (q_stride_s, q_stride_h, 1)
@@ -128,15 +151,15 @@ def flashattn_bwd_ws_unsplit_dkdv(
         else (dv_stride_b, dv_stride_s, dv_stride_h, 1)
     )
     q_type = T.StridedTensor(q_shape, q_strides, dtype)
-    k_type = T.StridedTensor(kv_shape, k_strides, dtype)
-    v_type = T.StridedTensor(kv_shape, v_strides, dtype)
-    o_type = T.StridedTensor(q_shape, o_strides, dtype)
-    do_type = T.StridedTensor(q_shape, do_strides, dtype)
-    dk_type = T.StridedTensor(kv_grad_shape, dk_strides, kv_grad_dtype)
-    dv_type = T.StridedTensor(kv_grad_shape, dv_strides, kv_grad_dtype)
+    k_type = T.StridedTensor(k_shape, k_strides, dtype)
+    v_type = T.StridedTensor(v_shape, v_strides, dtype)
+    o_type = T.StridedTensor(o_shape, o_strides, dtype)
+    do_type = T.StridedTensor(o_shape, do_strides, dtype)
+    dk_type = T.StridedTensor(dk_shape, dk_strides, kv_grad_dtype)
+    dv_type = T.StridedTensor(dv_shape, dv_strides, kv_grad_dtype)
     dtype_bytes = _tilelang_dtype_nbytes(dtype)
-    k_robust_bytes = cosize(kv_shape, k_strides) * dtype_bytes
-    v_robust_bytes = cosize(kv_shape, v_strides) * dtype_bytes
+    k_robust_bytes = cosize(k_shape, k_strides) * dtype_bytes
+    v_robust_bytes = cosize(v_shape, v_strides) * dtype_bytes
 
     def q_block(tensor, batch_idx, q_start, begin_seq, head):
         if is_varlen:
@@ -203,13 +226,14 @@ def flashattn_bwd_ws_unsplit_dkdv(
         block_end,
         begin_seq,
         end_seq,
+        grad_dim,
     ):
         if heads_q_eq_heads_kv:
             T.copy(accum, cast)
             if (block_end + begin_seq) > end_seq:
                 for i, j in T.Parallel(block_N, dim):
                     kv_offset = block_start + i
-                    if begin_seq + kv_offset < end_seq:
+                    if begin_seq + kv_offset < end_seq and j < grad_dim:
                         T.copy(
                             cast[i, j],
                             kv_tile_e(
@@ -222,15 +246,25 @@ def flashattn_bwd_ws_unsplit_dkdv(
                             ),
                         )
             else:
-                T.copy(
-                    cast,
-                    kv_tile_b(tensor, batch_idx, block_start, begin_seq, head),
-                )
+                for i, j in T.Parallel(block_N, dim):
+                    kv_offset = block_start + i
+                    if j < grad_dim:
+                        T.copy(
+                            cast[i, j],
+                            kv_tile_e(
+                                tensor,
+                                batch_idx,
+                                kv_offset,
+                                begin_seq,
+                                head,
+                                j,
+                            ),
+                        )
         else:
             if (block_end + begin_seq) > end_seq:
                 for i, j in T.Parallel(block_N, dim):
                     kv_offset = block_start + i
-                    if begin_seq + kv_offset < end_seq:
+                    if begin_seq + kv_offset < end_seq and j < grad_dim:
                         T.copy(
                             accum[i, j],
                             kv_tile_e(
@@ -243,10 +277,20 @@ def flashattn_bwd_ws_unsplit_dkdv(
                             ),
                         )
             else:
-                T.copy(
-                    accum,
-                    kv_tile_b(tensor, batch_idx, block_start, begin_seq, head),
-                )
+                for i, j in T.Parallel(block_N, dim):
+                    kv_offset = block_start + i
+                    if j < grad_dim:
+                        T.copy(
+                            accum[i, j],
+                            kv_tile_e(
+                                tensor,
+                                batch_idx,
+                                kv_offset,
+                                begin_seq,
+                                head,
+                                j,
+                            ),
+                        )
 
     @T.prim_func
     def flashattn_bwd_ws_unsplit_dkdv_kernel(
@@ -258,12 +302,19 @@ def flashattn_bwd_ws_unsplit_dkdv(
         dO: do_type,  # type: ignore
         cu_seq_q: T.Tensor([batch + 1], T.int32),  # type: ignore
         cu_seq_kv: T.Tensor([batch + 1], T.int32),  # type: ignore
+        seqused_q: T.Tensor([batch], T.int32),  # type: ignore
+        seqused_k: T.Tensor([batch], T.int32),  # type: ignore
         Lse: T.Tensor(
             [heads_q, total_seq_q] if is_varlen else [batch, heads_q, seqlen_q],
             accum_dtype,
         ),  # type: ignore
         Delta: T.Tensor([total_seq_q, heads_q], accum_dtype),  # type: ignore
         max_seq_kv: T.int32,
+        window_size_left: T.int32,  # type: ignore
+        window_size_right: T.int32,  # type: ignore
+        softcap: T.float32,  # type: ignore
+        smscale: T.float32,  # type: ignore
+        rln2_scale: T.float32,  # type: ignore
     ):
         with T.Kernel(
             T.ceildiv(max_seq_kv, block_N),
@@ -271,6 +322,14 @@ def flashattn_bwd_ws_unsplit_dkdv(
             batch,
             threads=total_role_threads,
         ) as (bx, by, bz):
+            T.assume(qk_dim <= dim)
+            T.assume(v_dim <= dim)
+            T.assume(dk_dim <= dim)
+            T.assume(dv_dim <= dim)
+            T.assume(qk_dim % 8 == 0)
+            T.assume(v_dim % 8 == 0)
+            T.assume(dk_dim % 8 == 0)
+            T.assume(dv_dim % 8 == 0)
             T.assume(q_stride_s % 8 == 0)
             T.assume(q_stride_h % 8 == 0)
             T.assume(k_stride_s % 8 == 0)
@@ -309,6 +368,10 @@ def flashattn_bwd_ws_unsplit_dkdv(
                 end_seq_q = begin_seq_q + seqlen_q
                 begin_seq_kv = bz * seqlen_k
                 end_seq_kv = begin_seq_kv + seqlen_k
+            if has_seqused_q:
+                end_seq_q = begin_seq_q + seqused_q[bz]
+            if has_seqused_k:
+                end_seq_kv = begin_seq_kv + seqused_k[bz]
 
             Qa_shared_0 = T.alloc_shared([block_M, dim], dtype)
             dOb_shared_0 = T.alloc_shared([block_M, dim], dtype)
@@ -486,6 +549,10 @@ def flashattn_bwd_ws_unsplit_dkdv(
                     phase_consumer0 = 0
                     accs_accum = T.alloc_fragment([block_M, block_N], accum_dtype)
                     dp_accum = T.alloc_fragment([block_M, block_N], accum_dtype)
+                    if has_softcap:
+                        softcap_deriv = T.alloc_fragment(
+                            [block_M, block_N], accum_dtype
+                        )
                     accs_cast = T.alloc_fragment([block_M, block_N], dtype)
                     lse_buffer = T.alloc_fragment([block_M], accum_dtype)
                     delta_buffer = T.alloc_fragment([block_M], accum_dtype)
@@ -499,6 +566,10 @@ def flashattn_bwd_ws_unsplit_dkdv(
                                 lse_elem(Lse, bz, q_start + i, begin_seq_q, by),
                                 lse_buffer[i],
                                 src_robust_desc=lse_robust_desc,
+                            )
+                        for i in T.Parallel(block_M):
+                            lse_buffer[i] = T.if_then_else(
+                                T.isfinite(lse_buffer[i]), lse_buffer[i], 2**30
                             )
                         for i in T.Parallel(block_M):
                             T.copy(
@@ -526,6 +597,21 @@ def flashattn_bwd_ws_unsplit_dkdv(
                                     accs_accum[i, j] = T.if_then_else(
                                         valid, accs_accum[i, j], float("-inf")
                                     )
+                        if has_window_left or has_window_right:
+                            for i, j in T.Parallel(block_M, block_N):
+                                q_idx = q_start - begin_seq_q + i
+                                k_idx = bx * block_N + perm_n(j, block_N)
+                                valid = (
+                                    not has_window_left
+                                    or k_idx >= q_idx + causal_offset - window_size_left
+                                ) and (
+                                    not has_window_right
+                                    or k_idx
+                                    <= q_idx + causal_offset + window_size_right
+                                )
+                                accs_accum[i, j] = T.if_then_else(
+                                    valid, accs_accum[i, j], float("-inf")
+                                )
                         if (q_start + block_M) >= end_seq_q:
                             for i in T.Parallel(block_M):
                                 lse_buffer[i] = T.if_then_else(
@@ -563,12 +649,66 @@ def flashattn_bwd_ws_unsplit_dkdv(
                             transpose_B=True,
                             policy=T.GemmWarpPolicy.FullCol,
                         )
-                        for i, j in T.Parallel(block_M, block_N):
-                            accs_accum[i, j] = (
-                                accs_accum[i, j] * rln2_scale - lse_buffer[i]
-                            )
-                        for i, j in T.Parallel(block_M, block_N):
-                            accs_accum[i, j] = T.exp2(accs_accum[i, j])
+                        if has_softcap:
+                            for i, j in T.Parallel(block_M, block_N):
+                                softcap_tanh = T.tanh(
+                                    accs_accum[i, j] * smscale / softcap
+                                )
+                                softcap_deriv[i, j] = 1.0 - softcap_tanh * softcap_tanh
+                                accs_accum[i, j] = softcap_tanh * softcap
+                            if (block_kv_end + begin_seq_kv) > end_seq_kv:
+                                for i, j in T.Parallel(block_M, block_N):
+                                    valid = permuted_kv_valid(
+                                        begin_seq_kv, block_kv_start, j, end_seq_kv
+                                    )
+                                    accs_accum[i, j] = T.if_then_else(
+                                        valid, accs_accum[i, j], float("-inf")
+                                    )
+                                    softcap_deriv[i, j] = T.if_then_else(
+                                        valid, softcap_deriv[i, j], 0.0
+                                    )
+                            if is_causal:
+                                if q_start < causal_q_mask_end:
+                                    for i, j in T.Parallel(block_M, block_N):
+                                        q_idx = q_start - begin_seq_q + i
+                                        k_idx = bx * block_N + perm_n(j, block_N)
+                                        valid = q_idx + causal_offset >= k_idx
+                                        accs_accum[i, j] = T.if_then_else(
+                                            valid, accs_accum[i, j], float("-inf")
+                                        )
+                                        softcap_deriv[i, j] = T.if_then_else(
+                                            valid, softcap_deriv[i, j], 0.0
+                                        )
+                            if has_window_left or has_window_right:
+                                for i, j in T.Parallel(block_M, block_N):
+                                    q_idx = q_start - begin_seq_q + i
+                                    k_idx = bx * block_N + perm_n(j, block_N)
+                                    valid = (
+                                        not has_window_left
+                                        or k_idx
+                                        >= q_idx + causal_offset - window_size_left
+                                    ) and (
+                                        not has_window_right
+                                        or k_idx
+                                        <= q_idx + causal_offset + window_size_right
+                                    )
+                                    accs_accum[i, j] = T.if_then_else(
+                                        valid, accs_accum[i, j], float("-inf")
+                                    )
+                                    softcap_deriv[i, j] = T.if_then_else(
+                                        valid, softcap_deriv[i, j], 0.0
+                                    )
+                            for i, j in T.Parallel(block_M, block_N):
+                                accs_accum[i, j] = T.exp2(
+                                    accs_accum[i, j] * log2e - lse_buffer[i]
+                                )
+                        else:
+                            for i, j in T.Parallel(block_M, block_N):
+                                accs_accum[i, j] = (
+                                    accs_accum[i, j] * rln2_scale - lse_buffer[i]
+                                )
+                            for i, j in T.Parallel(block_M, block_N):
+                                accs_accum[i, j] = T.exp2(accs_accum[i, j])
 
                         T.wait_wgmma(0)
                         T.barrier_arrive(bar_doa0_free)
@@ -584,6 +724,9 @@ def flashattn_bwd_ws_unsplit_dkdv(
                             dp_accum[i, j] = dp_accum[i, j] * smscale - delta_buffer[i]
                         for i, j in T.Parallel(block_M, block_N):
                             dp_accum[i, j] = dp_accum[i, j] * accs_accum[i, j]
+                        if has_softcap:
+                            for i, j in T.Parallel(block_M, block_N):
+                                dp_accum[i, j] = dp_accum[i, j] * softcap_deriv[i, j]
                         T.copy(dp_accum, accs_cast)
                         T.barrier_wait(bar_dst_free, phase_consumer0 ^ 1)
                         for i, t, l in T.Parallel(block_M, 8, L):
@@ -645,6 +788,7 @@ def flashattn_bwd_ws_unsplit_dkdv(
                         block_kv_end,
                         begin_seq_kv,
                         end_seq_kv,
+                        dv_dim,
                     )
                     store_kv_grad(
                         dK,
@@ -656,6 +800,7 @@ def flashattn_bwd_ws_unsplit_dkdv(
                         block_kv_end,
                         begin_seq_kv,
                         end_seq_kv,
+                        dk_dim,
                     )
 
     # if heads_kv == heads_q -> output dk dv,

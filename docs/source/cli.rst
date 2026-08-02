@@ -10,7 +10,8 @@ Command Line Interface
 MATE provides a command-line interface for validating the runtime environment,
 inspecting resolved configuration, viewing environment variables, inspecting
 registered JIT or AOT modules, exporting compile commands for development
-tools, clearing the JIT cache, and replaying captured dumps.
+tools, installing pre-generated kernel artifacts, clearing caches, and replaying
+captured dumps.
 
 Quick Reference
 ---------------
@@ -79,11 +80,31 @@ Export ``compile_commands.json`` for IDEs and language servers such as
 Cache Management
 ----------------
 
+Install the optional ``mate-mubin`` wheel matching the running MATE version:
+
+.. code-block:: bash
+
+   mate install-mubin-wheel
+
 Clear the runtime JIT cache without removing packaged AOT libraries:
 
 .. code-block:: bash
 
    mate clear-cache
+
+MUBIN Artifacts
+---------------
+
+Manage MUBIN artifacts for wrapper-backed attention and GEMM paths:
+
+.. code-block:: bash
+
+   mate download-mubin
+   mate list-mubins
+   mate clear-mubin
+
+These commands use the same artifact directory as the MUBIN runtime helpers.
+See :doc:`Diagnostics <diagnostics>` if a path cannot find its artifacts.
 
 Replay Recorded Calls
 ---------------------

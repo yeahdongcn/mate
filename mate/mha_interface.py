@@ -3,7 +3,10 @@ import torch
 from typing import List, Optional, Union, Tuple
 
 from mate.api_logging import mate_api
-from .jit.flash_attention_ops import get_flash_attention_ops_module
+from mate.mate_runtime import get_physical_num_mps
+from mate.utils import ceil_div
+from .jit.mubin.flash_attention import flash_atten_varlen_asm_mubin
+from .jit.mubin.flash_mla import flash_mla_asm_mubin
 from .jit.mla_ops import get_mla_ops_module
 from .jit.attention.fmha import (
     _fmha_get_metadata as jit_fmha_get_metadata,
@@ -11,11 +14,6 @@ from .jit.attention.fmha import (
 from .jit.attention.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
 from .jit.attention.fmha.fmha_combine import _flash_attn_combine
 from .execution_context import raise_complete_if_dry_run
-
-
-@functools.cache
-def _get_flash_attention_ops():
-    return get_flash_attention_ops_module()
 
 
 @functools.cache
@@ -144,6 +142,72 @@ def _allocate_mla_decode_outputs(q: torch.Tensor, head_dim_v: int):
     return out, softmax_lse
 
 
+_FLASH_MLA_METADATA_SIZE = 8
+
+
+def _prepare_mla_scheduler_metadata_from_workspace(
+    workspace: torch.Tensor,
+    is_inited: bool,
+    q_nope: torch.Tensor,
+    ckv: torch.Tensor,
+    seqlens_k: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+):
+    if workspace.dim() != 1:
+        raise ValueError("MLA scheduler workspace must be 1D")
+    if workspace.dtype != torch.uint8:
+        raise ValueError("MLA scheduler workspace must have dtype torch.uint8")
+    if not workspace.is_contiguous():
+        raise ValueError("MLA scheduler workspace must be contiguous")
+    if workspace.device != q_nope.device:
+        raise ValueError("MLA scheduler workspace must be on the query device")
+    if cu_seqlens_q is not None and max_seqlen_q is None:
+        raise ValueError("max_seqlen_q must be provided when cu_seqlens_q is set")
+
+    seqlen_q = q_nope.shape[1] if cu_seqlens_q is None else max_seqlen_q
+    num_heads_q = q_nope.shape[-2]
+    num_heads_k = ckv.shape[-2] if ckv.dim() == 4 else 1
+    q_seq_per_hk = seqlen_q * num_heads_q // num_heads_k
+    num_mp_parts = max(
+        get_physical_num_mps(q_nope.device)
+        // num_heads_k
+        // ceil_div(q_seq_per_hk, 128),
+        1,
+    )
+    batch = seqlens_k.shape[0]
+    metadata_words = num_mp_parts * _FLASH_MLA_METADATA_SIZE
+    num_splits_words = batch + 1
+    needed_bytes = (metadata_words + num_splits_words) * 4
+    if workspace.numel() < needed_bytes:
+        raise ValueError("MLA scheduler workspace is too small")
+
+    workspace_i32 = workspace[:needed_bytes].view(torch.int32)
+    tile_scheduler_metadata = workspace_i32[:metadata_words].view(
+        num_mp_parts,
+        _FLASH_MLA_METADATA_SIZE,
+    )
+    num_splits = workspace_i32[metadata_words : metadata_words + num_splits_words]
+
+    if not is_inited:
+        _get_mla_ops().get_function("get_mla_decoding_metadata")(
+            seqlens_k,
+            q_seq_per_hk,
+            num_heads_k,
+            None,
+            False,
+            None,
+            tile_scheduler_metadata,
+            num_splits,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    return tile_scheduler_metadata, num_splits
+
+
 def _prepare_mla_query_input(
     x: torch.Tensor, *, require_seq_dense: bool
 ) -> torch.Tensor:
@@ -254,62 +318,6 @@ def _flash_attn_forward(
     )
 
     return out, softmax_lse, *rest
-
-
-def _flash_attn_varlen_backward(
-    dout: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    softcap: float,
-    alibi_slopes: Optional[torch.Tensor],
-    deterministic: bool,
-    rng_state: Optional[torch.Tensor] = None,
-    zero_tensors: bool = False,
-) -> torch.Tensor:
-    # dq, dk, dv are allocated by us so they should already be contiguous
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    _get_flash_attention_ops().get_function("dnn_mha_varlen_bwd")(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dq,
-        dk,
-        dv,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        None,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        zero_tensors,
-        causal,
-        window_size_left,
-        window_size_right,
-        softcap,
-        deterministic,
-        None,
-        None,
-    )
-    return None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -489,7 +497,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                     (batch, nr_heads, seq_q), dtype=torch.float32, device=q.device
                 )
 
-            _get_flash_attention_ops().get_function("flash_atten_varlen_asm")(
+            flash_atten_varlen_asm_mubin(
                 q,
                 k,
                 v,
@@ -510,7 +518,17 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
         is_grad = any(x.requires_grad for x in [q, k, v])
         if is_grad:
-            ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
+            ctx.save_for_backward(
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+            )
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
             ctx.softmax_scale = softmax_scale
@@ -525,99 +543,42 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
-        headdim = q.shape[-1]
-        use_tilelang_bwd = headdim == v.shape[-1] and headdim in (128, 256)
-        if use_tilelang_bwd:
-            from .flash_attention.tilelang.flash_attention_varlen_bwd import (
-                flashattn_varlen_bwd_interface,
-            )
+        (
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+        ) = ctx.saved_tensors
+        from .flash_attention.tilelang.flash_attention_varlen_bwd import (
+            flashattn_varlen_bwd_interface,
+        )
 
-            dq, dk, dv = flashattn_varlen_bwd_interface(
-                q,
-                k,
-                v,
-                out,
-                dout,
-                softmax_lse,
-                ctx.max_seqlen_q,
-                ctx.max_seqlen_k,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                is_causal=ctx.causal,
-                smscale=ctx.softmax_scale,
-                dtype=None,
-                is_bhsd=False,
-                deterministic=ctx.deterministic,
-            )
-        else:
-            # dnn bwd need (b,h max_q) lse but fwd lse is (h, total_q) currently!
-            def lse_varlen_to_padded(lse_flat, cu_seqlen_q, max_q, pad_value=0.0):
-                # lse_flat: [H, total_Q]
-                # lse_padded: [H, b, max_q]
-                H, total_Q = lse_flat.shape
-                # b = cu_seqlen_q.shape[0] - 1
-                device = lse_flat.device
-                seq_ids = torch.arange(max_q, device=device).unsqueeze(0)
-                offsets = cu_seqlen_q[:-1].unsqueeze(1)
-                indices = seq_ids + offsets
-                seqlens = cu_seqlen_q[1:] - cu_seqlen_q[:-1]
-                valid_mask = seq_ids < seqlens.unsqueeze(1)
-                indices = torch.clamp(indices, 0, total_Q - 1)
-                lse_gathered = lse_flat[:, indices]
-                lse_padded = torch.where(
-                    valid_mask.unsqueeze(0),
-                    lse_gathered,
-                    torch.tensor(pad_value, device=device, dtype=lse_flat.dtype),
-                )
-                return lse_padded.permute(1, 0, 2).contiguous()
-
-            is_varlen = cu_seqlens_q is not None and cu_seqlens_k is not None
-            if not is_varlen:
-                raise ValueError("DNN fallback backward currently supports varlen only")
-            q_bwd, k_bwd, v_bwd = q, k, v
-            out_bwd, dout_bwd = out, dout
-            cu_seqlens_q_bwd = cu_seqlens_q
-            cu_seqlens_k_bwd = cu_seqlens_k
-            max_seqlen_q_bwd = ctx.max_seqlen_q
-            max_seqlen_k_bwd = ctx.max_seqlen_k
-            softmax_lse_bwd = lse_varlen_to_padded(
-                softmax_lse, cu_seqlens_q, ctx.max_seqlen_q
-            )
-            dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-            dq_bwd = dq
-            dk_bwd = dk
-            dv_bwd = dv
-            head_size_og = dout_bwd.size(2)
-            dout_padded = dout_bwd
-            if head_size_og % 8 != 0:
-                dout_padded = torch.nn.functional.pad(
-                    dout_bwd, [0, 8 - head_size_og % 8]
-                )
-            _flash_attn_varlen_backward(
-                dout_padded,
-                q_bwd,
-                k_bwd,
-                v_bwd,
-                out_bwd,
-                softmax_lse_bwd,
-                dq_bwd,
-                dk_bwd,
-                dv_bwd,
-                cu_seqlens_q_bwd,
-                cu_seqlens_k_bwd,
-                max_seqlen_q_bwd,
-                max_seqlen_k_bwd,
-                dropout_p=0.0,
-                softmax_scale=ctx.softmax_scale,
-                causal=ctx.causal,
-                window_size_left=ctx.window_size[0],
-                window_size_right=ctx.window_size[1],
-                softcap=ctx.softcap,
-                alibi_slopes=None,
-                deterministic=ctx.deterministic,
-                rng_state=None,
-            )
+        dq, dk, dv = flashattn_varlen_bwd_interface(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            softmax_lse,
+            ctx.max_seqlen_q,
+            ctx.max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            is_causal=ctx.causal,
+            window_size=ctx.window_size,
+            softcap=ctx.softcap,
+            smscale=ctx.softmax_scale,
+            dtype=None,
+            is_bhsd=False,
+            deterministic=ctx.deterministic,
+        )
         # dq = dq[..., : dout.shape[-1]]
         # dk = dk[..., : dout.shape[-1]]
         # dv = dv[..., : dout.shape[-1]]
@@ -810,8 +771,8 @@ def flash_attn_combine(
 
 @mate_api
 def flash_attn_with_kvcache(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
+    q: Optional[torch.Tensor],
+    k_cache: Optional[torch.Tensor],
     v_cache: torch.Tensor,
     k: Optional[torch.Tensor] = None,
     v: Optional[torch.Tensor] = None,
@@ -847,17 +808,20 @@ def flash_attn_with_kvcache(
     cp_world_size: int = 1,
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
+    only_qv: bool = False,
 ):
     r"""FlashAttention3 compatible API: forward with kv cache
 
     Parameters
     ----------
-    q : Tensor
+    q : Optional[Tensor]
         The query tensor with shape ``(batch_size, seqlen, nheads, headdim)`` if cu_seqlens_q is None,
-        or ``(total_q, nheads, headdim)`` if cu_seqlens_q is not None
-    k_cache : Tensor
+        or ``(total_q, nheads, headdim)`` if cu_seqlens_q is not None. May be ``None`` when
+        ``only_qv=True``.
+    k_cache : Optional[Tensor]
         The key cache tensor with shape ``(batch_size_cache, seqlen_cache, nheads_k, headdim)`` if there's no page_table,
-        or ``(num_blocks, page_block_size, nheads_k, headdim)`` if there's a page_table (i.e. paged KV cache)
+        or ``(num_blocks, page_block_size, nheads_k, headdim)`` if there's a page_table (i.e. paged KV cache).
+        May be ``None`` when ``only_qv=True``.
 
     v_cache : Tensor
         The value cache tensor with shape ``(batch_size_cache, seqlen_cache, nheads_k, headdim_v)`` if there's no page_table,
@@ -938,6 +902,8 @@ def flash_attn_with_kvcache(
         ``(batch_size + 1,)``, dtype ``int32``. Required when CP is enabled (``cp_world_size > 1``)
         so that each rank can correctly compute causal masking boundaries against the full
         key sequence. Ignored when ``cp_world_size == 1``.
+    only_qv: bool
+        Skip the QK score and use only the QV score.
 
     Returns
     -------
@@ -953,6 +919,24 @@ def flash_attn_with_kvcache(
           or ``(nheads, total_q)`` if cu_seqlens_q is not None
 
     """
+    if only_qv:
+        if qv is None:
+            raise ValueError("only_qv=True requires qv")
+        if isinstance(scheduler_metadata, tuple):
+            raise ValueError("only_qv=True does not support MLA ASM scheduler metadata")
+        if q is None:
+            q = torch.empty((*qv.shape[:-1], 64), dtype=qv.dtype, device=qv.device)
+        if k_cache is None:
+            k_cache = torch.empty(
+                (*v_cache.shape[:-1], 64),
+                dtype=v_cache.dtype,
+                device=v_cache.device,
+            )
+    else:
+        if q is None:
+            raise ValueError("q can only be None when only_qv=True")
+        if k_cache is None:
+            raise ValueError("k_cache can only be None when only_qv=True")
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     if window_size is None:
@@ -960,9 +944,11 @@ def flash_attn_with_kvcache(
     if attention_chunk is None:
         attention_chunk = 0
     if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
-            -0.5
-        )
+        softmax_scale = (
+            qv.shape[-1]
+            if only_qv
+            else q.shape[-1] + (qv.shape[-1] if qv is not None else 0)
+        ) ** -0.5
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
@@ -979,22 +965,51 @@ def flash_attn_with_kvcache(
         mla_qv = _prepare_mla_query_input(mla_qv, require_seq_dense=require_seq_dense)
         mla_q = _prepare_mla_query_input(mla_q, require_seq_dense=require_seq_dense)
         out, softmax_lse = _allocate_mla_decode_outputs(mla_q, mla_qv.shape[-1])
-        _get_mla_ops().get_function("dispatch_mla_impl_for_fa_interface")(
-            mla_qv,
-            mla_q,
-            v_cache,
-            k_cache,
-            cache_seqlens,
-            page_table,
-            softmax_scale,
-            causal,
-            cu_seqlens_q,
-            max_seqlen_q,
-            out,
-            softmax_lse,
-            scheduler_metadata[0] if scheduler_metadata is not None else None,
-            scheduler_metadata[1] if scheduler_metadata is not None else False,
+        tile_scheduler_metadata, mla_num_splits = (
+            _prepare_mla_scheduler_metadata_from_workspace(
+                scheduler_metadata[0],
+                scheduler_metadata[1],
+                mla_qv,
+                v_cache,
+                cache_seqlens,
+                cu_seqlens_q,
+                max_seqlen_q,
+            )
         )
+        if use_flash_mla_asm:
+            flash_mla_asm_mubin(
+                mla_qv,
+                mla_q,
+                v_cache,
+                k_cache,
+                cache_seqlens,
+                page_table,
+                tile_scheduler_metadata,
+                mla_num_splits,
+                out,
+                softmax_lse,
+                softmax_scale,
+                causal,
+                cu_seqlens_q,
+                max_seqlen_q,
+            )
+        else:
+            _get_mla_ops().get_function("mla_with_kvcache")(
+                mla_qv,
+                mla_q,
+                v_cache,
+                k_cache,
+                cache_seqlens,
+                cu_seqlens_q,
+                max_seqlen_q,
+                page_table,
+                tile_scheduler_metadata,
+                mla_num_splits,
+                out,
+                softmax_lse,
+                softmax_scale,
+                causal,
+            )
         rest = []
     else:
         out, softmax_lse, *rest = jit_fmha_fwd(
@@ -1038,6 +1053,7 @@ def flash_attn_with_kvcache(
             cp_world_size=cp_world_size,
             cp_rank=cp_rank,
             cp_tot_seqused_k=cp_tot_seqused_k,
+            only_qv=only_qv,
         )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out

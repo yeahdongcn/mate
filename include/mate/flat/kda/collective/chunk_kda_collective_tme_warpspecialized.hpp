@@ -147,6 +147,8 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
   static constexpr int VPermuteMmaAtomN = 8;
   static constexpr int VPermuteRepeat   = kHeadDim / VPermuteMmaAtomN;
   static_assert(kHeadDim % VPermuteMmaAtomN == 0);
+  static constexpr int GmemVPermuteBlocks = VPermuteRepeat / VPermuteMmaAtomN;
+  static_assert(VPermuteRepeat % VPermuteMmaAtomN == 0);
 
   using R2SFragmentType   = mute::uint_bit_t<R2SVectorBits>;
   using UMmaPermuteTile   = decltype(filter(
@@ -155,10 +157,14 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
   using PermuteTiledMmaPU = decltype(mate::convert_to_permuted_sqmma(TiledMmaPU{}, PermuteTileForU{}));
   using PermuteVTile =
       decltype(filter(make_ordered_layout(Shape<Int<VPermuteMmaAtomN>, Int<VPermuteRepeat>>{}, Step<_2, _1>{})));
-  using R2SCopyAtom        = Copy_Atom<UniversalCopy<R2SFragmentType>, Element>;
-  using R2STiledCopy       = decltype(make_tiled_copy_C(R2SCopyAtom{}, PermuteTiledMmaPU{}));
-  using StateGmemCopyAtom  = Copy_Atom<UniversalCopy<StateElement>, StateElement>;
-  using StateGmemTiledCopy = decltype(make_tiled_copy_C(StateGmemCopyAtom{}, TiledMmaKU{}));
+  // SQMMA fragments enumerate V in 8x8-transposed blocks. Compose this
+  // internal-to-natural mapping into gmem views so vectorized copies/casts stay unchanged.
+  using InternalToNaturalVLayout = decltype(filter(make_ordered_layout(
+      Shape<Int<VPermuteMmaAtomN>, Int<VPermuteMmaAtomN>, Int<GmemVPermuteBlocks>>{}, Step<_2, _1, _3>{})));
+  using R2SCopyAtom              = Copy_Atom<UniversalCopy<R2SFragmentType>, Element>;
+  using R2STiledCopy             = decltype(make_tiled_copy_C(R2SCopyAtom{}, PermuteTiledMmaPU{}));
+  using StateGmemCopyAtom        = Copy_Atom<UniversalCopy<StateElement>, StateElement>;
+  using StateGmemTiledCopy       = decltype(make_tiled_copy_C(StateGmemCopyAtom{}, TiledMmaKU{}));
 
   using SmemLayoutG       = SmemLayoutQ;
   using SmemLayoutGCumsum = decltype(as_position_independent_swizzle_layout(take<0, 2>(SmemLayoutG{})));
@@ -353,7 +359,7 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
         NumOutputWarps,                  // PReady
         NumProducerWarps,                // DtBiasLoaded
         mutlass::NumWarpsPerWarpSquad,   // InverseReadySmemReady
-        NumStateWarps + NumOutputWarps,  // VUpdatedReadyConsumed
+        NumStateWarps + NumOutputWarps,  // VUpdatedConsumed
         NumOutputWarps,                  // StateConsumed
     };
     if (tid == 0) {
@@ -580,16 +586,28 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
     auto       cState     = make_identity_tensor(make_shape(Int<kHeadDim>{}, Int<kHeadDim>{}));
     auto       tCcState   = thr_mma_ku.partition_C(cState);
     using StateVec        = mutlass::Array<float, VecSize>;
+    using ElementVec      = mutlass::Array<Element, VecSize>;
     auto rStateVec        = recast<StateVec const>(rState);
+    auto rStateCvt        = make_fragment_like<Element>(rState);
+    auto rStateCvtVec     = recast<ElementVec>(rStateCvt);
+    mutlass::NumericArrayConverter<Element, float, VecSize, mutlass::FloatRoundStyle::round_to_nearest> convert_state;
 
     MUTLASS_PRAGMA_UNROLL
     for (int vec_idx = 0; vec_idx < size(rStateVec); ++vec_idx) {
-      int    i       = vec_idx * VecSize;
-      int    col_k   = int(get<0>(tCcState(i)));
-      int    state_v = PermuteVTile{}(int(get<1>(tCcState(i))));
-      float  scale   = sGShifted(col_k);
-      float4 values  = simd::vmul(reinterpret_cast<float4 const&>(rStateVec(vec_idx)), scale);
-      simd::store_float4_to_packed4_rn(&sState(make_coord(state_v, col_k)), values);
+      int    base           = vec_idx * VecSize;
+      int    col_k          = int(get<0>(tCcState(base)));
+      float  scale          = sGShifted(col_k);
+      float4 values         = simd::vmul(reinterpret_cast<float4 const&>(rStateVec(vec_idx)), scale);
+      rStateCvtVec(vec_idx) = convert_state(reinterpret_cast<StateVec const&>(values));
+    }
+
+    // KU accumulator coordinates already use the V basis consumed by PU. Keep
+    // those coordinates when scattering into the swizzled state tile.
+    MUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(rStateCvt); ++i) {
+      int col_k                        = int(get<0>(tCcState(i)));
+      int col_v                        = int(get<1>(tCcState(i)));
+      sState(make_coord(col_v, col_k)) = rStateCvt(i);
     }
     named_barrier_arrive(KdaNamedBarrier::StateCommitted);
   }
@@ -608,7 +626,9 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
           make_shape(problem_size.N, problem_size.H, Int<kHeadDim>{}, Int<kHeadDim>{}),
           make_stride(
               int64_t(problem_size.H * kHeadDim * kHeadDim), int64_t(kHeadDim * kHeadDim), _1{}, int64_t(kHeadDim)));
-      auto   gState    = mState(work_desc.seq_idx, work_desc.head_idx, _, _);
+      auto permuted_state =
+          make_tensor(mState.data(), composition(mState.layout(), make_tile(_, _, _, InternalToNaturalVLayout{})));
+      auto   gState    = permuted_state(work_desc.seq_idx, work_desc.head_idx, _, _);
       Tensor tSgState  = thr_copy_state.partition_S(gState);
       Tensor rStateCvt = make_fragment_like<StateElement>(rState);
       Tensor tSrState  = thr_copy_state.retile_D(rStateCvt);
@@ -646,7 +666,9 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
           make_shape(problem_size.N, problem_size.H, Int<kHeadDim>{}, Int<kHeadDim>{}),
           make_stride(
               int64_t(problem_size.H * kHeadDim * kHeadDim), int64_t(kHeadDim * kHeadDim), _1{}, int64_t(kHeadDim)));
-      auto   gState     = mState(work_desc.seq_idx, work_desc.head_idx, _, _);
+      auto permuted_state =
+          make_tensor(mState.data(), composition(mState.layout(), make_tile(_, _, _, InternalToNaturalVLayout{})));
+      auto   gState     = permuted_state(work_desc.seq_idx, work_desc.head_idx, _, _);
       Tensor rStateCvt  = make_fragment_like<StateElement>(rState);
       Tensor tSrState   = thr_copy_state.retile_S(rStateCvt);
       Tensor tDgState   = thr_copy_state.partition_D(gState);
@@ -768,9 +790,6 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       gemm(tiled_mma_inverse, acc_inverse, tSrKDecayed, tSrKInverse, acc_inverse);
       mate::warpsquad_commit_batch();
       mate::warpsquad_wait();
-      if constexpr (!IsFinalChunk::value) {
-        named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
-      }
 
       // we put load_beta after warpsquad_wait to avoid the weird compiler MTGPU-DEPENDENCY-GRAPH warning
       bool is_not_full_chunk = IsFinalChunk::value && work_desc.actual_len(chunk_idx) < kChunk;
@@ -804,9 +823,6 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       gemm(tiled_mma_qk_p, acc_p, tSrQDecayed, tSrKInverse, acc_p);
       mate::warpsquad_commit_batch();
       mate::warpsquad_wait();
-      if constexpr (!IsFinalChunk::value) {
-        named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
-      }
 
       MUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(acc_p) / VecSize; ++i) {
@@ -1013,11 +1029,23 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       commit_state(sState, rState, shared_storage, stage, local_tid);
 
       named_barrier_wait(KdaNamedBarrier::OperandsReady, phase);
+      if constexpr (!decltype(is_first_chunk)::value) {
+        // inverse/P share one stage across chunks.  Do not overwrite the
+        // previous tiles until both the state and output squads have consumed
+        // the previous U/inverse/P epoch.
+        named_barrier_wait(KdaNamedBarrier::VUpdatedConsumed, uint32_t((chunk_idx - 1) & 1));
+      }
       prepare_state_operands(shared_storage, params, problem_size, work_desc, chunk_idx, local_tid, is_final_chunk);
       scale_state(rState, shared_storage, stage, local_tid);
+      if constexpr (!decltype(is_final_chunk)::value) {
+        named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
+      }
       if constexpr (!(decltype(is_final_chunk)::value && !HasStateOut)) {
         issue_state_update(rState, shared_storage, stage, local_tid, phase);
         mate::warpsquad_wait();
+      }
+      if constexpr (!decltype(is_final_chunk)::value) {
+        named_barrier_arrive(KdaNamedBarrier::VUpdatedConsumed);
       }
     };
 
@@ -1154,22 +1182,22 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       mate::warpsquad_commit_batch();
     };
     auto store_output = [&](int chunk_idx, auto is_final_chunk) INLINE_LAMBDA {
-      int        actual_len        = work_desc.actual_len(chunk_idx);
-      bool       is_not_full_chunk = decltype(is_final_chunk)::value && actual_len < kChunk;
-      auto       mOut              = make_tensor(make_gmem_ptr(params.ptr_out),
+      int  actual_len        = work_desc.actual_len(chunk_idx);
+      bool is_not_full_chunk = decltype(is_final_chunk)::value && actual_len < kChunk;
+      auto mOut              = make_tensor(make_gmem_ptr(params.ptr_out),
                               make_shape(Int<kHeadDim>{}, problem_size.T, make_shape(problem_size.H, problem_size.B)),
                               params.stride_out);
-      TiledMmaQS tiled_mma_output  = TiledMmaQS{};
-      auto       thr_mma_output    = tiled_mma_output.get_thread_slice(local_tid);
-      auto       cOutput           = make_identity_tensor(make_shape(Int<kChunk>{}, Int<kHeadDim>{}));
-      auto       tCcOutput         = thr_mma_output.partition_C(cOutput);
-      using AccumVec               = mutlass::Array<float, VecSize>;
-      using ElementVec             = mutlass::Array<Element, VecSize>;
-      auto output_vec              = recast<AccumVec const>(acc_output);
+      auto permuted_out =
+          make_tensor(mOut.data(), composition(mOut.layout(), make_tile(InternalToNaturalVLayout{}, _, _)));
+      TiledMmaQS tiled_mma_output = TiledMmaQS{};
+      auto       thr_mma_output   = tiled_mma_output.get_thread_slice(local_tid);
+      auto       cOutput          = make_identity_tensor(make_shape(Int<kChunk>{}, Int<kHeadDim>{}));
+      auto       tCcOutput        = thr_mma_output.partition_C(cOutput);
+      using AccumVec              = mutlass::Array<float, VecSize>;
+      using ElementVec            = mutlass::Array<Element, VecSize>;
+      auto output_vec             = recast<AccumVec const>(acc_output);
       mutlass::NumericArrayConverter<Element, float, VecSize, mutlass::FloatRoundStyle::round_to_nearest>
           convert_output;
-      mate::warpsquad_wait();
-
       MUTLASS_PRAGMA_UNROLL
       for (int vec_idx = 0; vec_idx < size(output_vec); ++vec_idx) {
         int        base   = vec_idx * VecSize;
@@ -1180,7 +1208,7 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
           int row = int(get<0>(tCcOutput(base + j)));
           int col = int(get<1>(tCcOutput(base + j)));
           if (!is_not_full_chunk || row < actual_len) {
-            auto* ptr = &mOut(make_coord(
+            auto* ptr = &permuted_out(make_coord(
                 col, work_desc.tme_token(chunk_idx) + row, make_coord(work_desc.head_idx, work_desc.tme_batch())));
             *ptr      = packed[j];
           }
@@ -1206,12 +1234,24 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       prepare_k_restored_half(stage, 16);
       named_barrier_arrive(KdaNamedBarrier::KRestoredReady);
       mate::warpsquad_wait();
+      // The producer-owned q/k/g-total tiles and the committed state tile are
+      // no longer read after the output squad's prior MMAs have completed.
+      // Release those two dependencies independently; U is still live until
+      // the intra-output MMA below finishes.
       if constexpr (!decltype(is_final_chunk)::value) {
         named_barrier_arrive(KdaNamedBarrier::OperandsConsumed);
         named_barrier_arrive(KdaNamedBarrier::StateConsumed);
       }
       update_v(shared_storage, stage, local_tid, phase);
       issue_intra_output(stage, phase);
+      mate::warpsquad_wait();
+      if constexpr (!decltype(is_final_chunk)::value) {
+        // Both state and output have now consumed this scratch epoch.  The next
+        // state chunk may reuse inverse/P, and output's sequential execution
+        // guarantees U is not reused before the state squad reaches its next
+        // StateCommitted handoff.
+        named_barrier_arrive(KdaNamedBarrier::VUpdatedConsumed);
+      }
       store_output(chunk_idx, is_final_chunk);
     };
 

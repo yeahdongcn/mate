@@ -11,6 +11,7 @@ from ... import env as jit_env
 from ...core import JitSpec, gen_jit_spec
 from ....utils import ceil_div
 from .fmha_utils import (
+    _FP8_DTYPES,
     _get_fwd_kernel_config,
     fmha_extra_include_paths,
     get_fmha_template,
@@ -321,6 +322,11 @@ specs_attn = [
         default=False,
     ),
     ParamSpec(
+        name="only_qv",
+        domain=[False],
+        default=False,
+    ),
+    ParamSpec(
         name="is_packgqa",
         domain=domain_by_case(config_selector, CONFIG_TABLE, "is_packgqa"),
         depends_on=("config_level",),
@@ -340,24 +346,21 @@ specs_attn = [
     ParamSpec(
         name="has_q_descale",
         domain=[False],
-        meaningful_if=lambda cfg: cfg["dtype"]
-        in [torch.float8_e4m3fn, torch.float8_e5m2],
+        meaningful_if=lambda cfg: cfg["dtype"] in _FP8_DTYPES,
         depends_on=("dtype",),
         sweep=False,
     ),
     ParamSpec(
         name="has_k_descale",
         domain=[False],
-        meaningful_if=lambda cfg: cfg["dtype"]
-        in [torch.float8_e4m3fn, torch.float8_e5m2],
+        meaningful_if=lambda cfg: cfg["dtype"] in _FP8_DTYPES,
         depends_on=("dtype",),
         sweep=False,
     ),
     ParamSpec(
         name="has_v_descale",
         domain=[False],
-        meaningful_if=lambda cfg: cfg["dtype"]
-        in [torch.float8_e4m3fn, torch.float8_e5m2],
+        meaningful_if=lambda cfg: cfg["dtype"] in _FP8_DTYPES,
         depends_on=("dtype",),
         sweep=False,
     ),
@@ -583,6 +586,7 @@ def _fmha_fwd(
     cp_world_size: int = 1,
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
+    only_qv: bool = False,
 ):
     # Feature gates.
     assert not ((k_new is None) ^ (v_new is None)), (
@@ -651,8 +655,8 @@ def _fmha_fwd(
         )
     ), "inputs must be on MUSA device"
 
-    assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn], (
-        "inputs must be float16, bfloat16, or float8_e4m3fn"
+    assert q.dtype in (torch.float16, torch.bfloat16, *_FP8_DTYPES), (
+        "inputs must be float16, bfloat16, float8_e4m3fn, or float8_e5m2"
     )
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     if q_v is not None:
@@ -812,8 +816,10 @@ def _fmha_fwd(
         # assert q.dtype in (torch.float16, torch.bfloat16), (
         #     "q_v is only supported for fp16 and bf16 data type"
         # )
+    if only_qv:
+        assert q_v is not None, "only_qv=True requires q_v"
     # FP8
-    if q.dtype == torch.float8_e4m3fn:
+    if q.dtype in _FP8_DTYPES:
         if q_descale is not None:
             assert q_descale.shape == (batch_size, num_head_kv)
         if k_descale is not None:
@@ -831,7 +837,7 @@ def _fmha_fwd(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(
-            head_dim + (head_dim_v if q_v is not None else 0)
+            head_dim_v if only_qv else head_dim + (head_dim_v if q_v is not None else 0)
         )
 
     qhead_per_kvhead = num_head // num_head_kv
@@ -873,7 +879,7 @@ def _fmha_fwd(
         "Local attention (sliding window) is not currently supported with context parallelism (cp_world_size > 1)."
     )
 
-    out_torch_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+    out_torch_dtype = torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype
     q_batch_seqlen_shape = (
         (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     )
@@ -929,7 +935,7 @@ def _fmha_fwd(
         q.element_size(),
         kernel_pack_gqa,
         q_v is not None,
-        q.dtype in [torch.float8_e4m3fn, torch.float8_e5m2],
+        q.dtype in _FP8_DTYPES,
     )
     # print(
     #     f"{tile_m=}, {tile_n=}, {stages_k=}, {stages_v=}, {headdim_rounded=}, {headdim_v_rounded=}, {consumers_qk=}, {consumers_pv=}, {enable_packgqa=}"
@@ -980,6 +986,7 @@ def _fmha_fwd(
         "has_seqlens_rotary": seqlens_rotary is not None,
         "has_attention_chunk": attention_chunk > 0,
         "has_qv": q_v is not None,
+        "only_qv": only_qv,
     }
     # print(f"tile_m: {tile_m}, tile_n: {tile_n}")
 

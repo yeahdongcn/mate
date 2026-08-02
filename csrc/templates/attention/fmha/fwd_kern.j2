@@ -60,6 +60,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
 ) {
   // FMHA config
   constexpr bool HasQv = {{ 'true' if has_qv else 'false' }};
+  constexpr bool OnlyQv = {{ 'true' if only_qv else 'false' }};
   constexpr bool HasCuseqlensQ = {{ 'true' if has_cu_seqlens_q else 'false' }};
   constexpr bool HasCuseqlensK = {{ 'true' if has_cu_seqlens_k else 'false' }};
   constexpr bool HasSequsedQ = {{ 'true' if has_seqused_q else 'false' }};
@@ -139,6 +140,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                          HasSoftcap,
                                                          IsAppendKV,
                                                          HasQv,
+                                                         OnlyQv,
                                                          HeadRatio,
                                                          IsPackGQA,
                                                          IsSplit /*Split*/,

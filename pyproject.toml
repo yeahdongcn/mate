@@ -12,18 +12,18 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dynamic = ["version"]
 dependencies = [
-    "apache-tvm-ffi>=0.1.8",
+    "apache-tvm-ffi==0.1.9.post3",
     "torch>=2.7.0",
     "click>=8.0.0",
     "jinja2",
     "packaging>=24",
+    "requests",
 ]
 
 [tool.setuptools.dynamic]
@@ -70,6 +70,7 @@ ignore = [
 [tool.setuptools.packages.find]
 where=["."]
 include=["mate*"]
+exclude=["mate-mubin*"]
 
 [tool.setuptools.package-data]
 "mate" = ["_build_meta.py"]
@@ -80,14 +81,14 @@ include=["mate*"]
 # Full functionality including safetensors support and TileLang-backed ops
 all = [
     "safetensors>=0.4.0",
-    "tilelang",
+    "tilelang-musa==0.1.8",
 ]
 
 # CLI extension for full replay support (safetensors enables tensor dump/replay)
 cli = ["safetensors>=0.4.0"]
 
 # TileLang-backed operators such as FlashMLA / GDN
-tilelang = ["tilelang-musa"]
+tilelang = ["tilelang-musa==0.1.8"]
 
 # Testing dependencies
 testing = [
@@ -109,7 +110,7 @@ dev = [
     "numpy",
     "safetensors>=0.4.0",
     "pytest>=7.0.0",
-    "tilelang-musa",
+    "tilelang-musa==0.1.8",
     "triton",
 ]
 

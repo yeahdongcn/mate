@@ -17,13 +17,16 @@ import sys
 import json
 import re
 import importlib
+import shlex
 import signal
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import click
 
 TVM_FFI_PACKAGE_NAME = "apache-tvm-ffi"
+MATE_WHEEL_INDEX_URL = "https://dl.mthreads.com/repo/api/pypi/pypi/simple"
 TVM_FFI_INSTALL_HINT = (
     "Install/build apache-tvm-ffi from the MooreThreads MUSA fork: "
     "https://github.com/MooreThreads/tvm-ffi. Use a release tag "
@@ -117,6 +120,10 @@ ENV_VARS = {
     "MATE_EXTRA_MUSAFLAGS": "Extra mcc flags for JIT builds",
     "MATE_EXTRA_LDFLAGS": "Extra linker flags for JIT builds",
     "MATE_MCC": "Override the mcc compiler path used by JIT builds",
+    "MATE_MUBIN_DIR": "Directory for explicit MUBIN artifact downloads",
+    "MATE_MUBIN_NO_DOWNLOAD": "Set to disable automatic MUBIN artifact downloads",
+    "MATE_MUBIN_VERIFY_DISABLED": "Set to disable MUBIN artifact hash verification",
+    "MATE_MUBIN_DOWNLOAD_VERBOSE": "Show verbose MUBIN download output (0/1)",
 }
 
 
@@ -842,6 +849,118 @@ def clear_cache_cmd():
         click.secho("JIT cache cleared successfully.", fg="green")
     except Exception as exc:
         click.secho(f"Failed to clear JIT cache: {exc}", fg="red")
+
+
+@cli.command("install-mubin-wheel")
+@click.option(
+    "--mate-version",
+    default=None,
+    help="MATE version to match (defaults to the running MATE version).",
+)
+@click.option(
+    "--index-url",
+    default=MATE_WHEEL_INDEX_URL,
+    show_default=True,
+    help="Python package index containing mate-mubin wheels.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the pip command without running it.",
+)
+def install_mubin_wheel_cmd(
+    mate_version: str | None,
+    index_url: str,
+    dry_run: bool,
+):
+    """Install the mate-mubin wheel matching MATE."""
+    version = _public_version(mate_version or __version__)
+    if version == "unknown":
+        raise click.ClickException(
+            "Unable to resolve the MATE version; pass --mate-version explicitly."
+        )
+
+    requirement = f"mate-mubin=={version}"
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--no-deps",
+        "--index-url",
+        index_url,
+        requirement,
+    ]
+    click.echo(shlex.join(command))
+    if dry_run:
+        return
+
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise click.ClickException(
+            f"Failed to install {requirement} (pip exited with {result.returncode})"
+        )
+
+
+@cli.command("download-mubin")
+def download_mubin_cmd():
+    """Download MATE MUBIN metadata and kernel artifacts."""
+    try:
+        from mate.artifacts import download_artifacts, resolve_mubin_output_dir
+
+        output_dir = resolve_mubin_output_dir()
+        downloaded = download_artifacts(output_dir)
+        click.secho(
+            f"Downloaded {len(downloaded)} MATE MUBIN metadata/kernel files to "
+            f"{output_dir}",
+            fg="green",
+        )
+    except Exception as exc:
+        click.secho(f"Failed to download MATE MUBIN artifacts: {exc}", fg="red")
+
+
+@cli.command("list-mubins")
+def list_mubins_cmd():
+    """List active MATE MUBIN artifact status by module."""
+    try:
+        from mate.artifacts import get_active_mubin_artifacts_status
+
+        active_dir, source, statuses = get_active_mubin_artifacts_status()
+    except Exception as exc:
+        click.secho(f"Failed to list MATE MUBIN artifacts: {exc}", fg="red")
+        return
+
+    print_header("MATE MUBIN Artifacts")
+    print_kv("Source", source)
+    print_kv("Directory", str(active_dir))
+    click.echo()
+    for module, status, module_dir in statuses:
+        status_color = {
+            "Downloaded": "green",
+            "Metadata only": "cyan",
+            "Incomplete": "yellow",
+        }.get(status, "red")
+        click.secho(f"{module:<20} ", fg="white", nl=False)
+        click.secho(f"{status:<12} ", fg=status_color, nl=False)
+        click.secho(str(module_dir), fg="cyan")
+
+
+@cli.command("clear-mubin")
+def clear_mubin_cmd():
+    """Clear the configured MATE MUBIN artifact directory."""
+    try:
+        from mate.artifacts import clear_mubin_artifacts
+
+        output_dir, cleared = clear_mubin_artifacts()
+        if cleared:
+            click.secho(f"MUBIN artifacts cleared: {output_dir}", fg="green")
+        else:
+            click.secho(
+                f"MUBIN artifact directory does not exist: {output_dir}", fg="yellow"
+            )
+    except Exception as exc:
+        click.secho(f"Failed to clear MATE MUBIN artifacts: {exc}", fg="red")
 
 
 @cli.command("replay")

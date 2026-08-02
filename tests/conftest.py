@@ -27,6 +27,36 @@ class _PytestGuardConfig:
     log_allocations: bool
 
 
+@pytest.fixture
+def disable_mudnn_tf32():
+    mudnn = getattr(torch.backends, "mudnn", None)
+    if mudnn is None:
+        yield
+        return
+
+    original_allow_tf32 = mudnn.allow_tf32
+    try:
+        mudnn.allow_tf32 = False
+        yield
+    finally:
+        mudnn.allow_tf32 = original_allow_tf32
+
+
+@pytest.fixture
+def enable_musa_tf32():
+    musa_matmul = torch.backends.musa.matmul
+    mudnn = torch.backends.mudnn
+    original_musa_allow_tf32 = musa_matmul.allow_tf32
+    original_mudnn_allow_tf32 = mudnn.allow_tf32
+    try:
+        musa_matmul.allow_tf32 = True
+        mudnn.allow_tf32 = True
+        yield
+    finally:
+        mudnn.allow_tf32 = original_mudnn_allow_tf32
+        musa_matmul.allow_tf32 = original_musa_allow_tf32
+
+
 def _parse_bool_env(name: str, *, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -206,34 +236,40 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help="Disable guard allocator allocation logging.",
     )
-    fmha_group = parser.getgroup("mate-dnn-fmha")
+    fmha_group = parser.getgroup("mate-fmha-bwd")
     fmha_group.addoption(
+        "--fmha-bwd-stress-iters",
         "--dnn-fmha-stress-iters",
+        dest="fmha_bwd_stress_iters",
         action="store",
         type=int,
         default=0,
         help=(
             "Run this many extra stress iterations after each "
-            "tests/test_dnn_fmha.py correctness case."
+            "tests/test_fmha_bwd.py correctness case."
         ),
     )
     fmha_group.addoption(
+        "--fmha-bwd-stress-mode",
         "--dnn-fmha-stress-mode",
+        dest="fmha_bwd_stress_mode",
         action="store",
         choices=("kernel-only", "check"),
         default="kernel-only",
         help=(
-            "DNN FMHA stress mode: kernel-only only launches/synchronizes; "
+            "FMHA BWD stress mode: kernel-only only launches/synchronizes; "
             "check also validates every iteration."
         ),
     )
     fmha_group.addoption(
+        "--fmha-bwd-stress-progress-interval",
         "--dnn-fmha-stress-progress-interval",
+        dest="fmha_bwd_stress_progress_interval",
         action="store",
         type=int,
         default=0,
         help=(
-            "Print DNN FMHA stress progress every N iterations. "
+            "Print FMHA BWD stress progress every N iterations. "
             "0 disables progress output."
         ),
     )
@@ -341,8 +377,8 @@ def _get_shard_config():
 
 
 def _stable_shard_id(key: Path, total: int) -> int:
-    if "test_fmha.py" in key.name:
-        return total - 1  # FA3 tests always at the end in file mode
+    if key.name in {"test_fmha.py", "test_fmha_bwd.py"}:
+        return total - 1  # FMHA tests always run on the final shard in file mode
 
     if total == 1:
         return 0

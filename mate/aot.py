@@ -16,7 +16,6 @@ from mate.jit.guard_allocator import gen_guard_allocator_aot
 from mate.jit.mla_ops import gen_mla_ops_aot
 from mate.jit.mega_moe import gen_mega_moe_runtime_utils_spec
 from mate.jit.moe_fused_gate import gen_moe_fused_gate_aot
-from mate.jit.sage_attention import gen_sage_attention_aot
 
 
 def parse_bool(value: str) -> bool:
@@ -101,7 +100,6 @@ def gen_all_modules(config: dict[str, object] | None = None):
     if attention_aot_level > 0:
         specs.extend(gen_fmha_aot(attention_aot_level))
         specs.extend(gen_mla_ops_aot())
-        specs.extend(gen_sage_attention_aot())
     if add_gemm:
         specs.extend(gen_gemm_ops_aot())
         specs.extend(gen_deep_gemm_gemm_aot())

@@ -10,8 +10,7 @@ import torch.nn.functional as F
 from mate.gdn_prefill import chunk_gated_delta_rule
 
 
-if hasattr(torch.backends, "mudnn"):
-    torch.backends.mudnn.allow_tf32 = False
+pytestmark = pytest.mark.usefixtures("disable_mudnn_tf32")
 
 CHUNK_SIZE = 64
 HEAD_SIZE = 128
