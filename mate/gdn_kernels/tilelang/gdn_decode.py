@@ -10,7 +10,6 @@ import functools
 import tilelang
 import tilelang.language as T
 import torch
-from tvm import tir
 
 __all__ = ["run_gated_delta_rule_decode_vk_fp32"]
 
@@ -260,7 +259,7 @@ def _build_decode_fp32_vk_kernel_factory(
                     for i in T.serial(prefetch_count):
                         prologue_v_tile = start_v_tile + i
                         prologue_v_base = prologue_v_tile * v_tile
-                        T.copy(
+                        T.tma_copy(
                             state[state_slot, hid, prologue_v_base, 0],
                             state_load_stage[i, :, :],
                             barrier=mbars[i],
@@ -333,9 +332,9 @@ def _build_decode_fp32_vk_kernel_factory(
                             # Keep one TME store overlapped with compute, but wait before
                             # reusing its shared-memory stage two iterations later.
                             if local_v_tile > 1:
-                                tir.call_extern("void", "__musa_tme_store_read_wait")
+                                T.tma_store_wait()
                             global_prev_v_base = global_v_base - v_tile
-                            T.copy(
+                            T.tma_copy(
                                 state_store_stage[(local_v_tile - 1) % 2, :, :],
                                 state[
                                     state_slot,
@@ -343,11 +342,9 @@ def _build_decode_fp32_vk_kernel_factory(
                                     global_prev_v_base : global_prev_v_base + v_tile,
                                     :,
                                 ],
-                                disable_tma=False,
                                 inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
                                 outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                             )
-                            tir.call_extern("void", "__musa_tme_store_commit")
                             # Keep the CTA in step after the issuing warp commits the store.
                             T.sync_threads()
 
@@ -403,7 +400,7 @@ def _build_decode_fp32_vk_kernel_factory(
                         if next_local_v_tile < num_v_tiles_per_block:
                             global_next_v_tile = start_v_tile + next_local_v_tile
                             global_next_v_base = global_next_v_tile * v_tile
-                            T.copy(
+                            T.tma_copy(
                                 state[state_slot, hid, global_next_v_base, 0],
                                 state_load_stage[stage_idx_var, :, :],
                                 barrier=mbars[stage_idx_var],
@@ -416,7 +413,7 @@ def _build_decode_fp32_vk_kernel_factory(
                     global_prev_v_base_epi = (
                         start_v_tile + num_v_tiles_per_block - 1
                     ) * v_tile
-                    T.copy(
+                    T.tma_copy(
                         state_store_stage[(num_v_tiles_per_block - 1) % 2, :, :],
                         state[
                             state_slot,
@@ -424,7 +421,6 @@ def _build_decode_fp32_vk_kernel_factory(
                             global_prev_v_base_epi : global_prev_v_base_epi + v_tile,
                             :,
                         ],
-                        disable_tma=False,
                         inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
                         outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                     )

@@ -26,6 +26,10 @@ The current compatibility scope includes:
 - Import path: `fmha_sm100`
 - Runtime backend: MATE MSA operators on MUSA
 
+MUSA wrapper releases use the PEP 440 local version suffix `+musa`, for
+example `0.2.5+musa`. Use `python -m pip show fmha_sm100` to distinguish this
+wrapper from the native package.
+
 ## Requirements
 
 Before using this wrapper, make sure the following are available:
@@ -45,6 +49,15 @@ python -m build --wheel
 The generated wheel will be placed under `dist/`.
 
 ## Installation
+
+For delivered packages, install from the external MUSA wheel source:
+
+```bash
+python -m pip install fmha_sm100 \
+  --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+```
+
+This installs the matching `mate` dependency automatically.
 
 For local wrapper development, install from source:
 

@@ -1,5 +1,6 @@
 """Runtime helpers shared by MATE Python APIs and compatibility wrappers."""
 
+import functools
 from typing import Optional
 
 import torch
@@ -13,9 +14,14 @@ def _device_index(device: Optional[torch.device] = None) -> int:
     return device.index
 
 
+@functools.cache
+def _get_physical_num_mps(device_index: int) -> int:
+    return torch.musa.get_device_properties(device_index).multi_processor_count
+
+
 def get_physical_num_mps(device: Optional[torch.device] = None) -> int:
     """Return the physical MUSA MP count for ``device``."""
-    return torch.musa.get_device_properties(_device_index(device)).multi_processor_count
+    return _get_physical_num_mps(_device_index(device))
 
 
 def get_num_mps() -> int:

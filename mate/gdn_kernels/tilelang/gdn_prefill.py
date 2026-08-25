@@ -24,8 +24,6 @@ __all__ = ["fused_chunk_gdn_prefill"]
         "-mllvm",
         "-mtgpu-if-convert=1",
         "-mllvm",
-        "-misched=mtgpu-max-ilp",
-        "-mllvm",
         "-mtgpu-tiny-offset-hint=1",
         "-mllvm",
         "-mtgpu-enable-postra-sched=0",
@@ -364,7 +362,7 @@ def tilelang_fused_chunk_gdn_prefill(
                     # K can be a split-QKV strided view; TileLang emits a TMA
                     # descriptor with the tensor strides, and TMA pads tail OOB.
                     if tx == 256:
-                        T.copy(
+                        T.tma_copy(
                             k[batch_idx, load_left:load_right, bhg, 0:DK],
                             scaled_k_shared,
                             barrier=scaled_k_is_ready,
@@ -447,7 +445,7 @@ def tilelang_fused_chunk_gdn_prefill(
                         load_left = seq_start_idx + i_s * block_S
                         load_right = load_left + block_S
                         if tx == 768:
-                            T.copy(
+                            T.tma_copy(
                                 q[batch_idx, load_left:load_right, bhg, 0:DK],
                                 q_shared[i_s % 2, :, :],
                                 barrier=q_is_ready[i_s % 2],
@@ -459,7 +457,7 @@ def tilelang_fused_chunk_gdn_prefill(
                         load_left = seq_start_idx + i_s * block_S
                         load_right = load_left + block_S
                         if tx == 800:
-                            T.copy(
+                            T.tma_copy(
                                 k[batch_idx, load_left:load_right, bhg, 0:DK],
                                 k_shared[i_s % 2, :, :],
                                 barrier=k_is_ready[i_s % 2],
@@ -471,7 +469,7 @@ def tilelang_fused_chunk_gdn_prefill(
                         load_left = seq_start_idx + i_s * block_S
                         load_right = load_left + block_S
                         if tx == 832:
-                            T.copy(
+                            T.tma_copy(
                                 a[batch_idx, load_left:load_right, bh, 0:block_S],
                                 pa_shared[i_s % 2, :, :],
                                 barrier=a_is_ready[i_s % 2],
@@ -483,7 +481,7 @@ def tilelang_fused_chunk_gdn_prefill(
                         load_right = load_left + block_S
                         T.barrier_wait(v_is_free, T.bitwise_xor(i_s % 2, 1))
                         if tx == 864:
-                            T.copy(
+                            T.tma_copy(
                                 v[
                                     batch_idx,
                                     load_left:load_right,

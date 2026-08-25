@@ -30,7 +30,8 @@ Decision Guide
      - :doc:`Wrappers <wrapper_tutorials>`
      - Wrappers preserve familiar package names and route supported execution
        paths to MATE on MUSA.
-   * - A supported FlashAttention-3, SageAttention, FlashMLA, FlashKDA, or DeepGEMM-style surface
+   * - A supported FlashAttention-3, SageAttention, FlashMLA, MSA/fmha_sm100,
+       FlashKDA, or DeepGEMM-style surface
      - :doc:`Wrappers <wrapper_tutorials>`
      - Wrapper pages define the supported scope and provide quickstart steps.
    * - Direct control over callable MATE entrypoints

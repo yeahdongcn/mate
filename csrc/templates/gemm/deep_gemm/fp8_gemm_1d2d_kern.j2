@@ -33,6 +33,7 @@ void {{ func_name }}(
   constexpr uint32_t kQuantTile        = {{ quant_tile }};
   constexpr uint32_t kNumMmaWarpSquads = {{ num_mma_warp_squads }};
   constexpr auto     kScaleMode        = {{ scale_accumulation_mode_cpp }};
+  using Epilogue                       = {{ epilogue_type }};
 
   constexpr bool kIsNormal = kType == mate::deep_gemm::GemmType::Normal;
   constexpr bool kIsBatched = kType == mate::deep_gemm::GemmType::Batched;
@@ -110,6 +111,18 @@ void {{ func_name }}(
   const int64_t N = kGroupB ? b.size(1) : b.size(0);
   const int64_t KTiles = ceil_div(K, static_cast<int64_t>(kQuantTile));
   const int64_t NTiles = ceil_div(N, static_cast<int64_t>(kQuantTile));
+{% if epilogue == "head_splits" %}
+  constexpr int64_t kHeadLeft  = {{ head_left }};
+  constexpr int64_t kHeadMid   = {{ head_mid }};
+  constexpr int64_t kHeadRight = {{ head_right }};
+  constexpr int64_t kCompactHeadDim = kHeadLeft + kHeadRight;
+  constexpr int64_t kFullHeadDim    = kHeadLeft + kHeadMid + kHeadRight;
+  TVM_FFI_ICHECK(kHeadLeft > 0 && kHeadMid >= 0 && kHeadRight > 0) << "Invalid head_splits";
+  TVM_FFI_ICHECK(N % kCompactHeadDim == 0) << "N must be divisible by left + right";
+  const int64_t DN = N / kCompactHeadDim * kFullHeadDim;
+{% else %}
+  const int64_t DN = N;
+{% endif %}
 
   if constexpr (kGroupB) {
     TVM_FFI_ICHECK(b.size(0) == G) << "b.shape[0] must match logical group count";
@@ -120,10 +133,10 @@ void {{ func_name }}(
   if constexpr (kGroupD) {
     TVM_FFI_ICHECK(d.size(0) == G) << "d.shape[0] must match logical group count";
     TVM_FFI_ICHECK(d.size(1) == M) << "d.shape[1] must match logical M";
-    TVM_FFI_ICHECK(d.size(2) == N) << "d.shape[2] must match logical N";
+    TVM_FFI_ICHECK(d.size(2) == DN) << "d.shape[2] must match logical output N";
   } else {
     TVM_FFI_ICHECK(d.size(0) == M) << "d.shape[0] must match logical M";
-    TVM_FFI_ICHECK(d.size(1) == N) << "d.shape[1] must match logical N";
+    TVM_FFI_ICHECK(d.size(1) == DN) << "d.shape[1] must match logical output N";
   }
   if constexpr (kGroupA) {
     TVM_FFI_ICHECK(scale_a.size(0) == G) << "scale_a.shape[0] must match logical group count";
@@ -147,7 +160,7 @@ void {{ func_name }}(
   }
 
   if (mate::gemm::common::gemm_early_return(
-          static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), d)) {
+          static_cast<int>(G), static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), d, false)) {
     return;
   }
 
@@ -169,7 +182,7 @@ void {{ func_name }}(
     if constexpr (kGroupD) {
       return make_stride(d.stride(1), _1{}, d.stride(0));
     }
-    return make_stride(d.stride(0), _1{}, M * N);
+    return make_stride(d.stride(0), _1{}, M * DN);
   }();
 
   auto stride_sfa = [&]() {
@@ -197,7 +210,7 @@ void {{ func_name }}(
       kType, kScaleMode, ElementA, ElementB, ElementD,
       decltype(stride_a), decltype(stride_b), decltype(stride_d),
       decltype(stride_sfa), decltype(stride_sfb),
-      TileShape, kStages, kQuantTile, kNumMmaWarpSquads>;
+      TileShape, kStages, kQuantTile, kNumMmaWarpSquads, Epilogue>;
 
   typename Kernel::Arguments args{
     .ptr_a              = reinterpret_cast<ElementA const*>(a.data_ptr()),
@@ -213,6 +226,7 @@ void {{ func_name }}(
     .stride_sfb         = stride_sfb,
     .m                  = static_cast<int>(M),
     .n                  = static_cast<int>(N),
+    .d_n                = static_cast<int>(DN),
     .k                  = static_cast<int>(K),
     .num_groups         = static_cast<int>(G),
     .expected_m         = kIsMasked ? expected_m : 0,

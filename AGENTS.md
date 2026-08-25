@@ -77,13 +77,29 @@ When working with MATE's dependencies and tools, refer to these official documen
   - Package: `apache-tvm-ffi` (<https://pypi.org/project/apache-tvm-ffi/>)
   - Use for: Understanding FFI export syntax, cross-language bindings
   - MUSA Fork: https://github.com/MooreThreads/tvm-ffi/
-    - When working on MUSA-related features, always refer to the musa-specific fork and its tags (e.g., v0.1.9.post2+musa.1) instead of upstream TVM-FFI.
+    - When working on MUSA-related features, always refer to the musa-specific fork and its tags (e.g., v0.1.11.post1+musa.1) instead of upstream TVM-FFI.
 
 
 ### When to Consult These Docs
 
 - **Working on FFI bindings** → Check TVM-FFI docs for export patterns and type marshaling
 - **Working on kernel bindings** → Check the TVM-FFI kernel library guide for output-allocation patterns and `TensorView` usage
+
+
+## Repository Skills
+
+Public repository skills live under `skills/<skill-name>/SKILL.md`.
+
+- Before planning a non-trivial task, inspect the `name` and `description`
+  frontmatter in `skills/*/SKILL.md`.
+- If the user names a skill, or a skill description clearly matches the task,
+  read that `SKILL.md` completely before acting.
+- Load only the selected skill body and the references needed for the current
+  task. Do not bulk-load every skill or every bundled resource.
+- Resolve skill-relative paths from the directory containing `SKILL.md`.
+- When multiple skills are relevant, use the smallest complementary set and
+  follow any explicit baseline order declared by those skills.
+
 
 ## Behavior Rules
 

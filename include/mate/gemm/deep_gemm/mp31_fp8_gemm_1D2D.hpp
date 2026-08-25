@@ -6,6 +6,7 @@
 #include <mute/atom/copy_atom.hpp>
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
+#include <type_traits>
 
 #include "mate/attention/fmha/pipeline_ws.hpp"
 #include "mate/common/mma_mp31_sqmma.hpp"
@@ -31,7 +32,8 @@ template <GemmType  kType,
           typename TileShape,
           uint32_t kStages,
           uint32_t kQuantTile,
-          uint32_t kNumMmaWarpSquads>
+          uint32_t kNumMmaWarpSquads,
+          typename Epilogue = EpilogueGemm>
 struct Mp31Fp8Gemm1D2D {
   static constexpr int BlockM = size<0>(TileShape{});
   static constexpr int BlockN = size<1>(TileShape{});
@@ -93,9 +95,10 @@ struct Mp31Fp8Gemm1D2D {
   static constexpr TME::CacheHint TmeBInnerHint = TME::CacheHint::CACHE_NORMAL;
   static constexpr TME::CacheHint TmeBOuterHint = TME::CacheHint::CACHE_NONE;
 
-  using PipelineAB       = mutlass::Mp31PipelineTmeAsync<kStages>;
-  using PipelineABParams = typename PipelineAB::Params;
-  using PipelineABState  = typename PipelineAB::PipelineState;
+  static constexpr int BarPerStageRatio = 2;
+  using PipelineAB                      = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<kStages, BarPerStageRatio>;
+  using PipelineABParams                = typename PipelineAB::Params;
+  using PipelineABState                 = typename PipelineAB::PipelineState;
 
   using PipelineSeq       = mutlass::OrderedSequenceBarrier<1, NumMmaWarpSquads>;
   using PipelineSeqParams = typename PipelineSeq::Params;
@@ -144,7 +147,7 @@ struct Mp31Fp8Gemm1D2D {
     StrideSFA stride_sfa;
     StrideSFB stride_sfb;
 
-    int m = 0, n = 0, k = 0;
+    int m = 0, n = 0, d_n = 0, k = 0;
     int num_groups = 1;
     int expected_m = 0;
     int num_mps    = 0;
@@ -168,7 +171,7 @@ struct Mp31Fp8Gemm1D2D {
     RobustDescriptor desc_sfa;
     RobustDescriptor desc_sfb;
 
-    int m, n, k;
+    int m, n, d_n, k;
     int num_groups;
     int expected_m;
     int num_mps;
@@ -194,12 +197,17 @@ struct Mp31Fp8Gemm1D2D {
     auto desc_sfa   = make_robust_desc(args.ptr_sfa, static_cast<size_t>(cosize(sfa_layout)));
     auto desc_sfb   = make_robust_desc(args.ptr_sfb, static_cast<size_t>(cosize(sfb_layout)));
 
-    return Params{tme_a,         tme_b,           args.ptr_d,      args.ptr_grouped_layout,
-                  args.ptr_sfa,  args.ptr_sfb,    args.stride_sfa, args.stride_sfb,
-                  args.stride_d, desc_sfa,        desc_sfb,        args.m,
-                  args.n,        args.k,          args.num_groups, args.expected_m,
-                  args.num_mps,  args.quant_tile, k_tiles_qt,      n_tiles_qt,
-                  k_blocks};
+    return Params{tme_a,           tme_b,
+                  args.ptr_d,      args.ptr_grouped_layout,
+                  args.ptr_sfa,    args.ptr_sfb,
+                  args.stride_sfa, args.stride_sfb,
+                  args.stride_d,   desc_sfa,
+                  desc_sfb,        args.m,
+                  args.n,          args.d_n > 0 ? args.d_n : args.n,
+                  args.k,          args.num_groups,
+                  args.expected_m, args.num_mps,
+                  args.quant_tile, k_tiles_qt,
+                  n_tiles_qt,      k_blocks};
   }
 
   static constexpr int SharedStorageSize = int(sizeof(SharedStorage));
@@ -239,6 +247,7 @@ struct Mp31Fp8Gemm1D2D {
 
     const uint32_t m          = uint32_t(params.m);
     const uint32_t n          = uint32_t(params.n);
+    const uint32_t d_n        = uint32_t(params.d_n);
     const uint32_t num_groups = uint32_t(params.num_groups);
 
     auto mA      = params.tme_a.get_tme_tensor(make_shape(params.m, params.k, params.num_groups));
@@ -252,7 +261,7 @@ struct Mp31Fp8Gemm1D2D {
 
     const uint32_t k_blocks = uint32_t(params.k_blocks);
 
-    PipelineABState pipe_write = mutlass::make_producer_start_state<PipelineAB>();
+    PipelineABState pipe_write = mutlass::make_producer_start_state_warpspecialized<PipelineAB>();
     PipelineABState pipe_read;
 
     PipelineSeqParams seq_params{};
@@ -380,9 +389,8 @@ struct Mp31Fp8Gemm1D2D {
 
         Tensor tCgScaleA0 = thr_mma.partition_C(gScaleA(_, 0).compose(ScaleAViewAsCLayout{}));
         Tensor tCgScaleB0 = thr_mma.partition_C(gScaleB(_, 0).compose(ScaleBViewAsCLayout{}));
-
-        Tensor tCrScaleA = make_tensor_like<ElementBlockScale>(tCgScaleA0);
-        Tensor tCrScaleB = make_tensor_like<ElementBlockScale>(tCgScaleB0);
+        Tensor tCrScaleA  = make_tensor_like<ElementBlockScale>(tCgScaleA0);
+        Tensor tCrScaleB  = make_tensor_like<ElementBlockScale>(tCgScaleB0);
 
         auto scale_copy_a = ScaleGmemCopyAtom{}.with(params.desc_sfa);
         auto scale_copy_b = ScaleGmemCopyAtom{}.with(params.desc_sfb);
@@ -496,30 +504,112 @@ struct Mp31Fp8Gemm1D2D {
         }
 
         Tensor mD = make_tensor(
-            make_gmem_ptr(params.ptr_d), make_shape(params.m, params.n, params.num_groups), params.stride_d);
-        Tensor gD = local_tile(mD, make_shape(Int<BlockM>{}, Int<BlockN>{}, Int<1>{}), make_coord(_, _, _));
-        Tensor tD = gD(_, _, _0{}, m_abs_block, n_block_idx, d_gid);
+            make_gmem_ptr(params.ptr_d), make_shape(params.m, params.d_n, params.num_groups), params.stride_d);
+        uint32_t m0 = m_abs_block * uint32_t(BlockM);
+        uint32_t n0 = n_block_idx * uint32_t(BlockN);
 
-        auto     tCgD = thr_mma.partition_C(tD);
-        uint32_t m0   = m_block_idx * uint32_t(BlockM);
-        uint32_t n0   = n_block_idx * uint32_t(BlockN);
-        if (m0 + uint32_t(BlockM) <= m && n0 + uint32_t(BlockN) <= n) {
-          MUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(rAcc); ++i) {
-            tCgD(i) = ElementD(rAcc(i));
-          }
-        } else {
-          auto cD   = make_identity_tensor(make_shape(Int<BlockM>{}, Int<BlockN>{}));
-          auto tCcD = thr_mma.partition_C(cD);
-          auto residue_mn =
-              make_coord(min(uint32_t(BlockM), m > m0 ? m - m0 : 0u), min(uint32_t(BlockN), n > n0 ? n - n0 : 0u));
+        // normal write back
+        if constexpr (std::is_same_v<Epilogue, EpilogueGemm>) {
+          Tensor gD = local_tile(mD, make_shape(Int<BlockM>{}, Int<BlockN>{}, Int<1>{}), make_coord(_, _, _));
+          Tensor tD = gD(_, _, _0{}, m_abs_block, n_block_idx, d_gid);
 
-          MUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(rAcc); ++i) {
-            if (elem_less(tCcD(i), residue_mn)) {
+          auto tCgD = thr_mma.partition_C(tD);
+          if (m0 + uint32_t(BlockM) <= m && n0 + uint32_t(BlockN) <= n) {
+            MUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(rAcc); ++i) {
               tCgD(i) = ElementD(rAcc(i));
             }
+          } else {
+            auto cD   = make_identity_tensor(make_shape(Int<BlockM>{}, Int<BlockN>{}));
+            auto tCcD = thr_mma.partition_C(cD);
+            auto residue_mn =
+                make_coord(min(uint32_t(BlockM), m > m0 ? m - m0 : 0u), min(uint32_t(BlockN), n > n0 ? n - n0 : 0u));
+
+            MUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(rAcc); ++i) {
+              if (elem_less(tCcD(i), residue_mn)) {
+                tCgD(i) = ElementD(rAcc(i));
+              }
+            }
           }
+        } else if constexpr (detail::is_epilogue_head_splits_v<Epilogue>) {
+          if constexpr (Epilogue::Left == Epilogue::Right && Epilogue::CompactHead % uint32_t(BlockN) == 0) {
+            constexpr uint32_t HeadStride  = Epilogue::Left + Epilogue::Mid + Epilogue::Right;
+            constexpr uint32_t RightOffset = Epilogue::Left + Epilogue::Mid;
+
+            Tensor mDHead = make_tensor(make_gmem_ptr(params.ptr_d),
+                                        make_shape(params.m,
+                                                   params.n / int(Epilogue::CompactHead),
+                                                   make_shape(Int<Epilogue::Left>{}, Int<2>{}),
+                                                   params.num_groups),
+                                        make_stride(get<0>(params.stride_d),
+                                                    Int<HeadStride>{},
+                                                    make_stride(_1{}, Int<RightOffset>{}),
+                                                    get<2>(params.stride_d)));
+            Tensor gD     = mDHead(_, n_block_idx, _, d_gid);
+            Tensor tD     = local_tile(gD,
+                                   make_shape(Int<BlockM>{}, make_shape(Int<Epilogue::Left>{}, Int<2>{})),
+                                   make_coord(m_abs_block, _0{}));
+            auto   tCgD   = thr_mma.partition_C(tD);
+
+            // Use compile-time store chunks to expose accumulator and destination indices
+            // as constants during lowering, reducing temporary register pressure and spills
+            constexpr int StgChunkSize    = 4;
+            constexpr int NumAccumulators = size(rAcc);
+            static_assert(NumAccumulators % StgChunkSize == 0,
+                          "The head-split epilogue requires complete accumulator store batches");
+            constexpr int NumStoreChunks = NumAccumulators / StgChunkSize;
+
+            if (m0 + uint32_t(BlockM) <= m) {
+              for_each(make_seq<NumStoreChunks>{}, [&](auto batch) {
+                for_each(make_seq<StgChunkSize>{}, [&](auto item) {
+                  constexpr int i = int(batch) * StgChunkSize + int(item);
+                  tCgD(i)         = ElementD(rAcc(i));
+                });
+              });
+            } else {
+              auto cD   = make_identity_tensor(make_shape(Int<BlockM>{}, Int<BlockN>{}));
+              auto tCcD = thr_mma.partition_C(cD);
+
+              for_each(make_seq<NumStoreChunks>{}, [&](auto batch) {
+                for_each(make_seq<StgChunkSize>{}, [&](auto item) {
+                  constexpr int  i   = int(batch) * StgChunkSize + int(item);
+                  const uint32_t row = m0 + uint32_t(get<0>(tCcD(i)));
+                  if (row < m) {
+                    tCgD(i) = ElementD(rAcc(i));
+                  }
+                });
+              });
+            }
+          } else {
+            auto cD   = make_identity_tensor(make_shape(Int<BlockM>{}, Int<BlockN>{}));
+            auto tCcD = thr_mma.partition_C(cD);
+
+            if (m0 + uint32_t(BlockM) <= m && n0 + uint32_t(BlockN) <= n) {
+              MUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < size(rAcc); ++i) {
+                const uint32_t row         = m0 + uint32_t(get<0>(tCcD(i)));
+                const uint32_t compact_col = n0 + uint32_t(get<1>(tCcD(i)));
+                const uint32_t full_col    = Epilogue::apply_index_n(compact_col);
+                mD(row, full_col, d_gid)   = ElementD(rAcc(i));
+              }
+            } else {
+              auto residue_mn =
+                  make_coord(min(uint32_t(BlockM), m > m0 ? m - m0 : 0u), min(uint32_t(BlockN), n > n0 ? n - n0 : 0u));
+
+              MUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < size(rAcc); ++i) {
+                if (elem_less(tCcD(i), residue_mn)) {
+                  const uint32_t row         = m0 + uint32_t(get<0>(tCcD(i)));
+                  const uint32_t compact_col = n0 + uint32_t(get<1>(tCcD(i)));
+                  const uint32_t full_col    = Epilogue::apply_index_n(compact_col);
+                  mD(row, full_col, d_gid)   = ElementD(rAcc(i));
+                }
+              }
+            }
+          }
+        } else {
+          static_assert(std::is_same_v<Epilogue, EpilogueGemm>, "Unsupported epilogue type");
         }
 
         scheduler.advance_to_next_work();

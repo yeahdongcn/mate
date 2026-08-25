@@ -12,7 +12,6 @@ if not hasattr(torch, "uint64"):
     torch.uint64 = torch.int64
 import tilelang
 from tilelang import language as T
-from tvm import tir
 
 from ...utils import cosize
 from .sparse_mla_decode_scheduled_common import (
@@ -33,10 +32,25 @@ from .sparse_mla_index_type import jit_for_tensor_addressing
 from ...execution_context import raise_complete_if_dry_run
 
 
+MODEL1_DECODE_COMPILE_FLAGS = [
+    *SCHEDULED_DECODE_COMPILE_FLAGS,
+    "-mllvm",
+    "-mtgpu-if-convert=1",
+    "-mllvm",
+    "-mtgpu-opt-level=1",
+    "-mllvm",
+    "-mtgpu-enable-high-latency-schedule=1",
+    "-mllvm",
+    "-mtgpu-load-store-opt=1",
+    "-mllvm",
+    "-mtgpu-load-store-2d=1",
+]
+
+
 @tilelang.jit(
     out_idx=[],
     pass_configs=SCHEDULED_DECODE_PASS_CONFIGS,
-    compile_flags=SCHEDULED_DECODE_COMPILE_FLAGS,
+    compile_flags=MODEL1_DECODE_COMPILE_FLAGS,
 )
 def sparse_attention_decode_fwd_scheduled_kernel_model1(
     num_heads,
@@ -44,7 +58,6 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
     *,
     has_extra=False,
     kv_group=1,
-    sm_scale=None,
     block_m=64,
     block_i=64,
     threads=0,
@@ -55,8 +68,6 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
     has_attn_sink=False,
     has_topk_length=False,
     has_extra_topk_length=False,
-    page_block_size=64,
-    extra_page_block_size=None,
     support_split=True,
     use_int64_cosize=False,
     use_8byte_kv_loads=False,
@@ -64,18 +75,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
     )
-    if sm_scale is None:
-        sm_scale = (1.0 / dim) ** 0.5 * 1.44269504
-    else:
-        sm_scale = sm_scale * 1.44269504
     assert has_extra or not has_extra_topk_length, (
         "has_extra_topk_length requires has_extra"
     )
-    if has_extra:
-        assert extra_page_block_size is not None
     topk = T.dynamic("topk")
+    page_block_size = T.dynamic("page_block_size")
     if has_extra:
         extra_topk = T.dynamic("extra_topk")
+        extra_page_block_size = T.dynamic("extra_page_block_size")
     batch = T.dynamic("batch")
     seq_len = T.dynamic("seq_len")
     dim_bytes = 584
@@ -177,34 +184,32 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         )
     if use_int64_cosize:
         q_cosize = cosize(
-            q_shape, tuple(tir.Cast("int64", stride) for stride in q_strides)
+            q_shape, tuple(T.cast(stride, "int64") for stride in q_strides)
         )
         kv_nope_cosize = cosize(
             kv_nope_shape,
-            tuple(tir.Cast("int64", stride) for stride in kv_nope_strides),
+            tuple(T.cast(stride, "int64") for stride in kv_nope_strides),
         )
         kv_rope_cosize = cosize(
             kv_rope_shape,
-            tuple(tir.Cast("int64", stride) for stride in kv_rope_strides),
+            tuple(T.cast(stride, "int64") for stride in kv_rope_strides),
         )
         quant_scales_cosize = cosize(
             quant_scales_shape,
-            tuple(tir.Cast("int64", stride) for stride in quant_scales_strides),
+            tuple(T.cast(stride, "int64") for stride in quant_scales_strides),
         )
         if has_extra:
             extra_kv_nope_cosize = cosize(
                 extra_kv_nope_shape,
-                tuple(tir.Cast("int64", stride) for stride in extra_kv_nope_strides),
+                tuple(T.cast(stride, "int64") for stride in extra_kv_nope_strides),
             )
             extra_kv_rope_cosize = cosize(
                 extra_kv_rope_shape,
-                tuple(tir.Cast("int64", stride) for stride in extra_kv_rope_strides),
+                tuple(T.cast(stride, "int64") for stride in extra_kv_rope_strides),
             )
             extra_quant_scales_cosize = cosize(
                 extra_quant_scales_shape,
-                tuple(
-                    tir.Cast("int64", stride) for stride in extra_quant_scales_strides
-                ),
+                tuple(T.cast(stride, "int64") for stride in extra_quant_scales_strides),
             )
     else:
         q_cosize = cosize(q_shape, q_strides)
@@ -263,19 +268,19 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         max_lse_init=-(2**30),
     )
 
+    pipelined_producer = not has_extra and block_m == 64
     update_online_softmax = make_scheduled_decode_online_softmax(
         h_per_block=heads_per_block,
         block_i=block_i,
         out_width=128,
         accum_dtype=accum_dtype,
-        sm_scale=sm_scale,
+        defer_pv1_maintenance=pipelined_producer,
     )
     finalize_left = make_scheduled_decode_finalize_left(
         h_per_block=heads_per_block,
         out_width=128,
         num_heads=num_heads,
         accum_dtype=accum_dtype,
-        sm_scale=sm_scale,
         has_attn_sink=has_attn_sink,
         use_strict_valid=True,
         add_denominator_epsilon=False,
@@ -317,6 +322,57 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
     pv_gemm_policy = T.GemmWarpPolicy.FullRow
 
     @T.macro
+    def probe_indices(
+        indices_arg,
+        b_i,
+        s_i,
+        g_i,
+        block_index,
+        topk_length_arg,
+        seq_len_kv_arg,
+        ldg_ty,
+        kperm_indices_local,
+        kperm_mask_local,
+    ):
+        for r in T.unroll(4, explicit=True):
+            token_pos = (
+                block_index * block_i
+                + ((r * 16 + ldg_ty) % 8) * (block_i // 8)
+                + (r * 16 + ldg_ty) // 8
+            )
+            kperm_indices_local[r] = indices_arg[b_i, s_i, g_i, token_pos]
+
+        for r in T.unroll(4, explicit=True):
+            token_pos = (
+                block_index * block_i
+                + ((r * 16 + ldg_ty) % 8) * (block_i // 8)
+                + (r * 16 + ldg_ty) // 8
+            )
+            kperm_mask_local[r] = (
+                T.Cast("uint32", kperm_indices_local[r])
+                < T.Cast("uint32", seq_len_kv_arg)
+            ) and (token_pos < topk_length_arg)
+            kperm_indices_local[r] = T.if_then_else(
+                kperm_mask_local[r],
+                kperm_indices_local[r],
+                seq_len_kv_arg,
+            )
+
+    @T.macro
+    def publish_indices(
+        ldg_ty,
+        ldg_tx,
+        phase,
+        kperm_indices_local,
+        kv_indices,
+        bar_kv_mask_free,
+    ):
+        T.barrier_wait(bar_kv_mask_free, (phase & 1) ^ 1)
+        if ldg_tx == 0:
+            for r in T.unroll(4):
+                kv_indices[r * 16 + ldg_ty] = kperm_indices_local[r]
+
+    @T.macro
     def load_model1_paged_kv_block(
         kv_rope,
         quant_scales,
@@ -324,6 +380,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         scale_robust_desc_arg,
         page_size,
         kperm_indices_local,
+        kperm_mask_local,
+        is_kv_valid,
         kv_indices,
         kv_shared_l,
         kv_shared_r,
@@ -341,6 +399,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         bar_kv1_ready,
     ):
         T.barrier_wait(bar_kv0_free, (phase & 1) ^ 1)
+        if pipelined_producer:
+            T.barrier_arrive(bar_indices_ready)
         for r in T.unroll(4):
             for u in T.unroll(4):
                 for v in T.vectorized(4):
@@ -357,9 +417,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                         force_async_copy=True,
                         src_robust_desc=rope_robust_desc_arg,
                     )
-        T.lma_wait()
-        T.barrier_arrive(bar_kv_mask_ready)
-        T.barrier_arrive(bar_indices_ready)
+        if not pipelined_producer:
+            T.lma_wait()
+            T.barrier_arrive(bar_kv_mask_ready)
+            T.barrier_arrive(bar_indices_ready)
         T.barrier_wait(bar_indices_ready, phase & 1)
 
         for c in T.vectorized(4):
@@ -375,9 +436,19 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 force_async_copy=True,
                 src_robust_desc=scale_robust_desc_arg,
             )
-        T.ptx_commit_group()
-        T.ptx_wait_group(0)
-        T.barrier_arrive(bar_kv0_ready)
+        T.ldlms_crossbb_commit_0()
+        if pipelined_producer:
+            if ldg_tx == 0:
+                for r in T.unroll(4):
+                    row = ((r * 16 + ldg_ty) % 8) * (block_i // 8) + (
+                        r * 16 + ldg_ty
+                    ) // 8
+                    is_kv_valid[row] = kperm_mask_local[r]
+            T.lma_wait()
+            T.barrier_arrive(bar_kv_mask_ready)
+        else:
+            T.ldlms_crossbb_wait_0()
+            T.barrier_arrive(bar_kv0_ready)
 
         T.barrier_wait(bar_kv1_free, (phase & 1) ^ 1)
         for r in T.unroll(4):
@@ -445,10 +516,16 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                         force_async_copy=True,
                         src_robust_desc=rope_robust_desc_arg,
                     )
-        T.ptx_commit_group()
-        T.ptx_wait_group(0)
-        T.barrier_arrive(bar_kv1_ready)
-        T.sync_threads(1, 128)
+        T.ldlms_crossbb_commit_1()
+        if pipelined_producer:
+            T.ldlms_crossbb_wait_0()
+            T.barrier_arrive(bar_kv0_ready)
+            T.ldlms_crossbb_wait_1()
+            T.barrier_arrive(bar_kv1_ready)
+        else:
+            T.ldlms_crossbb_wait_1()
+            T.barrier_arrive(bar_kv1_ready)
+            T.sync_threads(1, 128)
 
     @T.macro
     def dsa_decode_body(
@@ -470,6 +547,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         output_partial,
         output,
         lse,
+        sm_scale,
     ):
         # MODEL1 scheduled split main kernel. It follows the FlashMLA scheduler
         # contract: each program consumes one metadata part and either writes the
@@ -585,7 +663,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
             T.fill(phase_count, 0)
 
             for b_i in range(begin_idx, end_idx + 1, 1):
-                tir.call_extern("void", "__musa_loop_transparent_outermost")
+                T.call_extern("void", "__musa_loop_transparent_outermost")
                 start_block_idx = T.alloc_var(T.int32)
                 end_block_idx = T.alloc_var(T.int32)
                 n_split_idx = T.alloc_var(T.int32)
@@ -613,20 +691,16 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 is_unsplit = (num_splits[b_i + 1] - num_splits[b_i]) == 1
 
                 if tid < producer_start:
-                    T.copy(
+                    T.tma_copy(
                         q[b_i, s_i, h0:h1, 0:256],
                         q_shared_l,
                         barrier=bar_q,
-                        src_robust_desc=q_robust_desc,
                     )
-                    T.copy(
+                    T.tma_copy(
                         q[b_i, s_i, h0:h1, 256:512],
                         q_shared_r,
                         barrier=bar_q,
-                        src_robust_desc=q_robust_desc,
                     )
-                    T.ptx_commit_group()
-                    T.ptx_wait_group(0)
                     T.barrier_arrive(bar_q)
                     T.barrier_wait(bar_q, (b_i - begin_idx) & 1)
 
@@ -818,10 +892,15 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                             alpha_shared,
                             acc_o_l_0,
                             acc_o_l_1,
+                            sm_scale,
                         )
 
                         T.lma_wait()
-                        T.barrier_arrive(bar_p_ready)
+                        if pipelined_producer:
+                            for h_i, d_i in T.Parallel(heads_per_block, 128):
+                                acc_o_l_0[h_i, d_i] *= alpha_local[h_i]
+                        else:
+                            T.barrier_arrive(bar_p_ready)
                         stage_value_shared_c0(
                             v_shared_0,
                             kv_reg_l,
@@ -841,6 +920,16 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                             wg_wait=-1,
                         )
                         T.warpgroup_commit_batch()
+
+                        if pipelined_producer:
+                            T.barrier_arrive(bar_p_ready)
+                            for h_i, d_i in T.Parallel(heads_per_block, 128):
+                                acc_o_l_1[h_i, d_i] *= alpha_local[h_i]
+                            T.reduce_sum(acc_s, sumexp_i, dim=1)
+                            for h_i in T.Parallel(heads_per_block):
+                                sumexp[h_i] = (
+                                    sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
+                                )
 
                         stage_value_shared_c0(
                             v_shared_1,
@@ -864,9 +953,9 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                             wg_wait=-1,
                         )
                         T.warpgroup_commit_batch()
+                        phase_count[0] = phase_count[0] ^ 1
                         T.warpgroup_wait(0)
                         T.barrier_arrive(bar_vl1_free)
-                        phase_count[0] = phase_count[0] ^ 1
 
                     finalize_left(
                         b_i,
@@ -889,6 +978,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                         num_splits,
                         attn_sink,
                         bar_final,
+                        sm_scale,
                     )
                 elif tid < consumer0_threads:
                     kv_reg_l = T.alloc_local([consumer0_rows_per_thread * 32], dtype)
@@ -1022,6 +1112,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 elif tid < producer_start:
                     acc_o_r_0 = T.alloc_fragment([heads_per_block, 128], accum_dtype)
                     acc_o_r_1 = T.alloc_fragment([heads_per_block, 128], accum_dtype)
+                    alpha_r = T.alloc_fragment([heads_per_block], accum_dtype)
                     kv_reg_r = T.alloc_local([consumer1_rows_per_thread * 32], dtype)
                     kv_reg_r_fp16 = T.view(
                         kv_reg_r, [consumer1_rows_per_thread * 32], T.float16
@@ -1148,9 +1239,12 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                         T.barrier_wait(bar_vr0_ready, (phase_count[0] & 1))
 
                         T.barrier_wait(bar_p_ready, (phase_count[0] & 1))
+                        for h_i in T.Parallel(heads_per_block):
+                            alpha_r[h_i] = alpha_shared[h_i]
                         for h_i, d_i in T.Parallel(heads_per_block, 128):
-                            acc_o_r_0[h_i, d_i] *= alpha_shared[h_i]
-                            acc_o_r_1[h_i, d_i] *= alpha_shared[h_i]
+                            acc_o_r_0[h_i, d_i] *= alpha_r[h_i]
+                        if pipelined_producer:
+                            T.sched_boundary()
 
                         T.gemm(
                             scores_shared,
@@ -1166,9 +1260,17 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                             v_shared_1, kv_reg_r, c1_ldg_ty, c1_ldg_tx, 2
                         )
                         T.lma_wait()
-                        T.warpgroup_wait(0)
+                        if not pipelined_producer:
+                            T.warpgroup_wait(0)
                         T.barrier_arrive(bar_vr1_ready)
                         T.barrier_wait(bar_vr1_ready, (phase_count[0] & 1))
+
+                        if pipelined_producer:
+                            T.sched_boundary()
+                        for h_i, d_i in T.Parallel(heads_per_block, 128):
+                            acc_o_r_1[h_i, d_i] *= alpha_r[h_i]
+                        if pipelined_producer:
+                            T.warpgroup_wait(0)
 
                         T.gemm(
                             scores_shared,
@@ -1178,8 +1280,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                             wg_wait=-1,
                         )
                         T.warpgroup_commit_batch()
-                        T.warpgroup_wait(0)
                         phase_count[0] = phase_count[0] ^ 1
+                        T.warpgroup_wait(0)
 
                     finalize_right(
                         b_i,
@@ -1219,36 +1321,75 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                         else:
                             extra_topk_len_local[0] = extra_topk
 
-                    for i_i in range(start_block_idx, end_block_idx):
-                        main_block_count = T.max(
-                            T.ceildiv(topk_len_local[0], block_i), 1
-                        )
-                        use_extra = i_i >= main_block_count
-                        T.annotate_layout(
-                            {
-                                kv_shared_l[
-                                    :, :
-                                ]: tilelang.layout.make_sqmma_swizzled_layout(
-                                    kv_shared_l[:, :],
-                                    k_major=True,
-                                )
-                            },
-                            allow_reannotation=True,
-                            allow_buffer_region=True,
-                        )
-                        T.annotate_layout(
-                            {
-                                kv_shared_r[
-                                    :, :
-                                ]: tilelang.layout.make_sqmma_swizzled_layout(
-                                    kv_shared_r[:, :],
-                                    k_major=True,
-                                )
-                            },
-                            allow_reannotation=True,
-                            allow_buffer_region=True,
-                        )
-                        if has_extra:
+                    T.annotate_layout(
+                        {
+                            kv_shared_l[
+                                :, :
+                            ]: tilelang.layout.make_sqmma_swizzled_layout(
+                                kv_shared_l[:, :],
+                                k_major=True,
+                            ),
+                            kv_shared_r[
+                                :, :
+                            ]: tilelang.layout.make_sqmma_swizzled_layout(
+                                kv_shared_r[:, :],
+                                k_major=True,
+                            ),
+                        },
+                        allow_reannotation=True,
+                        allow_buffer_region=True,
+                    )
+                    if not pipelined_producer and not has_extra:
+                        for i_i in range(start_block_idx, end_block_idx):
+                            load_indices(
+                                indices,
+                                b_i,
+                                s_i,
+                                g_i,
+                                i_i,
+                                topk_len_local[0],
+                                seq_len_kv,
+                                ldg_ty,
+                                ldg_tx,
+                                phase_count[0],
+                                kperm_indices_local,
+                                kperm_mask_local,
+                                is_kv_valid,
+                                kv_indices,
+                                bar_kv_mask_free,
+                            )
+                            load_model1_paged_kv_block(
+                                kv_rope,
+                                quant_scales,
+                                rope_robust_desc,
+                                scale_robust_desc,
+                                page_block_size,
+                                kperm_indices_local,
+                                kperm_mask_local,
+                                is_kv_valid,
+                                kv_indices,
+                                kv_shared_l,
+                                kv_shared_r,
+                                quant_shared,
+                                ldg_ty,
+                                ldg_tx,
+                                ldg_scale_ty,
+                                ldg_scale_tx,
+                                phase_count[0],
+                                bar_kv0_free,
+                                bar_kv_mask_ready,
+                                bar_indices_ready,
+                                bar_kv0_ready,
+                                bar_kv1_free,
+                                bar_kv1_ready,
+                            )
+                            phase_count[0] = phase_count[0] ^ 1
+                    elif has_extra:
+                        for i_i in range(start_block_idx, end_block_idx):
+                            main_block_count = T.max(
+                                T.ceildiv(topk_len_local[0], block_i), 1
+                            )
+                            use_extra = i_i >= main_block_count
                             if use_extra:
                                 block_index = i_i - main_block_count
                                 load_indices(
@@ -1276,6 +1417,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                                     extra_scale_robust_desc,
                                     page_block_size_extra,
                                     kperm_indices_local,
+                                    kperm_mask_local,
+                                    is_kv_valid,
                                     kv_indices,
                                     kv_shared_l,
                                     kv_shared_r,
@@ -1319,6 +1462,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                                     scale_robust_desc,
                                     page_block_size,
                                     kperm_indices_local,
+                                    kperm_mask_local,
+                                    is_kv_valid,
                                     kv_indices,
                                     kv_shared_l,
                                     kv_shared_r,
@@ -1336,22 +1481,25 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                                     bar_kv1_ready,
                                 )
                                 phase_count[0] = phase_count[0] ^ 1
-                        else:
-                            block_index = i_i
-                            load_indices(
+                    else:
+                        if start_block_idx < end_block_idx:
+                            probe_indices(
                                 indices,
                                 b_i,
                                 s_i,
                                 g_i,
-                                block_index,
+                                start_block_idx,
                                 topk_len_local[0],
                                 seq_len_kv,
+                                ldg_ty,
+                                kperm_indices_local,
+                                kperm_mask_local,
+                            )
+                            publish_indices(
                                 ldg_ty,
                                 ldg_tx,
                                 phase_count[0],
                                 kperm_indices_local,
-                                kperm_mask_local,
-                                is_kv_valid,
                                 kv_indices,
                                 bar_kv_mask_free,
                             )
@@ -1362,6 +1510,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                                 scale_robust_desc,
                                 page_block_size,
                                 kperm_indices_local,
+                                kperm_mask_local,
+                                is_kv_valid,
                                 kv_indices,
                                 kv_shared_l,
                                 kv_shared_r,
@@ -1380,10 +1530,66 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                             )
                             phase_count[0] = phase_count[0] ^ 1
 
+                            for i_i in range(start_block_idx + 1, end_block_idx):
+                                probe_indices(
+                                    indices,
+                                    b_i,
+                                    s_i,
+                                    g_i,
+                                    i_i,
+                                    topk_len_local[0],
+                                    seq_len_kv,
+                                    ldg_ty,
+                                    kperm_indices_local,
+                                    kperm_mask_local,
+                                )
+                                publish_indices(
+                                    ldg_ty,
+                                    ldg_tx,
+                                    phase_count[0],
+                                    kperm_indices_local,
+                                    kv_indices,
+                                    bar_kv_mask_free,
+                                )
+                                load_model1_paged_kv_block(
+                                    kv_rope,
+                                    quant_scales,
+                                    rope_robust_desc,
+                                    scale_robust_desc,
+                                    page_block_size,
+                                    kperm_indices_local,
+                                    kperm_mask_local,
+                                    is_kv_valid,
+                                    kv_indices,
+                                    kv_shared_l,
+                                    kv_shared_r,
+                                    quant_shared,
+                                    ldg_ty,
+                                    ldg_tx,
+                                    ldg_scale_ty,
+                                    ldg_scale_tx,
+                                    phase_count[0],
+                                    bar_kv0_free,
+                                    bar_kv_mask_ready,
+                                    bar_indices_ready,
+                                    bar_kv0_ready,
+                                    bar_kv1_free,
+                                    bar_kv1_ready,
+                                )
+                                phase_count[0] = phase_count[0] ^ 1
+
         if support_split:
             # MODEL1 scheduled combine kernel. Only batches with more than one split
             # enter this stage; unsplit batches are already written by the split kernel.
-            dsa_combine(num_splits, glse, output_partial, attn_sink, output, lse)
+            dsa_combine(
+                tile_scheduler_metadata,
+                num_splits,
+                glse,
+                output_partial,
+                attn_sink,
+                output,
+                lse,
+            )
 
     @T.macro
     def run_no_extra(
@@ -1400,6 +1606,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         output_partial,
         output,
         lse,
+        sm_scale,
     ):
         dsa_decode_body(
             q,
@@ -1420,6 +1627,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
             output_partial,
             output,
             lse,
+            sm_scale,
         )
 
     @T.macro
@@ -1442,6 +1650,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         output_partial,
         output,
         lse,
+        sm_scale,
     ):
         dsa_decode_body(
             q,
@@ -1462,6 +1671,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
             output_partial,
             output,
             lse,
+            sm_scale,
         )
 
     topk_length_type: Any = T.Tensor([batch], indices_dtype)
@@ -1496,6 +1706,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_no_extra(
                     q,
@@ -1511,6 +1722,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_topk_length:
@@ -1529,6 +1741,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_no_extra(
                     q,
@@ -1544,6 +1757,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_attn_sink:
@@ -1562,6 +1776,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_no_extra(
                     q,
@@ -1577,6 +1792,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         else:
@@ -1594,6 +1810,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_no_extra(
                     q,
@@ -1609,6 +1826,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
     elif not has_extra:
@@ -1627,6 +1845,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_no_extra(
                     q,
@@ -1642,6 +1861,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_topk_length:
@@ -1658,6 +1878,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_no_extra(
                     q,
@@ -1673,6 +1894,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_attn_sink:
@@ -1689,6 +1911,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_no_extra(
                     q,
@@ -1704,6 +1927,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         else:
@@ -1719,6 +1943,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_no_extra(
                     q,
@@ -1734,6 +1959,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
     elif support_split:
@@ -1765,6 +1991,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -1785,6 +2012,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_topk_length and has_extra_topk_length:
@@ -1808,6 +2036,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -1828,6 +2057,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_topk_length and has_attn_sink:
@@ -1851,6 +2081,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -1871,6 +2102,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_topk_length:
@@ -1893,6 +2125,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -1913,6 +2146,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_extra_topk_length and has_attn_sink:
@@ -1936,6 +2170,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -1956,6 +2191,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_extra_topk_length:
@@ -1978,6 +2214,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -1998,6 +2235,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_attn_sink:
@@ -2020,6 +2258,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2040,6 +2279,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         else:
@@ -2061,6 +2301,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output_partial: output_partial_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2081,6 +2322,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
     else:
@@ -2104,6 +2346,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2124,6 +2367,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_topk_length and has_extra_topk_length:
@@ -2145,6 +2389,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2165,6 +2410,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_topk_length and has_attn_sink:
@@ -2186,6 +2432,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2206,6 +2453,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_topk_length:
@@ -2226,6 +2474,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2246,6 +2495,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_extra_topk_length and has_attn_sink:
@@ -2267,6 +2517,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2287,6 +2538,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_extra_topk_length:
@@ -2307,6 +2559,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2327,6 +2580,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_attn_sink:
@@ -2347,6 +2601,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2367,6 +2622,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         else:
@@ -2386,6 +2642,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 num_splits: num_splits_type,
                 output: output_type,
                 lse: lse_type,
+                sm_scale: T.float32,
             ):
                 run_extra(
                     q,
@@ -2406,6 +2663,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     None,
                     output,
                     lse,
+                    sm_scale,
                 )
 
     return dsa_decode
@@ -2476,6 +2734,7 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
     assert kv_scales_shape == (num_blocks, page_block_bytes)
     _, _, _, topk = indices_shape
     assert indices_shape == (batch, seq_len, kv_group, topk)
+    assert topk % block_i == 0, "topk must be a multiple of block_i"
 
     extra_inputs = (extra_kv_nope, extra_kv_rope, extra_kv_scales, extra_indices)
     has_extra = all(tensor is not None for tensor in extra_inputs)
@@ -2493,6 +2752,7 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
         )
         extra_topk = extra_indices_shape[-1]
         assert extra_topk > 0, "extra_indices must contain at least one index"
+        assert extra_topk % block_i == 0, "extra topk must be a multiple of block_i"
         assert extra_indices_shape == (batch, seq_len, kv_group, extra_topk)
         assert extra_kv_nope.dtype == torch.float8_e4m3fn, (
             "extra_kv_nope must be float8_e4m3fn"
@@ -2572,19 +2832,20 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
         d_v,
         has_extra=has_extra,
         kv_group=kv_group,
-        sm_scale=sm_scale,
         block_m=block_m,
         block_i=block_i,
         threads=threads,
         consumer0_threads=consumer0_threads,
         consumer1_threads=consumer1_threads,
         producer_threads=producer_threads,
-        max_nums_splits=runtime.max_nums_splits,
+        # The scheduler supports 32 or 64 MP parts.  Keep this compile-time
+        # resource bound aligned with the metadata-derived runtime choice;
+        # hard-coding 32 silently overflowed the combine workspace for
+        # num_mp_parts in [33, 64].
+        max_nums_splits=runtime.max_nums_splits if support_split else 1,
         has_attn_sink=runtime.has_attn_sink,
         has_topk_length=runtime.topk_length is not None,
         has_extra_topk_length=extra_topk_length is not None,
-        page_block_size=page_block_size,
-        extra_page_block_size=extra_page_block_size,
         support_split=support_split,
         use_8byte_kv_loads=use_8byte_kv_loads,
         use_int64_cosize=(
@@ -2608,6 +2869,9 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
         assert runtime.glse is not None and runtime.out_partial is not None
         args.extend((runtime.glse, runtime.out_partial))
     args.extend((runtime.out, runtime.lse))
+    runtime_sm_scale = (1.0 / d_v) ** 0.5 if sm_scale is None else float(sm_scale)
+    runtime_sm_scale *= 1.44269504
+    args.append(runtime_sm_scale)
     kernel(*args)
 
     return runtime.out, runtime.lse

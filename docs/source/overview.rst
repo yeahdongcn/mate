@@ -40,8 +40,8 @@ Typical Workflow
 
 2. Choose the integration surface.
 
-   Start with FlashAttention-3, SageAttention, FlashMLA, FlashKDA, or DeepGEMM
-   when one matches your framework surface.
+   Start with FlashAttention-3, SageAttention, FlashMLA, MSA/fmha_sm100,
+   FlashKDA, or DeepGEMM when one matches your framework surface.
 
 3. Install the delivered package.
 

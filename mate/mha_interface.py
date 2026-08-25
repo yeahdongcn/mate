@@ -39,22 +39,27 @@ def _check_valid_asm_input(
     softcap,
     cp_world_size=1,
 ):
-    enable_mubin = True
+    if not (q.is_musa and k.is_musa and v.is_musa):
+        return False
 
-    enable_mubin &= q.is_musa
-    enable_mubin &= k.is_musa
-    enable_mubin &= v.is_musa
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    if (
+        q.dtype not in supported_dtypes
+        or k.dtype not in supported_dtypes
+        or v.dtype not in supported_dtypes
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+    ):
+        return False
 
-    enable_mubin &= q.dtype == torch.float16 or q.dtype == torch.bfloat16
-    enable_mubin &= k.dtype == torch.float16 or k.dtype == torch.bfloat16
-    enable_mubin &= v.dtype == torch.float16 or v.dtype == torch.bfloat16
-
-    enable_mubin &= q.dtype == k.dtype and q.dtype == v.dtype
-
-    enable_mubin &= q.dim() == 3 or q.dim() == 4
-    enable_mubin &= k.dim() == 3 or k.dim() == 4
-    enable_mubin &= v.dim() == 3 or v.dim() == 4
-    enable_mubin &= q.dim() == k.dim() and q.dim() == v.dim()
+    if (
+        q.dim() not in (3, 4)
+        or k.dim() not in (3, 4)
+        or v.dim() not in (3, 4)
+        or q.dim() != k.dim()
+        or q.dim() != v.dim()
+    ):
+        return False
 
     headdim_qk = q.shape[-1]
     headdim_v = v.shape[-1]
@@ -62,54 +67,53 @@ def _check_valid_asm_input(
     is_192_128 = headdim_qk == 192 and headdim_v == 128
     is_128_128_or_less = headdim_qk == headdim_v and headdim_qk <= 128
 
-    enable_mubin &= is_192_128 or is_128_128_or_less
-
-    enable_mubin &= page_table is None
-
-    enable_mubin &= seqused_q is None
-    enable_mubin &= seqused_k is None
-
     window_size_left, window_size_right = window_size
-    enable_mubin &= window_size_left is None or window_size_left < 0
-    enable_mubin &= window_size_right is None or window_size_right <= 0
-
-    enable_mubin &= qv is None
-    enable_mubin &= softcap == 0.0
-    enable_mubin &= learnable_sink is None
-    enable_mubin &= attention_chunk == 0
-
-    enable_mubin &= cp_world_size == 1
-
-    if not enable_mubin:
-        return enable_mubin
+    if (
+        not (is_192_128 or is_128_128_or_less)
+        or page_table is not None
+        or seqused_q is not None
+        or seqused_k is not None
+        or (window_size_left is not None and window_size_left >= 0)
+        or (window_size_right is not None and window_size_right >= 0)
+        or qv is not None
+        or softcap != 0.0
+        or learnable_sink is not None
+        or attention_chunk != 0
+        or cp_world_size != 1
+    ):
+        return False
 
     if q.dim() == 3:
         total_seq_q, nr_heads, headdim_qk = q.shape
         total_seq_kv, nr_heads_kv, _ = k.shape
         _, _, headdim_v = v.shape
 
-        enable_mubin &= k.shape == (total_seq_kv, nr_heads_kv, headdim_qk)
-        enable_mubin &= v.shape == (total_seq_kv, nr_heads_kv, headdim_v)
+        if (
+            cu_seqlens_q is None
+            or cu_seqlens_k is None
+            or max_seqlen_q is None
+            or max_seqlen_k is None
+        ):
+            return False
 
-        enable_mubin &= cu_seqlens_q.is_musa
-        enable_mubin &= cu_seqlens_k.is_musa
+        return (
+            k.shape == (total_seq_kv, nr_heads_kv, headdim_qk)
+            and v.shape == (total_seq_kv, nr_heads_kv, headdim_v)
+            and cu_seqlens_q.is_musa
+            and cu_seqlens_k.is_musa
+            and cu_seqlens_k.numel() == cu_seqlens_q.numel()
+        )
 
-        enable_mubin &= cu_seqlens_q is not None
-        enable_mubin &= cu_seqlens_k is not None
-        enable_mubin &= cu_seqlens_k.numel() == cu_seqlens_q.numel()
+    batch, seq_q, nr_heads, headdim_qk = q.shape
+    _, seq_kv, nr_heads_kv, _ = k.shape
+    _, _, _, headdim_v = v.shape
 
-        enable_mubin &= max_seqlen_q is not None
-        enable_mubin &= max_seqlen_k is not None
-
-    if q.dim() == 4:
-        batch, seq_q, nr_heads, headdim_qk = q.shape
-        _, seq_kv, nr_heads_kv, _ = k.shape
-        _, _, _, headdim_v = v.shape
-
-        enable_mubin &= k.shape == (batch, seq_kv, nr_heads_kv, headdim_qk)
-        enable_mubin &= v.shape == (batch, seq_kv, nr_heads_kv, headdim_v)
-
-    return enable_mubin
+    return k.shape == (
+        batch,
+        seq_kv,
+        nr_heads_kv,
+        headdim_qk,
+    ) and v.shape == (batch, seq_kv, nr_heads_kv, headdim_v)
 
 
 def maybe_contiguous(x):
@@ -444,8 +448,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             assert seqused_q is None
             assert seqused_k is None
 
-            assert window_size_left is None or window_size_left < 0
-            assert window_size_right is None or window_size_right < 0
+            if not (
+                (window_size_left is None or window_size_left < 0)
+                and (window_size_right is None or window_size_right < 0)
+            ):
+                raise ValueError("MUBIN backend does not support windowed attention")
 
             assert qv is None
             assert learnable_sink is None

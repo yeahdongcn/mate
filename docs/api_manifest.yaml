@@ -8,6 +8,14 @@
           "kind": "lazy_attr_modules",
           "path": "mate/__init__.py",
           "module_targets": ["mha_interface", "flashmla"]
+        },
+        {
+          "kind": "module_mate_api",
+          "path": "mate/flashmla.py",
+          "only_names": [
+            "flash_mla_sparse_fwd",
+            "flash_mla_sparse_fwd_pack8"
+          ]
         }
       ],
       "detail_pages": [
@@ -20,11 +28,27 @@
             },
             {
               "kind": "module_mate_api",
-              "path": "mate/flashmla.py",
-              "exclude_names": [
-                "flash_mla_sparse_fwd",
-                "flash_mla_sparse_fwd_pack8"
-              ]
+              "path": "mate/flashmla.py"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Sparse MLA",
+      "summary_sources": [
+        {
+          "kind": "module_mate_api",
+          "path": "mate/sparse_mla_interface.py"
+        }
+      ],
+      "detail_pages": [
+        {
+          "path": "docs/source/api/sparse_mla.rst",
+          "sources": [
+            {
+              "kind": "module_mate_api",
+              "path": "mate/sparse_mla_interface.py"
             }
           ]
         }
@@ -46,21 +70,11 @@
       "summary_sources": [
         {
           "kind": "module_mate_api",
-          "path": "mate/gemm.py",
-          "exclude_names": [
-            "ragged_m_moe_gemm_16bit",
-            "masked_moe_gemm_16bit",
-            "ragged_k_moe_gemm_16bit"
-          ]
+          "path": "mate/gemm.py"
         },
         {
           "kind": "module_mate_api",
-          "path": "mate/deep_gemm.py",
-          "exclude_names": [
-            "fp8_einsum",
-            "fp8_mqa_logits",
-            "tf32_hc_prenorm_gemm"
-          ]
+          "path": "mate/deep_gemm.py"
         }
       ],
       "detail_pages": [
@@ -69,21 +83,33 @@
           "sources": [
             {
               "kind": "module_mate_api",
-              "path": "mate/gemm.py",
-              "exclude_names": [
-                "ragged_m_moe_gemm_16bit",
-                "masked_moe_gemm_16bit",
-                "ragged_k_moe_gemm_16bit"
-              ]
+              "path": "mate/gemm.py"
             },
             {
               "kind": "module_mate_api",
-              "path": "mate/deep_gemm.py",
-              "exclude_names": [
-                "fp8_einsum",
-                "fp8_mqa_logits",
-                "tf32_hc_prenorm_gemm"
-              ]
+              "path": "mate/deep_gemm.py"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "MSA",
+      "summary_sources": [
+        {
+          "kind": "module_mate_api",
+          "path": "mate/msa_interface.py",
+          "exclude_names": ["_msa_plan_from_lengths"]
+        }
+      ],
+      "detail_pages": [
+        {
+          "path": "docs/source/api/msa.rst",
+          "sources": [
+            {
+              "kind": "module_mate_api",
+              "path": "mate/msa_interface.py",
+              "exclude_names": ["_msa_plan_from_lengths"]
             }
           ]
         }

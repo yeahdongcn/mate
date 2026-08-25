@@ -27,11 +27,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FLASHMLA_ROOT = REPO_ROOT / "wrappers" / "FlashMLA"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(FLASHMLA_ROOT))
-sys.path.insert(0, str(FLASHMLA_ROOT / "tests"))
 
 import flash_mla  # noqa: E402
 from mate.mate_runtime import resolve_num_mps  # noqa: E402
-from sparse_mla_test_utils import FP8KVCacheLayout, quantize_k_cache  # noqa: E402
+from mate.sparse_mla_interface import (  # noqa: E402
+    get_batch_decode_metadata_mla,
+    sparse_mla_fp8_decode,
+)
+from mate.testing.sparse_mla import quantize_sparse_mla_cache  # noqa: E402
 
 
 DV = 512
@@ -88,6 +91,7 @@ class DecodeCase:
     temp_metadata: bool = False
     mp_count: int = 56
     tile_m: int = 64
+    native_fp8: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,7 +148,7 @@ def _bench_event_us(fn: Callable[[], object], repeat: int) -> float:
     # Event timing keeps launch overhead visible for wrapper e2e numbers without
     # relying on tilelang.profiler.do_bench, which can be unstable on large cases.
     repeat = max(3, repeat)
-    for _ in range(max(2, repeat // 4)):
+    for _ in range(max(3, repeat // 4)):
         fn()
     _sync()
 
@@ -170,7 +174,7 @@ def _bench_graph_us(
     num_iters_within_graph = max(1, num_iters_within_graph)
 
     captured_outputs = []
-    for _ in range(2):
+    for _ in range(3):
         captured_outputs.append(fn())
     _sync()
 
@@ -180,7 +184,7 @@ def _bench_graph_us(
             captured_outputs.append(fn())
     _sync()
 
-    for _ in range(2):
+    for _ in range(3):
         graph.replay()
     _sync()
 
@@ -380,6 +384,13 @@ def _parse_int_list(value: str) -> list[int]:
     return vals
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
+
+
 def _prefill_stats(
     case: PrefillCase,
     indices: torch.Tensor,
@@ -395,7 +406,7 @@ def _prefill_stats(
     if topk_length is not None:
         topk = indices.shape[-1]
         pos = torch.arange(topk, device=indices.device).view(1, 1, topk)
-        valid_mask &= pos < topk_length.view(case.seq_len_q, 1, 1)
+        valid_mask = valid_mask & (pos < topk_length.view(case.seq_len_q, 1, 1))
     num_valid_indices = int(valid_mask.sum().item())
 
     extra_topk = case.extra_topk if case.extra_topk > 0 else 0
@@ -439,10 +450,20 @@ def _decode_stats(
         num_retrieved += retrieved_tokens(extra_indices, extra_topk_length)
 
     flop = 2 * case.num_heads * num_attended * (case.d_qk + DV)
-    kv_token_size = 656 if case.d_qk == 576 else 576
+    if case.native_fp8:
+        kv_token_size = 576
+    elif case.d_qk == 512:
+        kv_token_size = 584
+    else:
+        kv_token_size = 656
+    q_element_size = 1 if case.native_fp8 else 2
     mem_bytes = sum(
         [
-            2 * case.batch_size * case.seq_len_q * case.num_heads * case.d_qk,
+            q_element_size
+            * case.batch_size
+            * case.seq_len_q
+            * case.num_heads
+            * case.d_qk,
             num_retrieved * kv_token_size,
             2 * case.batch_size * case.seq_len_q * case.num_heads * DV,
         ]
@@ -488,11 +509,11 @@ def _make_v32_prefill_graph_runner(
 
     def run_graph():
         args = [q, kv, indices]
+        args.extend((out, max_logits, lse))
         if topk_length is not None:
             args.append(topk_length)
         if attn_sink is not None:
             args.append(attn_sink)
-        args.extend((out, max_logits, lse))
         kernel(*args)
         return out, max_logits, lse
 
@@ -542,11 +563,11 @@ def _make_model1_prefill_graph_runner(
 
     def run_graph():
         args = [q, kv, indices]
+        args.extend((out, max_logits, lse))
         if topk_length is not None:
             args.append(topk_length)
         if attn_sink is not None:
             args.append(attn_sink)
-        args.extend((out, max_logits, lse))
         kernel(*args)
         return out, max_logits, lse
 
@@ -713,11 +734,7 @@ def _run_prefill_case(
 def _make_decode_inputs(case: DecodeCase):
     device = _device()
     torch.manual_seed(20260503 + case.d_qk + case.batch_size)
-    layout = (
-        FP8KVCacheLayout.MODEL1_FP8Sparse
-        if case.d_qk == 512
-        else FP8KVCacheLayout.V32_FP8Sparse
-    )
+    variant = "v4" if case.d_qk == 512 else "v32"
     q = torch.randn(
         (case.batch_size, case.seq_len_q, case.num_heads, case.d_qk),
         dtype=torch.bfloat16,
@@ -727,9 +744,7 @@ def _make_decode_inputs(case: DecodeCase):
     kv = torch.randn(
         (num_pages, case.page_size, 1, case.d_qk), dtype=torch.bfloat16, device=device
     )
-    k_cache = quantize_k_cache(kv, layout)
-    if layout == FP8KVCacheLayout.V32_FP8Sparse:
-        k_cache = k_cache.contiguous()
+    k_cache = quantize_sparse_mla_cache(kv, variant)
     indices = _make_indices(
         case.batch_size * case.seq_len_q, case.topk, case.seq_len_kv, device
     ).view(case.batch_size, case.seq_len_q, 1, case.topk)
@@ -757,9 +772,7 @@ def _make_decode_inputs(case: DecodeCase):
             dtype=torch.bfloat16,
             device=device,
         )
-        extra_k_cache = quantize_k_cache(extra_kv, layout)
-        if layout == FP8KVCacheLayout.V32_FP8Sparse:
-            extra_k_cache = extra_k_cache.contiguous()
+        extra_k_cache = quantize_sparse_mla_cache(extra_kv, variant)
         extra_indices = _make_indices(
             case.batch_size * case.seq_len_q,
             case.extra_topk,
@@ -782,6 +795,54 @@ def _make_decode_inputs(case: DecodeCase):
         extra_indices,
         extra_topk_length,
     )
+
+
+def _make_native_fp8_decode_inputs(case: DecodeCase, use_graph: bool):
+    if case.d_qk != 576:
+        raise AssertionError("native FP8 decode requires d_qk=576")
+    if case.extra_topk > 0 or case.attn_sink:
+        raise AssertionError("native FP8 decode does not support extra KV or sinks")
+
+    device = _device()
+    torch.manual_seed(20260722 + case.batch_size + case.topk)
+    q = (
+        torch.randn(
+            (case.batch_size, case.seq_len_q, case.num_heads, case.d_qk),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+    num_pages = (case.seq_len_kv + case.page_size - 1) // case.page_size
+    kv_cache = (
+        torch.randn(
+            (num_pages, case.page_size, case.d_qk),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+    kv_cache = kv_cache.unsqueeze(1)
+    indices = _make_indices(
+        case.batch_size * case.seq_len_q,
+        case.topk,
+        case.seq_len_kv,
+        device,
+    ).view(case.batch_size, case.seq_len_q, case.topk)
+    # The native FP8 API requires seq_lens metadata even when every row uses
+    # the full sparse topk.  Default cases perturb selected rows; full-topk
+    # cases keep every entry equal to topk.
+    topk_length = torch.full(
+        (case.batch_size,), case.topk, dtype=torch.int32, device=device
+    )
+    if case.topk_length:
+        topk_length[::5] = max(1, case.topk // 2)
+    out = torch.empty(
+        (case.batch_size, case.seq_len_q, case.num_heads, DV),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    return q, kv_cache, indices, topk_length, out
 
 
 def _make_v32_temp_decode_inputs(case: DecodeCase):
@@ -1022,6 +1083,87 @@ def _run_decode_case(
     use_graph: bool,
     graph_iters: int,
 ) -> None:
+    if case.native_fp8:
+        q, kv_cache, indices, topk_length, out = _make_native_fp8_decode_inputs(
+            case, use_graph
+        )
+        stats = _decode_stats(case, indices.unsqueeze(2), topk_length, None, None)
+
+        def run_native():
+            return sparse_mla_fp8_decode(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=None,
+                qk_nope_head_dim=128,
+                kv_lora_rank=DV,
+                qk_rope_head_dim=64,
+                block_tables=indices,
+                seq_lens=topk_length,
+                max_seq_len=case.seq_len_kv,
+                sparse_mla_top_k=case.topk,
+                out=out,
+                bmm1_scale=case.d_qk**-0.5,
+            )
+
+        metadata = get_batch_decode_metadata_mla(
+            q,
+            topk_length,
+            case.topk,
+        )
+
+        def run_native_reusing_metadata():
+            return sparse_mla_fp8_decode(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=None,
+                qk_nope_head_dim=128,
+                kv_lora_rank=DV,
+                qk_rope_head_dim=64,
+                block_tables=indices,
+                seq_lens=topk_length,
+                max_seq_len=case.seq_len_kv,
+                sparse_mla_top_k=case.topk,
+                out=out,
+                bmm1_scale=case.d_qk**-0.5,
+                metadata=metadata,
+            )
+
+        run_native()
+        run_native_reusing_metadata()
+        _sync()
+        auto_e2e_us = _bench_event_us(run_native, repeat)
+        reused_e2e_us = _bench_event_us(run_native_reusing_metadata, repeat)
+        impl_kernel_us, impl_kernel_rows = _bench_impl_kernel_us(
+            run_native_reusing_metadata, repeat
+        )
+        kernel_path_us, used_graph = _bench_kernel_path_us(
+            run_native_reusing_metadata,
+            repeat,
+            use_graph=use_graph,
+            graph_iters=graph_iters,
+            graph_fn=run_native_reusing_metadata if use_graph else None,
+        )
+        print(
+            f"decode-native-fp8 {case.name}: "
+            f"e2e(auto-metadata)={auto_e2e_us:.1f} us, "
+            f"e2e(reused-metadata)={reused_e2e_us:.1f} us, "
+            f"{_kernel_path_name(used_graph)}(reused-metadata)="
+            f"{kernel_path_us:.1f} us, "
+            f"impl_kernel_us={impl_kernel_us:.1f} us, "
+            f"{_format_perf(stats, reused_e2e_us, kernel_path_us, impl_kernel_us)}"
+        )
+        if profile_kernels:
+            print(f"  impl kernels={impl_kernel_us:.1f} us")
+            for role, name, time_us in impl_kernel_rows:
+                print(f"  {time_us:8.1f} us  [{role}] {name}")
+            kernel_us, kernel_rows = _bench_kernel_us(
+                run_native_reusing_metadata, max(2, repeat // 2)
+            )
+            print(f"  profiled kernels={kernel_us:.1f} us")
+            for role, name, time_us in kernel_rows:
+                print(f"  {time_us:8.1f} us  [{role}] {name}")
+        return
+
     if case.direct_tilelang:
         q, k_cache, indices, sched_meta, num_splits, topk_length = (
             _make_v32_temp_decode_inputs(case)
@@ -1143,6 +1285,7 @@ def _run_decode_case(
     run_kernel_path()
     _sync()
     e2e_us = _bench_event_us(run_with_new_metadata, repeat)
+    reused_metadata_us = _bench_event_us(run_kernel_path, repeat)
     run_graph = None
     if use_graph and case.d_qk == 512:
         run_graph = _make_model1_decode_graph_runner(
@@ -1181,6 +1324,7 @@ def _run_decode_case(
     )
     print(
         f"decode  {case.name}: e2e={e2e_us:.1f} us, "
+        f"e2e(reused-metadata)={reused_metadata_us:.1f} us, "
         f"{_kernel_path_name(used_graph)}={kernel_path_us:.1f} us, "
         f"impl_kernel_us={impl_kernel_us:.1f} us, "
         f"{_format_perf(stats, e2e_us, kernel_path_us, impl_kernel_us)}"
@@ -1195,11 +1339,11 @@ def _run_decode_case(
             print(f"  {time_us:8.1f} us  [{role}] {name}")
 
 
-def _prefill_cases(
-    quick: bool, case_set: str, include_large: bool
-) -> Iterable[PrefillCase]:
+def _prefill_cases(quick: bool) -> Iterable[PrefillCase]:
     skvs = [8192]
     templates = [(512, 64, 512), (512, 64, 2048), (576, 64, 512), (576, 64, 2048)]
+    if quick:
+        templates = [template for template in templates if template[-1] == 512]
     for d_qk, heads, topk in templates:
         for skv in skvs:
             yield PrefillCase(
@@ -1215,6 +1359,7 @@ def _custom_prefill_cases(
     skv: int,
     topks: Iterable[int],
     full_topk: bool,
+    attn_sink: bool,
 ) -> Iterable[PrefillCase]:
     for sq in sqs:
         for topk in topks:
@@ -1226,45 +1371,68 @@ def _custom_prefill_cases(
                 skv,
                 topk,
                 topk_length=not full_topk,
+                attn_sink=attn_sink,
             )
 
 
 def _decode_cases(
-    quick: bool, case_set: str, include_large: bool
+    quick: bool,
+    *,
+    batches: Iterable[int] | None = None,
+    heads: Iterable[int] | None = None,
+    topks: Iterable[int] | None = None,
+    full_topk: bool = False,
 ) -> Iterable[DecodeCase]:
-    batches = [128]
+    batches = list(batches) if batches is not None else [128]
+    heads = list(heads) if heads is not None else [64]
+    topks = list(topks) if topks is not None else ([512] if quick else [2048, 512])
     for bsz in batches:
-        yield DecodeCase(
-            f"b{bsz}_d{512}_heads{64}_topk{2048}", 512, 64, bsz, 1, 8192, 2048, 64
-        )
-        yield DecodeCase(
-            f"b{bsz}_d{512}_heads{64}_topk{512}", 512, 64, bsz, 1, 8192, 512, 64
-        )
-        yield DecodeCase(
-            f"b{bsz}_d{576}_heads{64}_topk{2048}", 576, 64, bsz, 1, 8192, 2048, 64
-        )
-        yield DecodeCase(
-            f"b{bsz}_d{576}_heads{64}_topk{512}", 576, 64, bsz, 1, 8192, 512, 64
-        )
+        for num_heads in heads:
+            for topk in topks:
+                yield DecodeCase(
+                    f"b{bsz}_d512_heads{num_heads}_topk{topk}",
+                    512,
+                    num_heads,
+                    bsz,
+                    1,
+                    8192,
+                    topk,
+                    64,
+                    topk_length=not full_topk,
+                )
+                yield DecodeCase(
+                    f"b{bsz}_d576_heads{num_heads}_topk{topk}",
+                    576,
+                    num_heads,
+                    bsz,
+                    1,
+                    8192,
+                    topk,
+                    64,
+                    topk_length=not full_topk,
+                    attn_sink=False,
+                )
+                yield DecodeCase(
+                    f"b{bsz}_d576_native_fp8_heads{num_heads}_topk{topk}",
+                    576,
+                    num_heads,
+                    bsz,
+                    1,
+                    8192,
+                    topk,
+                    64,
+                    topk_length=not full_topk,
+                    attn_sink=False,
+                    native_fp8=True,
+                )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("prefill", "decode", "both"), default="both")
-    parser.add_argument("--repeat", type=int, default=20)
+    parser.add_argument("--repeat", type=_positive_int, default=20)
     parser.add_argument(
         "--quick", action="store_true", help="Run one size per family for smoke checks"
-    )
-    parser.add_argument(
-        "--case-set",
-        choices=("wrapper", "tilelang"),
-        default="wrapper",
-        help="wrapper uses FlashMLA public ABI; tilelang mirrors direct kernel perf cases",
-    )
-    parser.add_argument(
-        "--include-large",
-        action="store_true",
-        help="Include large direct/scheduled comparison cases; these are slow and may expose current kernel issues",
     )
     parser.add_argument(
         "--profile-kernels",
@@ -1307,13 +1475,50 @@ def main() -> None:
         help="Use full topk length for every prefill row instead of the default variable-length perturbation",
     )
     parser.add_argument(
+        "--prefill-attn-sink",
+        action="store_true",
+        help="Enable attention sink for custom prefill cases",
+    )
+    parser.add_argument(
         "--no-graph",
         action="store_true",
         help="Disable graph replay for kernel-path timing",
     )
     parser.add_argument(
+        "--decode-layout",
+        choices=("all", "quantized-cache", "native-fp8", "v32-compare"),
+        default="all",
+        help=(
+            "Filter decode cases by input layout; v32-compare runs the 656-byte "
+            "cache and native FP8 V3.2 paths"
+        ),
+    )
+    parser.add_argument(
+        "--decode-batches",
+        type=_parse_int_list,
+        default=None,
+        help="Comma-separated decode batch sizes; default: 128",
+    )
+    parser.add_argument(
+        "--decode-heads",
+        type=_parse_int_list,
+        default=None,
+        help="Comma-separated decode head counts; default: 64",
+    )
+    parser.add_argument(
+        "--decode-topks",
+        type=_parse_int_list,
+        default=None,
+        help="Comma-separated decode topk values; default: 2048,512",
+    )
+    parser.add_argument(
+        "--decode-full-topk",
+        action="store_true",
+        help="Use the full decode topk for every batch row",
+    )
+    parser.add_argument(
         "--graph-iters",
-        type=int,
+        type=_positive_int,
         default=4,
         help="Function calls captured inside one graph replay",
     )
@@ -1343,7 +1548,7 @@ def main() -> None:
     )
     print(
         f"device={device}, repeat={args.repeat}, quick={args.quick}, "
-        f"case_set={args.case_set}, graph={use_graph}, graph_iters={args.graph_iters}, "
+        f"graph={use_graph}, graph_iters={args.graph_iters}, "
         f"model1_prefill_persistence={not args.no_model1_prefill_persistence}, "
         f"model1_prefill_persistent_blocks={model1_prefill_persistent_blocks}"
     )
@@ -1358,11 +1563,10 @@ def main() -> None:
                 skv=args.prefill_skv,
                 topks=args.prefill_topks or [512, 2048],
                 full_topk=args.prefill_full_topk,
+                attn_sink=args.prefill_attn_sink,
             )
         else:
-            prefill_cases = _prefill_cases(
-                args.quick, args.case_set, args.include_large
-            )
+            prefill_cases = _prefill_cases(args.quick)
         for prefill_case in prefill_cases:
             if prefill_case.d_qk == 512:
                 prefill_case = dataclasses.replace(
@@ -1385,7 +1589,19 @@ def main() -> None:
                 args.graph_iters,
             )
     if args.mode in ("decode", "both"):
-        for decode_case in _decode_cases(args.quick, args.case_set, args.include_large):
+        for decode_case in _decode_cases(
+            args.quick,
+            batches=args.decode_batches,
+            heads=args.decode_heads,
+            topks=args.decode_topks,
+            full_topk=args.decode_full_topk,
+        ):
+            if args.decode_layout == "quantized-cache" and decode_case.native_fp8:
+                continue
+            if args.decode_layout == "native-fp8" and not decode_case.native_fp8:
+                continue
+            if args.decode_layout == "v32-compare" and decode_case.d_qk != 576:
+                continue
             _run_decode_case(
                 decode_case,
                 args.repeat,
@@ -1399,7 +1615,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except BaseException:
+    except Exception:
         import os
         import traceback
 

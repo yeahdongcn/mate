@@ -384,6 +384,7 @@ def _fmha_get_metadata(
         kernel_packgqa,
         has_qv,
         qkv_dtype in _FP8_DTYPES,
+        is_local and attention_chunk != 0,
     )
 
     packgqa = enable_packgqa if kernel_packgqa is None else kernel_packgqa

@@ -183,6 +183,7 @@ def _get_fwd_kernel_config(
     enable_packgqa: bool = None,
     has_qv: bool = False,
     is_fp8: bool = False,
+    is_high_regpressure: bool = False,
 ):
     headdim, headdim_v = _roundup_headdim(headdim, headdim_v)
 
@@ -246,23 +247,35 @@ def _get_fwd_kernel_config(
         assert False, f"Add config for headdim {headdim}-{headdim_v}"
 
     if is_fp8 and not has_qv:
-        match (headdim, headdim_v):
-            case (64, 64) | (128, 128) | (192, 128) | (192, 192):
+        match (
+            headdim,
+            headdim_v,
+            is_high_regpressure,
+        ):  # workaround for MusaToolKit 4.3.8
+            case (
+                (64, 64, _) | (128, 128, False) | (192, 128, False) | (192, 192, False)
+            ):
                 tile_m = 256
                 tile_n = 128
                 stages_k = 2
                 stages_v = 2
-            case (256, 256):
+            case (256, 256, False):
                 tile_m = 192
                 tile_n = 128
                 stages_k = 1
                 stages_v = 1
-            case (384, 384):
+            case (
+                (128, 128, True)
+                | (192, 128, True)
+                | (192, 192, True)
+                | (256, 256, True)
+                | (384, 384, _)
+            ):
                 tile_m = 128
                 tile_n = 128
                 stages_k = 1
                 stages_v = 1
-            case (512, 512):
+            case (512, 512, _):
                 tile_m = 32
                 tile_n = 128
                 stages_k = 1

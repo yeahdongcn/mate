@@ -3,7 +3,6 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from tvm import tir
 
 from ...execution_context import raise_complete_if_dry_run
 
@@ -375,7 +374,7 @@ def _build_kda_decode_kernel_factory(
                         prologue_v_tile = start_v_tile
                         prologue_v_base = prologue_v_tile * v_tile
                         if state_v_first:
-                            T.copy(
+                            T.tma_copy(
                                 state[state_slot, hid, prologue_v_base, 0],
                                 state_load_stage[0, :, :],
                                 barrier=mbars[0],
@@ -383,7 +382,7 @@ def _build_kda_decode_kernel_factory(
                                 outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                             )
                         else:
-                            T.copy(
+                            T.tma_copy(
                                 state[state_slot, hid, 0, prologue_v_base],
                                 state_load_stage2[0, :, :],
                                 barrier=mbars[0],
@@ -551,7 +550,7 @@ def _build_kda_decode_kernel_factory(
                             ):
                                 global_prev_v_base = global_v_base - v_tile
                                 if state_v_first:
-                                    T.copy(
+                                    T.tma_copy(
                                         state_load_stage[local_v_tile - 1, :, :],
                                         state_final[
                                             final_state_slot[0],
@@ -560,12 +559,11 @@ def _build_kda_decode_kernel_factory(
                                             + v_tile,
                                             :,
                                         ],
-                                        disable_tma=False,
                                         inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
                                         outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                                     )
                                 else:
-                                    T.copy(
+                                    T.tma_copy(
                                         state_load_stage2[local_v_tile - 1, :, :],
                                         state_final[
                                             final_state_slot[0],
@@ -574,11 +572,9 @@ def _build_kda_decode_kernel_factory(
                                             global_prev_v_base : global_prev_v_base
                                             + v_tile,
                                         ],
-                                        disable_tma=False,
                                         inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
                                         outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                                     )
-                                tir.call_extern("void", "__musa_tme_store_commit")
 
                             if i_t == 0 and use_initial_state:
                                 T.mbarrier_wait_parity(
@@ -672,7 +668,7 @@ def _build_kda_decode_kernel_factory(
                                     )
                                     global_next_v_base = global_next_v_tile * v_tile
                                     if state_v_first:
-                                        T.copy(
+                                        T.tma_copy(
                                             state[
                                                 state_slot, hid, global_next_v_base, 0
                                             ],
@@ -682,7 +678,7 @@ def _build_kda_decode_kernel_factory(
                                             outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                                         )
                                     else:
-                                        T.copy(
+                                        T.tma_copy(
                                             state[
                                                 state_slot, hid, 0, global_next_v_base
                                             ],
@@ -699,7 +695,7 @@ def _build_kda_decode_kernel_factory(
                         ) * v_tile
                         if do_store_final_this_token and global_prev_v_base_epi < dim_v:
                             if state_v_first:
-                                T.copy(
+                                T.tma_copy(
                                     state_load_stage[num_v_tiles_per_block - 1, :, :],
                                     state_final[
                                         final_state_slot[0],
@@ -708,12 +704,11 @@ def _build_kda_decode_kernel_factory(
                                         + v_tile,
                                         :,
                                     ],
-                                    disable_tma=False,
                                     inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
                                     outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                                 )
                             else:
-                                T.copy(
+                                T.tma_copy(
                                     state_load_stage2[num_v_tiles_per_block - 1, :, :],
                                     state_final[
                                         final_state_slot[0],
@@ -722,11 +717,9 @@ def _build_kda_decode_kernel_factory(
                                         global_prev_v_base_epi : global_prev_v_base_epi
                                         + v_tile,
                                     ],
-                                    disable_tma=False,
                                     inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
                                     outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
                                 )
-                            tir.call_extern("void", "__musa_tme_store_commit")
                         if (
                             tid < num_v_rows_per_block
                             and start_v_tile * v_tile + tid < dim_v

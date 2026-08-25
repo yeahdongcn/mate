@@ -4,6 +4,8 @@ import torch
 from einops import rearrange, repeat
 from typing import Optional, Union, Tuple  # noqa: F401
 from flash_attn_interface import (
+    flash_attn_func,
+    flash_attn_qkvpacked_func,
     flash_attn_with_kvcache,
     flash_attn_varlen_func,
     get_scheduler_metadata,
@@ -19,6 +21,49 @@ from mate.testing.flash_attn import (
     pad_input,
     lse_ref_from_score,
 )
+
+
+@pytest.mark.parametrize("layout", ["stacked", "gqa"])
+@torch.inference_mode()
+def test_flash_attn_qkvpacked_func_forward(layout):
+    torch.manual_seed(666)
+    device = "musa"
+    dtype = torch.bfloat16
+
+    if layout == "stacked":
+        qkv = torch.randn(1, 128, 3, 4, 128, device=device, dtype=dtype)
+        q, k, v = qkv.unbind(dim=-3)
+        packed_kwargs = {}
+    else:
+        qkv = torch.randn(1, 128, 8, 128, device=device, dtype=dtype)
+        q, k, v = qkv.split([4, 2, 2], dim=-2)
+        packed_kwargs = {"num_heads_q": 4}
+
+    out = flash_attn_qkvpacked_func(qkv, causal=True, **packed_kwargs)
+    out_ref = flash_attn_func(q, k, v, causal=True)
+
+    torch.testing.assert_close(out, out_ref)
+
+
+def test_flash_attn_qkvpacked_func_backward():
+    torch.manual_seed(666)
+    device = "musa"
+    dtype = torch.bfloat16
+
+    qkv = torch.randn(1, 128, 3, 4, 128, device=device, dtype=dtype, requires_grad=True)
+    q, k, v = [
+        tensor.detach().contiguous().requires_grad_() for tensor in qkv.unbind(dim=-3)
+    ]
+    grad_out = torch.randn(1, 128, 4, 128, device=device, dtype=dtype)
+
+    out = flash_attn_qkvpacked_func(qkv, causal=True)
+    out_ref = flash_attn_func(q, k, v, causal=True)
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
+    qkv_grad_ref = torch.stack([q.grad, k.grad, v.grad], dim=-3)
+
+    torch.testing.assert_close(out, out_ref)
+    torch.testing.assert_close(qkv.grad, qkv_grad_ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

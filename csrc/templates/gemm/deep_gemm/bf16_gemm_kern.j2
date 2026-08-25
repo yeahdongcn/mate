@@ -113,7 +113,7 @@ void {{ func_name }}(
   check_mp31(a.device(), "{{ func_name }}");
 
   if (mate::gemm::common::gemm_early_return(
-          static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), d)) {
+          static_cast<int>(G), static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), d, false)) {
     return;
   }
 

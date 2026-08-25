@@ -7,6 +7,11 @@ from mate.testing.utils import calc_diff
 from mate.testing import supported_musa_compute_capability
 
 
+def _truncate_fp32_to_tf32(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.float32
+    return (x.view(torch.int32) & ~0x1FFF).view(torch.float32)
+
+
 def _sinkhorn_ref(logits: torch.Tensor, eps: float, repeat: int) -> torch.Tensor:
     row_max = logits.amax(dim=-1, keepdim=True)
     comb = torch.exp(logits - row_max)
@@ -125,7 +130,7 @@ def test_hc_prenorm_gemm(m: int, n: int, k: int, num_splits: int | None) -> None
     final_d = d if num_splits is None else d.sum(0)
     final_s = s if num_splits is None else s.sum(0)
 
-    ref_d = a.float() @ b.T
+    ref_d = a.float() @ _truncate_fp32_to_tf32(b).T
     ref_s = a.float().square().sum(-1)
 
     diff_d = calc_diff(final_d, ref_d)

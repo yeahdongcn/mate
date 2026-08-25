@@ -54,8 +54,8 @@ Minimal dense MLA example:
    import torch
    from mate.flashmla import get_mla_metadata, flash_mla_with_kvcache
 
-   q = torch.randn((1, 32, 8, 128), device="musa", dtype=torch.bfloat16)
-   k_cache = torch.randn((4, 16, 2, 128), device="musa", dtype=torch.bfloat16)
+   q = torch.randn((1, 32, 8, 576), device="musa", dtype=torch.bfloat16)
+   k_cache = torch.randn((4, 16, 2, 576), device="musa", dtype=torch.bfloat16)
    block_table = torch.zeros((1, 4), device="musa", dtype=torch.int32)
    cache_seqlens = torch.tensor([32], device="musa", dtype=torch.int32)
 
@@ -73,10 +73,12 @@ Minimal dense MLA example:
        k_cache=k_cache,
        block_table=block_table,
        cache_seqlens=cache_seqlens,
-       head_dim_v=128,
+       head_dim_v=512,
        tile_scheduler_metadata=tile_scheduler_metadata,
        num_splits=num_splits,
    )
 
 .. autofunction:: get_mla_metadata
 .. autofunction:: flash_mla_with_kvcache
+.. autofunction:: flash_mla_sparse_fwd
+.. autofunction:: flash_mla_sparse_fwd_pack8

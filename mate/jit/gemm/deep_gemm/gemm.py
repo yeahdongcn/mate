@@ -77,6 +77,10 @@ _FP8_SCALE_ACCUMULATION_MODE_CPP = {
 }
 _FP8_SCALE_ACCUMULATION_MODE_ENV = "MATE_DEEP_GEMM_FP8_SCALE_ACCUM_MODE"
 
+DEEP_GEMM_EPILOGUE_GEMM = "gemm"
+DEEP_GEMM_EPILOGUE_HEAD_SPLITS = "head_splits"
+_DEEP_GEMM_EPILOGUES = (DEEP_GEMM_EPILOGUE_GEMM, DEEP_GEMM_EPILOGUE_HEAD_SPLITS)
+
 
 @dataclass(frozen=True)
 class GemmJitConfig:
@@ -98,6 +102,8 @@ class DeepGemmGemmKernelConfig:
     num_mma_warp_squads: int
     quant_tile: int = 0
     scale_accumulation_mode: str = FP8_SCALE_ACCUMULATION_MODE_ITERATIVE
+    epilogue: str = DEEP_GEMM_EPILOGUE_GEMM
+    head_splits: tuple[int, int, int] = (0, 0, 0)
 
 
 DEEP_GEMM_CONFIGS = [
@@ -174,6 +180,9 @@ def deep_gemm_gemm_dispatch_name(config: DeepGemmGemmKernelConfig) -> str:
     default_wgs = _default_num_mma_warp_squads(config)
     if default_wgs != config.num_mma_warp_squads:
         suffix += f"_{config.num_mma_warp_squads}wgs"
+    if config.epilogue == DEEP_GEMM_EPILOGUE_HEAD_SPLITS:
+        left, mid, right = config.head_splits
+        suffix += f"_headsplits{left}x{mid}x{right}"
     if config.kind == "fp8":
         suffix += f"_quant1x{config.quant_tile}x{config.quant_tile}"
         if config.scale_accumulation_mode == FP8_SCALE_ACCUMULATION_MODE_DUAL_BUFFER:
@@ -193,7 +202,25 @@ def _deep_gemm_gemm_config_dict(
         "tile_k": config.tile_k,
         "stages": config.stages,
         "num_mma_warp_squads": config.num_mma_warp_squads,
+        "epilogue": config.epilogue,
     }
+    if config.epilogue == DEEP_GEMM_EPILOGUE_HEAD_SPLITS:
+        left, mid, right = config.head_splits
+        render_config.update(
+            epilogue_type=(
+                f"mate::deep_gemm::EpilogueHeadSplits<{left}, {mid}, {right}>"
+            ),
+            head_left=left,
+            head_mid=mid,
+            head_right=right,
+        )
+    else:
+        render_config.update(
+            epilogue_type="mate::deep_gemm::EpilogueGemm",
+            head_left=0,
+            head_mid=0,
+            head_right=0,
+        )
     if config.kind == "bf16":
         render_config.update(
             element_a=dtype_torch2mutlass_map[torch.bfloat16],
@@ -239,6 +266,19 @@ def _validate_deep_gemm_gemm_kernel_config(config: DeepGemmGemmKernelConfig) -> 
             f"{config.scale_accumulation_mode}. "
             f"Expected one of {_FP8_SCALE_ACCUMULATION_MODES}"
         )
+    if config.epilogue not in _DEEP_GEMM_EPILOGUES:
+        raise ValueError(
+            f"Unsupported DeepGEMM epilogue: {config.epilogue}. "
+            f"Expected one of {_DEEP_GEMM_EPILOGUES}"
+        )
+    if config.epilogue == DEEP_GEMM_EPILOGUE_HEAD_SPLITS:
+        if config.kind != "fp8" or config.gemm_type != GEMM_TYPE_NORMAL:
+            raise ValueError(
+                "Head-splits epilogue is only supported for normal FP8 GEMM"
+            )
+        left, mid, right = config.head_splits
+        if left <= 0 or mid < 0 or right <= 0:
+            raise ValueError(f"Invalid head_splits: {config.head_splits}")
 
 
 def _normalize_fp8_scale_accumulation_mode(mode: object, *, allow_auto: bool) -> str:
@@ -290,6 +330,16 @@ def _normalize_deep_gemm_gemm_config(
             ),
             allow_auto=False,
         )
+    head_splits_config = tuple(
+        int(split) for split in config.get("head_splits", (0, 0, 0))
+    )
+    if len(head_splits_config) != 3:
+        raise ValueError(f"head_splits must have 3 elements, got {head_splits_config}")
+    head_splits = (
+        head_splits_config[0],
+        head_splits_config[1],
+        head_splits_config[2],
+    )
     return DeepGemmGemmKernelConfig(
         kind=kind,
         gemm_type=str(config["gemm_type"]),
@@ -300,6 +350,8 @@ def _normalize_deep_gemm_gemm_config(
         num_mma_warp_squads=int(config["num_mma_warp_squads"]),
         quant_tile=int(config.get("quant_tile", 128 if kind == "fp8" else 0)),
         scale_accumulation_mode=scale_accumulation_mode,
+        epilogue=str(config.get("epilogue", DEEP_GEMM_EPILOGUE_GEMM)),
+        head_splits=head_splits,
     )
 
 
@@ -322,7 +374,7 @@ def _render_deep_gemm_gemm_source(
 
 def _freeze_deep_gemm_gemm_config(
     config: DeepGemmGemmKernelConfig,
-) -> tuple[str, str, int, int, int, int, int, int, str]:
+) -> tuple[str, str, int, int, int, int, int, int, str, str, tuple[int, int, int]]:
     return (
         config.kind,
         config.gemm_type,
@@ -333,12 +385,16 @@ def _freeze_deep_gemm_gemm_config(
         config.num_mma_warp_squads,
         config.quant_tile,
         config.scale_accumulation_mode,
+        config.epilogue,
+        config.head_splits,
     )
 
 
 @functools.cache
 def _load_deep_gemm_gemm_module(
-    frozen_config: tuple[str, str, int, int, int, int, int, int, str],
+    frozen_config: tuple[
+        str, str, int, int, int, int, int, int, str, str, tuple[int, int, int]
+    ],
 ):
     config = DeepGemmGemmKernelConfig(*frozen_config)
     return gen_deep_gemm_gemm_spec(config).build_and_load()
@@ -351,6 +407,8 @@ def get_deep_gemm_gemm_module(
     alignment_m: int = 128,
     config: Optional[GemmJitConfig] = None,
     scale_accumulation_mode: Optional[str] = None,
+    epilogue: str = DEEP_GEMM_EPILOGUE_GEMM,
+    head_splits: tuple[int, int, int] = (0, 0, 0),
 ):
     kernel_config = _resolve_deep_gemm_gemm_kernel_config(
         kind=kind,
@@ -359,6 +417,8 @@ def get_deep_gemm_gemm_module(
         alignment_m=alignment_m,
         config=config,
         scale_accumulation_mode=scale_accumulation_mode,
+        epilogue=epilogue,
+        head_splits=head_splits,
     )
     return (
         deep_gemm_gemm_dispatch_name(kernel_config),
@@ -397,6 +457,8 @@ def _make_kernel_config(
     gemm_type: str,
     config: GemmJitConfig,
     scale_accumulation_mode: Optional[str] = None,
+    epilogue: str = DEEP_GEMM_EPILOGUE_GEMM,
+    head_splits: tuple[int, int, int] = (0, 0, 0),
 ) -> DeepGemmGemmKernelConfig:
     if kind not in _SUPPORTED_KINDS:
         raise ValueError(f"Unsupported DeepGEMM GEMM kind: {kind}")
@@ -411,6 +473,8 @@ def _make_kernel_config(
             tile_k=64,
             stages=config.stages,
             num_mma_warp_squads=config.num_mma_warp_squads,
+            epilogue=epilogue,
+            head_splits=head_splits,
         )
     return DeepGemmGemmKernelConfig(
         kind=kind,
@@ -427,6 +491,8 @@ def _make_kernel_config(
             if scale_accumulation_mode is not None
             else config.scale_accumulation_mode,
         ),
+        epilogue=epilogue,
+        head_splits=head_splits,
     )
 
 
@@ -438,6 +504,8 @@ def _resolve_deep_gemm_gemm_kernel_config(
     alignment_m: int = 128,
     config: Optional[GemmJitConfig] = None,
     scale_accumulation_mode: Optional[str] = None,
+    epilogue: str = DEEP_GEMM_EPILOGUE_GEMM,
+    head_splits: tuple[int, int, int] = (0, 0, 0),
 ) -> DeepGemmGemmKernelConfig:
     selected = select_deep_gemm_gemm_config(
         kind=kind,
@@ -451,6 +519,8 @@ def _resolve_deep_gemm_gemm_kernel_config(
         gemm_type=gemm_type,
         config=selected,
         scale_accumulation_mode=scale_accumulation_mode,
+        epilogue=epilogue,
+        head_splits=head_splits,
     )
 
 
@@ -515,6 +585,8 @@ __all__ = [
     "GEMM_TYPE_M_GROUPED_CONTIGUOUS",
     "GEMM_TYPE_M_GROUPED_CONTIGUOUS_PSUM",
     "GEMM_TYPE_M_GROUPED_MASKED",
+    "DEEP_GEMM_EPILOGUE_GEMM",
+    "DEEP_GEMM_EPILOGUE_HEAD_SPLITS",
     "FP8_SCALE_ACCUMULATION_MODE_AUTO",
     "FP8_SCALE_ACCUMULATION_MODE_ITERATIVE",
     "FP8_SCALE_ACCUMULATION_MODE_DUAL_BUFFER",

@@ -32,6 +32,8 @@ def _fmha_fwd_combine_encode(config: Mapping[str, object]) -> str:
     if config["has_cu_seqlens_q"]:
         mode = "ragged_q"
         name_list.append(mode)
+        if config["has_seqused_q"]:
+            name_list.append("seqused_q")
     elif config["has_seqused_q"]:
         mode = "padded_q"
         name_list.append(mode)

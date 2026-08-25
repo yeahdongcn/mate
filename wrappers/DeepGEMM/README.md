@@ -9,9 +9,7 @@ This wrapper is designed for projects that already target DeepGEMM-style
 Python APIs. It helps run existing integrations on MUSA through MATE with
 minimal code changes.
 
-The current compatibility scope includes grouped GEMM, dense BF16 / FP8 GEMM,
-FP8 einsum, HyperConnection prenorm GEMM, and MQA (multi-query attention)
-logits APIs.
+The wrapper API aligns with the official DeepGEMM repository v2.1.1.
 
 ## Package and import
 
@@ -20,8 +18,9 @@ logits APIs.
 - Runtime backend: MATE GEMM and logits operators on MUSA
 
 MUSA wrapper releases use the PEP 440 local version suffix `+musa`, for
-example `0.2.4+musa`. Use `python -m pip show deep-gemm` to distinguish this
-wrapper from the native package.
+example `0.2.6+musa`. Use `python -m pip show deep-gemm` to distinguish this
+wrapper from the native package. The Python API compatibility baseline is
+official DeepGEMM v2.1.1.
 
 ## Requirements
 
@@ -89,13 +88,26 @@ Import individual APIs:
 
 ```python
 from deep_gemm import (
+    bf16_gemm_nn,
     bf16_gemm_nt,
+    bf16_gemm_tn,
+    bf16_gemm_tt,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
+    m_grouped_fp8_fp4_gemm_nt_contiguous,
+    m_grouped_fp8_fp4_gemm_nt_masked,
+    k_grouped_fp8_gemm_tn_contiguous,
+    k_grouped_bf16_gemm_tn_contiguous,
+    fp8_fp4_gemm_nt,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_masked,
+    k_grouped_fp8_gemm_tn_contiguous,
+    fp8_gemm_nn,
     fp8_gemm_nt,
+    fp8_gemm_tn,
+    fp8_gemm_tt,
     fp8_einsum,
+    fp8_gemm_nt_skip_head_mid,
     tf32_hc_prenorm_gemm,
     get_paged_mqa_logits_metadata,
     fp8_paged_mqa_logits,
@@ -108,19 +120,35 @@ from deep_gemm import (
 Dense BF16 GEMM:
 
 - `bf16_gemm_nt`
+- `bf16_gemm_nn`
+- `bf16_gemm_tn`
+- `bf16_gemm_tt`
 
 Grouped GEMM:
 
 - `m_grouped_bf16_gemm_nt_contiguous`
 - `m_grouped_bf16_gemm_nt_masked`
+- `m_grouped_fp8_fp4_gemm_nt_contiguous`
+- `m_grouped_fp8_fp4_gemm_nt_masked`
 - `m_grouped_fp8_gemm_nt_contiguous`
 - `m_grouped_fp8_gemm_nt_masked`
+- `k_grouped_fp8_gemm_tn_contiguous`
+- `k_grouped_bf16_gemm_tn_contiguous`
 - Legacy aliases: `fp8_m_grouped_gemm_nt_masked`, `bf16_m_grouped_gemm_nt_masked`
 
 Dense FP8 GEMM:
 
+- `fp8_fp4_gemm_nt`
 - `fp8_gemm_nt`
+- `fp8_gemm_nn`
+- `fp8_gemm_tn`
+- `fp8_gemm_tt`
 - `fp8_einsum`
+- `fp8_gemm_nt_skip_head_mid`
+
+Einsum:
+
+- `einsum`
 
 HyperConnection prenorm GEMM:
 
@@ -159,9 +187,24 @@ export MATE_DEEPGEMM_MK_ALIGNMENT=256
 ```
 
 Only `128` and `256` are supported. Use the returned value when padding each
-expert segment and building `m_indices` for
+expert segment and building `grouped_layout` for
 `m_grouped_{fp8,bf16}_gemm_nt_contiguous`. Set the environment variable before
 starting Python; the helper reads and caches the value on first use.
+
+The grouped wrapper uses the DeepGEMM 559d79f parameter names and order, while
+retaining MATE-only `alignment_m`, `backend`, and overlap parameters at the end
+of the signatures. PSUM and zero-padding layouts remain unsupported. The
+wrapper keeps runnable MATE defaults for unsupported capabilities.
+
+The grouped `m_grouped_fp8_fp4_*` entry points dispatch FP8-by-FP8 operands to
+the existing FP8 path. FP8 E4M3 A plus packed E2M1 FP4 B dispatches to MATE's
+native W4A8 backend. Native MATE scale tuples work with the wrapper defaults;
+DeepGEMM FP32 logical scales are adapted for `recipe_a=(1, 128)` and
+`recipe_b=(1, 32)` when `K=128`. Larger K is rejected because the current MATE
+W4A8 kernel has one A scale per row. The dense `fp8_fp4_gemm_nt` entry point
+still rejects packed FP4 operands.
+For K-grouped GEMM, `c=None` clears D, an independent C is copied to D, and
+`c is d` keeps in-place accumulation.
 
 ## Quick Start
 
@@ -189,4 +232,6 @@ python examples/run_deep_gemm.py
 
 - This wrapper preserves the DeepGEMM-style Python surface, but execution is provided by MATE on MUSA
 - `get_paged_mqa_logits_metadata(..., block_kv, ...)` currently requires `block_kv == 64`
+- `fp8_gemm_nt_skip_head_mid` writes the GEMM result into a full-width D tensor
+  according to `head_splits=(left, mid, right)` and leaves the middle portion of each head untouched
 - The example script currently demonstrates the FP8 grouped GEMM path

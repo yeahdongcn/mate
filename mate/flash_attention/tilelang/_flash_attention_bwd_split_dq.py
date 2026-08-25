@@ -221,6 +221,9 @@ def flashattn_bwd_ws_split_dq(
             T.assume(do_stride_h % 8 == 0)
             T.assume(dq_stride_s % 8 == 0)
             T.assume(dq_stride_h % 8 == 0)
+            if has_softcap:
+                softcap_scale = T.alloc_var(T.float32)
+                softcap_scale = smscale / softcap
             if not is_varlen:
                 T.assume(q_stride_b % 8 == 0)
                 T.assume(k_stride_b % 8 == 0)
@@ -322,8 +325,20 @@ def flashattn_bwd_ws_split_dq(
             causal_offset = local_seq_kv - local_seq_q
             kv_loop_start = begin_seq_kv
             kv_loop_end = end_seq_kv
-            if is_causal:
+            if has_window_left:
+                kv_local_start = T.alloc_var(T.int32)
+                kv_local_start = bx * block_M + causal_offset - window_size_left
+                kv_local_start = T.if_then_else(kv_local_start > 0, kv_local_start, 0)
+                kv_local_start = T.if_then_else(
+                    kv_local_start < local_seq_kv, kv_local_start, local_seq_kv
+                )
+                kv_loop_start = (
+                    begin_seq_kv + T.floordiv(kv_local_start, block_N) * block_N
+                )
+            if is_causal or has_window_right:
                 causal_kv_local_end = (bx + 1) * block_M + causal_offset
+                if has_window_right:
+                    causal_kv_local_end = causal_kv_local_end + window_size_right
                 causal_kv_local_end = T.if_then_else(
                     causal_kv_local_end > 0, causal_kv_local_end, 0
                 )
@@ -345,24 +360,24 @@ def flashattn_bwd_ws_split_dq(
                 phase_producer = 0
                 k0_reg_buffer = T.alloc_fragment([block_N, dim // 2], dtype)
                 k1_reg_buffer = T.alloc_fragment([block_N, dim // 2], dtype)
-                T.copy(
+                T.tma_copy(
                     q_block(Q, bz, block_q_start, begin_seq_q, by, 0),
                     Qa_shared_0,
                     barrier=bar_q_ready,
                 )
-                T.copy(
+                T.tma_copy(
                     q_block(Q, bz, block_q_start, begin_seq_q, by, dim // 2),
                     Qa_shared_1,
                     barrier=bar_q_ready,
                 )
                 T.barrier_arrive(bar_q_ready)
 
-                T.copy(
+                T.tma_copy(
                     q_block(dO, bz, block_q_start, begin_seq_q, by, 0),
                     dOa_shared_0,
                     barrier=bar_do_ready,
                 )
-                T.copy(
+                T.tma_copy(
                     q_block(dO, bz, block_q_start, begin_seq_q, by, dim // 2),
                     dOa_shared_1,
                     barrier=bar_do_ready,
@@ -372,7 +387,7 @@ def flashattn_bwd_ws_split_dq(
                 # preload K
                 T.barrier_wait(bar_kt0_free, 1)
                 _annotate_sqmma(Kt_shared_0, k_major=True)
-                T.copy(
+                T.tma_copy(
                     kv_block(K, bz, kv_loop_start, begin_seq_kv, kv_group, 0),
                     Kt_shared_0,
                     barrier=bar_kt0_ready,
@@ -381,7 +396,7 @@ def flashattn_bwd_ws_split_dq(
 
                 T.barrier_wait(bar_kt1_free, 1)
                 _annotate_sqmma(Kt_shared_1, k_major=True)
-                T.copy(
+                T.tma_copy(
                     kv_block(K, bz, kv_loop_start, begin_seq_kv, kv_group, dim // 2),
                     Kt_shared_1,
                     barrier=bar_kt1_ready,
@@ -397,7 +412,7 @@ def flashattn_bwd_ws_split_dq(
 
                 for kv_start in range(kv_loop_start, kv_loop_end, block_N):
                     _annotate_sqmma(Vt_shared_0, k_major=True)
-                    T.copy(
+                    T.tma_copy(
                         kv_block(V, bz, kv_start, begin_seq_kv, kv_group, 0),
                         Vt_shared_0,
                         barrier=bar_vt0_ready,
@@ -407,7 +422,7 @@ def flashattn_bwd_ws_split_dq(
 
                     T.barrier_wait(bar_vt1_free, phase_producer)
                     _annotate_sqmma(Vt_shared_1, k_major=True)
-                    T.copy(
+                    T.tma_copy(
                         kv_block(V, bz, kv_start, begin_seq_kv, kv_group, dim // 2),
                         Vt_shared_1,
                         barrier=bar_vt1_ready,
@@ -416,7 +431,7 @@ def flashattn_bwd_ws_split_dq(
 
                     T.barrier_wait(bar_kt0_free, phase_producer)
                     _annotate_sqmma(Kt_shared_0, k_major=True)
-                    T.copy(
+                    T.tma_copy(
                         kv_block(K, bz, kv_start + block_N, begin_seq_kv, kv_group, 0),
                         Kt_shared_0,
                         barrier=bar_kt0_ready,
@@ -425,7 +440,7 @@ def flashattn_bwd_ws_split_dq(
 
                     T.barrier_wait(bar_kt1_free, phase_producer)
                     _annotate_sqmma(Kt_shared_1, k_major=True)
-                    T.copy(
+                    T.tma_copy(
                         kv_block(
                             K, bz, kv_start + block_N, begin_seq_kv, kv_group, dim // 2
                         ),

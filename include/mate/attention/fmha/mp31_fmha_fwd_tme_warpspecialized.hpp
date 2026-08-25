@@ -674,6 +674,14 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static Params to_underlying_arguments(Arguments const& args) {
     // If IsPackGQA, reshape Q to be ((head_ratio, seqlen_q), head_size, num_head_kv, batch_size)
 
+    // cosize() evaluates size(shape) before applying strides, so promote shape leaves to avoid
+    // int32 overflow when the logical tensor contains more than INT32_MAX elements.
+    auto const cosize_64 = [](auto const& layout) -> uint64_t {
+      auto const shape_64 =
+          transform_leaf(layout.shape(), [](auto const& extent) { return static_cast<int64_t>(extent); });
+      return static_cast<uint64_t>(cosize(make_layout(shape_64, layout.stride())));
+    };
+
     int const  qhead_per_k_head = !IsPackGQA ? 1 : HeadRatio;
     auto const shape_Q_packed_  = make_shape(make_shape(qhead_per_k_head, get<0>(args.shape_Q)),
                                             get<1>(args.shape_Q),
@@ -704,10 +712,11 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     TME_Qv tme_load_Qv =
         make_tme_copy<TmeQvInnerHint, TmeQvOuterHint>(MP31_TME_LOAD{}, mQv, SmemLayoutTMELoadQv{}, TileShapeQv{});
 
-    int const cosize_q  = get<0>(args.shape_Q) == 0 ? 0 : cosize(make_layout(shape_Q_packed, stride_Q_packed));
-    auto      desc_Q    = make_robust_desc(args.ptr_Q, cosize_q);
-    int const cosize_qv = get<0>(args.shape_Qv) == 0 ? 0 : cosize(make_layout(shape_Qv_packed, stride_Qv_packed));
-    auto      desc_Qv   = make_robust_desc(args.ptr_Qv, cosize_qv);
+    uint64_t const cosize_q = get<0>(args.shape_Q) == 0 ? 0 : cosize_64(make_layout(shape_Q_packed, stride_Q_packed));
+    auto           desc_Q   = make_robust_desc(args.ptr_Q, cosize_q);
+    uint64_t const cosize_qv =
+        get<0>(args.shape_Qv) == 0 ? 0 : cosize_64(make_layout(shape_Qv_packed, stride_Qv_packed));
+    auto desc_Qv = make_robust_desc(args.ptr_Qv, cosize_qv);
 
     // print("TME_Q:");
     // print(tme_load_Q);
@@ -716,7 +725,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     Tensor         mK               = make_tensor(make_gmem_ptr(args.ptr_K), args.shape_K, args.stride_K);
     TME_K          tme_load_K       = TmeLoadKeyBuilder::make_tme_copy(mK);
     PermutedShapeK permuted_shape_K = TmeLoadKeyBuilder::get_permuted_shape(mK);
-    int const      cosize_k         = get<0>(args.shape_K) == 0 ? 0 : cosize(make_layout(args.shape_K, args.stride_K));
+    uint64_t const cosize_k = get<0>(args.shape_K) == 0 ? 0 : cosize_64(make_layout(args.shape_K, args.stride_K));
 
     RobustDescriptor desc_K = make_robust_desc(args.ptr_K, cosize_k);
 
@@ -739,7 +748,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     // Used for permute tme load
     PermutedShapeV permuted_shape_V = TmeLoadVBuilder::get_permuted_shape(mV);
-    int const      cosize_v         = get<0>(shape_V_gmem) == 0 ? 0 : cosize(make_layout(shape_V_gmem, args.stride_V));
+    uint64_t const cosize_v = get<0>(shape_V_gmem) == 0 ? 0 : cosize_64(make_layout(shape_V_gmem, args.stride_V));
 
     RobustDescriptor desc_V = make_robust_desc(args.ptr_V, cosize_v);
 
@@ -751,8 +760,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     Tensor   mKnew          = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
     TME_KNew tme_load_K_new = make_tme_copy<TmeKNewInnerHint, TmeKNewOuterHint>(
         MP31_TME_LOAD{}, conditional_return<IsAppendKV>(mKnew, mK), take<0, 2>(SmemLayoutK{}));
-    int const cosize_k_new =
-        get<0>(args.shape_K_new) == 0 ? 0 : cosize(make_layout(args.shape_K_new, args.stride_K_new));
+    uint64_t const cosize_k_new =
+        get<0>(args.shape_K_new) == 0 ? 0 : cosize_64(make_layout(args.shape_K_new, args.stride_K_new));
 
     RobustDescriptor desc_K_new = make_robust_desc(args.ptr_K_new, cosize_k_new);
 
@@ -764,16 +773,16 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         select<1, 0, 2, 3>(args.stride_V_new));
     TME_VNew tme_load_V_new = make_tme_copy<TmeVInnerHint, TmeVOuterHint>(
         MP31_TME_LOAD{}, conditional_return<IsAppendKV>(mVnew, mV_store), take<0, 2>(SmemLayoutVMmaPV{}));
-    int const cosize_v_new = get<0>(args.shape_K_new) == 0 ? 0 : cosize(mVnew.layout());
+    uint64_t const cosize_v_new = get<0>(args.shape_K_new) == 0 ? 0 : cosize_64(mVnew.layout());
 
     RobustDescriptor desc_V_new = make_robust_desc(args.ptr_V_new, cosize_v_new);
 
     RobustDescriptor desc_Cos = make_robust_desc(
         args.ptr_rotary_cos,
-        get<0>(args.shape_rotary) == 0 ? 0 : cosize(make_layout(args.shape_rotary, args.stride_rotary_cos)));
+        get<0>(args.shape_rotary) == 0 ? 0 : cosize_64(make_layout(args.shape_rotary, args.stride_rotary_cos)));
     RobustDescriptor desc_Sin = make_robust_desc(
         args.ptr_rotary_sin,
-        get<0>(args.shape_rotary) == 0 ? 0 : cosize(make_layout(args.shape_rotary, args.stride_rotary_sin)));
+        get<0>(args.shape_rotary) == 0 ? 0 : cosize_64(make_layout(args.shape_rotary, args.stride_rotary_sin)));
 
     // Qv
 
@@ -784,7 +793,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     mutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
     attention_chunk_divmod.divisor = args.attention_chunk;
 
-    RobustDescriptor desc_page_table = make_robust_desc(args.ptr_pagetable, cosize(make_layout(args.shape_pagetable)));
+    RobustDescriptor desc_page_table =
+        make_robust_desc(args.ptr_pagetable, cosize_64(make_layout(args.shape_pagetable)));
 
     // SHOW(shape_Q_packed);
     // SHOW(stride_Q_packed);
@@ -1077,9 +1087,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       if constexpr (IsPagedKV) {
         if constexpr (UseLSULoadV) {
           if constexpr (HasQv) {
-            paged_kv_manager.template load_V(n_block, sV(_, _, smem_pipe_write.index()));
+            paged_kv_manager.load_V(n_block, sV(_, _, smem_pipe_write.index()));
           } else {
-            paged_kv_manager.template load_V(n_block, sV_lsu(_, _, smem_pipe_write.index()));
+            paged_kv_manager.load_V(n_block, sV_lsu(_, _, smem_pipe_write.index()));
           }
           mute::ldgsts_wait();
           pipeline_v.producer_commit(smem_pipe_write);

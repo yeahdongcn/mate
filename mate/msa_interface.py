@@ -6,8 +6,7 @@ from typing import Literal, Optional, Union
 import torch
 
 from mate.api_logging import mate_api
-from mate.jit.msa_fwd import _msa_fwd
-from mate.jit.msa_ops import _msa_maxscore, _msa_sparse_topk_select
+from mate.jit.msa_ops import _msa_fwd, _msa_maxscore, _msa_sparse_topk_select
 
 __all__ = [
     "MsaDecodePlan",
@@ -132,6 +131,17 @@ def _ensure_int32_vector(name: str, tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to(dtype=torch.int32)
 
 
+def _cpu_int_values(name: str, tensor: torch.Tensor) -> list[int]:
+    """Return eager planning metadata without synchronizing an accelerator."""
+
+    if tensor.device.type != "cpu":
+        raise ValueError(
+            f"{name} must be a CPU tensor for eager MSA planning; use msa_plan "
+            "with device-resident MsaRuntimeMetadata for capture or hot-path execution"
+        )
+    return [int(value) for value in tensor.tolist()]
+
+
 def _make_cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
     lengths = _ensure_int32_vector("lengths", lengths)
     cu_seqlens = torch.zeros(
@@ -221,22 +231,23 @@ def _build_page_table_from_flat_kv_indices(
     if page_size <= 0:
         raise ValueError(f"page_size must be positive, got {page_size}")
     kv_indices = _ensure_int32_vector("kv_indices", kv_indices)
-    kv_lens = _ensure_int32_vector("kv_lens", kv_lens).to(device=kv_indices.device)
-    page_counts = _page_counts(kv_lens, page_size)
-    total_pages = int(page_counts.sum().item())
+    kv_lens = _ensure_int32_vector("kv_lens", kv_lens)
+    kv_lengths = _cpu_int_values("kv_lens", kv_lens)
+    page_counts = [_ceil_div(length, page_size) for length in kv_lengths]
+    total_pages = sum(page_counts)
     if kv_indices.numel() != total_pages:
         raise ValueError(
             "kv_indices does not match the page count implied by kv_lens: "
             f"{kv_indices.numel()} vs {total_pages}"
         )
-    max_pages = int(page_counts.max().item()) if page_counts.numel() > 0 else 0
+    max_pages = max(page_counts, default=0)
     page_table = torch.zeros(
         (kv_lens.numel(), max_pages),
         dtype=torch.int32,
         device=kv_indices.device,
     )
     start = 0
-    for batch_idx, count in enumerate(page_counts.tolist()):
+    for batch_idx, count in enumerate(page_counts):
         end = start + count
         if count > 0:
             page_table[batch_idx, :count] = kv_indices[start:end]
@@ -530,16 +541,14 @@ def _build_single_plan(
     sparse_kernel_mode: str,
     use_fp8_kvcache: bool,
 ) -> MsaPlan:
+    qo_lengths = _cpu_int_values("qo_segment_lens", qo_segment_lens)
+    kv_lengths = _cpu_int_values("kv_segment_lens", kv_segment_lens)
     prefill_plan = MsaPrefillPlan(
         cu_seqlens_q=_make_cu_seqlens(qo_segment_lens),
         cu_seqlens_k=_make_cu_seqlens(kv_segment_lens),
-        total_seqlen_k=int(kv_segment_lens.sum().item()),
-        max_seqlen_q=int(qo_segment_lens.max().item())
-        if qo_segment_lens.numel()
-        else 0,
-        max_seqlen_k=int(kv_segment_lens.max().item())
-        if kv_segment_lens.numel()
-        else 0,
+        total_seqlen_k=sum(kv_lengths),
+        max_seqlen_q=max(qo_lengths, default=0),
+        max_seqlen_k=max(kv_lengths, default=0),
     )
     mode = _resolve_plan_mode(
         max_qo_len=prefill_plan.max_seqlen_q,
@@ -807,10 +816,10 @@ def _split_qkv_for_mixed_plan(
     torch.Tensor,
     Optional[torch.Tensor],
 ]:
-    q_split = int(split_plan.qo_lens.sum().item())
+    q_split = sum(_cpu_int_values("plan.qo_lens", split_plan.qo_lens))
     q0, q1 = q[:q_split], q[q_split:]
     if kv_indices is None:
-        kv_split = int(split_plan.kv_lens.sum().item())
+        kv_split = sum(_cpu_int_values("plan.kv_lens", split_plan.kv_lens))
         return (
             q0,
             k[:kv_split],
@@ -822,8 +831,9 @@ def _split_qkv_for_mixed_plan(
             None,
         )
 
-    page_split = int(
-        _page_counts(split_plan.kv_lens, split_plan.page_size).sum().item()
+    page_split = sum(
+        _ceil_div(length, split_plan.page_size)
+        for length in _cpu_int_values("plan.kv_lens", split_plan.kv_lens)
     )
     return (
         q0,
@@ -862,6 +872,8 @@ def _decode_cu_seqlens_q(
     q: torch.Tensor,
     qo_lens: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    *,
+    max_seqlen_q: int,
 ) -> Optional[torch.Tensor]:
     if q.ndim == 3:
         return cu_seqlens_q if cu_seqlens_q is not None else _make_cu_seqlens(qo_lens)
@@ -869,10 +881,8 @@ def _decode_cu_seqlens_q(
         batch, seqlen_q, _, _ = q.shape
         if batch != int(qo_lens.numel()):
             raise ValueError(f"q batch mismatch: {batch} vs {int(qo_lens.numel())}")
-        if seqlen_q != int(qo_lens.max().item()):
-            raise ValueError(
-                f"q seqlen mismatch: {seqlen_q} vs {int(qo_lens.max().item())}"
-            )
+        if seqlen_q != int(max_seqlen_q):
+            raise ValueError(f"q seqlen mismatch: {seqlen_q} vs {int(max_seqlen_q)}")
         return None
     raise ValueError(f"q must be rank-3 or rank-4, got shape {tuple(q.shape)}")
 
@@ -964,7 +974,12 @@ def _run_sparse_fwd_kernel(
         num_qo_heads=plan.num_qo_heads,
         qhead_per_kv=qhead_per_kv,
     )
-    cu_seqlens_q = _decode_cu_seqlens_q(q, qo_lens, cu_seqlens_q)
+    cu_seqlens_q = _decode_cu_seqlens_q(
+        q,
+        qo_lens,
+        cu_seqlens_q,
+        max_seqlen_q=plan.prefill_plan.max_seqlen_q,
+    )
     max_seqlen_k = plan.prefill_plan.max_seqlen_k
     out_tensor, lse = _msa_fwd(
         q,
@@ -994,16 +1009,17 @@ def _materialize_decode_metadata(
     plan: MsaPlan,
     q: torch.Tensor,
     v: torch.Tensor,
+    *,
+    qo_lens: torch.Tensor,
+    kv_lens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
 ) -> MsaDecodePlan:
     if plan.decode_plan is None:
         raise ValueError(f"plan mode {plan.mode!r} does not define decode metadata")
+    plan.decode_plan.cache_seqlens = kv_lens
     if plan.decode_plan.scheduler_metadata is None:
         from mate.mha_interface import get_scheduler_metadata
 
-        device = q.device
-        qo_lens = _to_plan_device(plan.qo_lens, device)
-        kv_lens = _to_plan_device(plan.kv_lens, device)
-        plan.decode_plan.cache_seqlens = kv_lens
         plan.decode_plan.scheduler_metadata = get_scheduler_metadata(
             batch_size=plan.batch_size,
             max_seqlen_q=plan.prefill_plan.max_seqlen_q,
@@ -1014,7 +1030,7 @@ def _materialize_decode_metadata(
             headdim_v=v.shape[-1],
             seqused_q=qo_lens,
             seqused_k=kv_lens,
-            cu_seqlens_q=_make_cu_seqlens(qo_lens),
+            cu_seqlens_q=cu_seqlens_q,
             page_size=plan.page_size,
             num_splits=plan.num_kv_splits if plan.num_kv_splits > 0 else 0,
             causal=plan.causal,
@@ -1099,12 +1115,25 @@ def _run_single_plan(
                 raise ValueError(
                     "paged MSA execution requires kv_indices or page_table"
                 )
+            if plan.is_static or runtime_metadata is not None:
+                raise ValueError(
+                    "static/runtime-metadata paged MSA requires a preallocated "
+                    "page_table; building one from live device lengths is not "
+                    "capture-safe"
+                )
             page_table = _build_page_table_from_flat_kv_indices(
                 kv_indices.to(device=q.device, dtype=torch.int32, non_blocking=True),
-                kv_lens,
+                plan.kv_lens,
                 plan.page_size,
             )
-        decode_plan = _materialize_decode_metadata(plan, q, v)
+        decode_plan = _materialize_decode_metadata(
+            plan,
+            q,
+            v,
+            qo_lens=qo_lens,
+            kv_lens=kv_lens,
+            cu_seqlens_q=cu_seqlens_q,
+        )
         k_cache = _to_mate_paged_kv_layout(
             k,
             num_kv_heads=plan.num_kv_heads,
@@ -1296,10 +1325,17 @@ def _msa_plan_from_lengths(
     split_prefill_decode: bool = True,
     **kwargs,
 ) -> MsaPlanInfo:
-    """Build an eager execution plan from concrete sequence lengths."""
+    """Build an eager plan from CPU sequence lengths.
+
+    Accelerator-resident lengths are intentionally rejected: deriving Python
+    launch metadata from them would introduce a device-to-host synchronization.
+    Hot paths must use :func:`msa_plan` and :class:`MsaRuntimeMetadata`.
+    """
 
     qo_segment_lens = _ensure_int32_vector("qo_segment_lens", qo_segment_lens)
     kv_segment_lens = _ensure_int32_vector("kv_segment_lens", kv_segment_lens)
+    qo_lengths = _cpu_int_values("qo_segment_lens", qo_segment_lens)
+    _cpu_int_values("kv_segment_lens", kv_segment_lens)
     if qo_segment_lens.shape != kv_segment_lens.shape:
         raise ValueError(
             "qo_segment_lens and kv_segment_lens must have the same shape, got "
@@ -1358,6 +1394,7 @@ def _msa_plan_from_lengths(
         kv_segment_lens=kv_segment_lens,
         qo_offset=qo_offset,
     )
+    _cpu_int_values("qo_offset", qo_offset_tensor)
 
     batch_size = int(qo_segment_lens.numel())
     split = 0
@@ -1375,15 +1412,12 @@ def _msa_plan_from_lengths(
             "forced sparse blocks require kv_block_num to select sparse execution"
         )
     split_threshold = _prefill_qlen_threshold(sparse)
-    if (
-        split_prefill_decode
-        and qo_segment_lens.numel() > 0
-        and int(qo_segment_lens.max().item()) > split_threshold
-    ):
-        split_candidates = (qo_segment_lens > split_threshold).nonzero(as_tuple=False)
-        if split_candidates.numel() > 0:
-            split = int(split_candidates[0, 0].item())
-            has_mixed_prefill = split > 0
+    if split_prefill_decode and qo_lengths and max(qo_lengths) > split_threshold:
+        split = next(
+            (idx for idx, length in enumerate(qo_lengths) if length > split_threshold),
+            0,
+        )
+        has_mixed_prefill = split > 0
 
     if has_mixed_prefill:
         decode_plan = _build_single_plan(

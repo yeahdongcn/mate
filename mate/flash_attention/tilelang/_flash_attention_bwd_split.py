@@ -403,6 +403,9 @@ def flashattn_bwd_ws_split(
             T.assume(dk_stride_h % 8 == 0)
             T.assume(dv_stride_s % 8 == 0)
             T.assume(dv_stride_h % 8 == 0)
+            if has_softcap:
+                softcap_scale = T.alloc_var(T.float32)
+                softcap_scale = smscale / softcap
             if not is_varlen:
                 T.assume(q_stride_b % 8 == 0)
                 T.assume(k_stride_b % 8 == 0)
@@ -519,18 +522,36 @@ def flashattn_bwd_ws_split(
                 local_seq_q = end_seq_q - begin_seq_q
                 local_seq_kv = end_seq_kv - begin_seq_kv
                 causal_offset = local_seq_kv - local_seq_q
+                q_loop_start = T.alloc_var(T.int32)
+                q_loop_end = T.alloc_var(T.int32)
+                q_loop_start = begin_seq_q
+                q_loop_end = end_seq_q
+                if is_causal or has_window_right:
+                    q_local_start = T.alloc_var(T.int32)
+                    q_local_start = block_kv_start - causal_offset
+                    if has_window_right:
+                        q_local_start = q_local_start - window_size_right
+                    q_local_start = T.if_then_else(q_local_start > 0, q_local_start, 0)
+                    q_local_start = T.if_then_else(
+                        q_local_start < local_seq_q, q_local_start, local_seq_q
+                    )
+                    q_loop_start = (
+                        begin_seq_q + T.floordiv(q_local_start, block_M) * block_M
+                    )
+                if has_window_left:
+                    q_local_end = T.alloc_var(T.int32)
+                    q_local_end = block_kv_end - causal_offset + window_size_left
+                    q_local_end = T.if_then_else(q_local_end > 0, q_local_end, 0)
+                    q_local_end = T.if_then_else(
+                        q_local_end < local_seq_q, q_local_end, local_seq_q
+                    )
+                    q_loop_end = begin_seq_q + T.ceildiv(q_local_end, block_M) * block_M
+                    q_loop_end = T.if_then_else(
+                        q_loop_end < end_seq_q, q_loop_end, end_seq_q
+                    )
             if is_causal:
-                causal_q_local_start = T.alloc_var(T.int32)
                 causal_q_local_mask_end = T.alloc_var(T.int32)
-                causal_q_start = T.alloc_var(T.int32)
                 causal_q_mask_end = T.alloc_var(T.int32)
-                causal_q_local_start = block_kv_start - causal_offset
-                causal_q_local_start = T.if_then_else(
-                    causal_q_local_start > 0, causal_q_local_start, 0
-                )
-                causal_q_start = (
-                    begin_seq_q + T.floordiv(causal_q_local_start, block_M) * block_M
-                )
                 causal_q_local_mask_end = block_kv_end - causal_offset
                 causal_q_local_mask_end = T.if_then_else(
                     causal_q_local_mask_end > 0, causal_q_local_mask_end, 0
@@ -548,7 +569,7 @@ def flashattn_bwd_ws_split(
                     # tme load k
                     phase_producer = T.alloc_var(T.int32)
                     phase_producer = 0
-                    T.copy(
+                    T.tma_copy(
                         kv_block(
                             K,
                             bz,
@@ -560,7 +581,7 @@ def flashattn_bwd_ws_split(
                         K_shared_0,
                         barrier=bar_k,
                     )
-                    T.copy(
+                    T.tma_copy(
                         kv_block(
                             K,
                             bz,
@@ -635,11 +656,17 @@ def flashattn_bwd_ws_split(
                     T.barrier_arrive(bar_kt)
                     T.barrier_arrive(bar_vt)
                     for q_start in range(
-                        causal_q_start if is_causal else begin_seq_q, end_seq_q, block_M
+                        q_loop_start
+                        if is_causal or has_window_left or has_window_right
+                        else begin_seq_q,
+                        q_loop_end
+                        if is_causal or has_window_left or has_window_right
+                        else end_seq_q,
+                        block_M,
                     ):
                         T.barrier_wait(bar_qa0_free, phase_producer ^ 1)
                         _annotate_sqmma(Qa_shared_0, k_major=True)
-                        T.copy(
+                        T.tma_copy(
                             q_block(Q, bz, q_start, begin_seq_q, by, 0),
                             Qa_shared_0,
                             barrier=bar_qa0_ready,
@@ -648,7 +675,7 @@ def flashattn_bwd_ws_split(
 
                         T.barrier_wait(bar_qa1_free, phase_producer ^ 1)
                         _annotate_sqmma(Qa_shared_1, k_major=True)
-                        T.copy(
+                        T.tma_copy(
                             q_block(Q, bz, q_start, begin_seq_q, by, dim // 2),
                             Qa_shared_1,
                             barrier=bar_qa1_ready,
@@ -657,7 +684,7 @@ def flashattn_bwd_ws_split(
 
                         T.barrier_wait(bar_doa0_free, phase_producer ^ 1)
                         _annotate_sqmma(dOa_shared_0, k_major=True)
-                        T.copy(
+                        T.tma_copy(
                             q_block(dO, bz, q_start, begin_seq_q, by, 0),
                             dOa_shared_0,
                             barrier=bar_doa0_ready,
@@ -666,7 +693,7 @@ def flashattn_bwd_ws_split(
 
                         T.barrier_wait(bar_doa1_free, phase_producer ^ 1)
                         _annotate_sqmma(dOa_shared_1, k_major=True)
-                        T.copy(
+                        T.tma_copy(
                             q_block(dO, bz, q_start, begin_seq_q, by, dim // 2),
                             dOa_shared_1,
                             barrier=bar_doa1_ready,
@@ -677,7 +704,7 @@ def flashattn_bwd_ws_split(
                         _annotate_sqmma(
                             dOb_shared_0, k_major=False, continuity=dim // 4
                         )
-                        T.copy(
+                        T.tma_copy(
                             q_block(dO, bz, q_start, begin_seq_q, by, 0),
                             dOb_shared_0,
                             barrier=bar_dob0_ready,
@@ -688,7 +715,7 @@ def flashattn_bwd_ws_split(
                         _annotate_sqmma(
                             dOb_shared_1, k_major=False, continuity=dim // 4
                         )
-                        T.copy(
+                        T.tma_copy(
                             q_block(dO, bz, q_start, begin_seq_q, by, dim // 2),
                             dOb_shared_1,
                             barrier=bar_dob1_ready,
@@ -697,7 +724,7 @@ def flashattn_bwd_ws_split(
 
                         T.barrier_wait(bar_qb0_free, phase_producer)
                         _annotate_sqmma(Qb_shared_0, k_major=False, continuity=dim // 4)
-                        T.copy(
+                        T.tma_copy(
                             q_block(Q, bz, q_start, begin_seq_q, by, 0),
                             Qb_shared_0,
                             barrier=bar_qb0_ready,
@@ -706,7 +733,7 @@ def flashattn_bwd_ws_split(
 
                         T.barrier_wait(bar_qb1_free, phase_producer)
                         _annotate_sqmma(Qb_shared_1, k_major=False, continuity=dim // 4)
-                        T.copy(
+                        T.tma_copy(
                             q_block(Q, bz, q_start, begin_seq_q, by, dim // 2),
                             Qb_shared_1,
                             barrier=bar_qb1_ready,
@@ -729,8 +756,15 @@ def flashattn_bwd_ws_split(
                         dv_cast = T.alloc_fragment([block_N, dim // 2], dtype)
                     T.fill(dv_accum_0, 0.0)
                     T.fill(dv_accum_1, 0.0)
-                    dq_loop_start = causal_q_start if is_causal else begin_seq_q
-                    for q_start in range(dq_loop_start, end_seq_q, block_M):
+                    for q_start in range(
+                        q_loop_start
+                        if is_causal or has_window_left or has_window_right
+                        else begin_seq_q,
+                        q_loop_end
+                        if is_causal or has_window_left or has_window_right
+                        else end_seq_q,
+                        block_M,
+                    ):
                         # is_last_q_tile = (q_start+block_M) >= end_seq_q
                         T.barrier_wait(bar_p_ready, phase_consumer1)
                         T.barrier_wait(bar_dob0_ready, phase_consumer1)
@@ -881,7 +915,13 @@ def flashattn_bwd_ws_split(
                     dk_cast_0 = T.alloc_fragment([block_N, dim // 2], dtype)
                     dk_cast_1 = T.alloc_fragment([block_N, dim // 2], dtype)
                     for q_start in range(
-                        causal_q_start if is_causal else begin_seq_q, end_seq_q, block_M
+                        q_loop_start
+                        if is_causal or has_window_left or has_window_right
+                        else begin_seq_q,
+                        q_loop_end
+                        if is_causal or has_window_left or has_window_right
+                        else end_seq_q,
+                        block_M,
                     ):
                         # is_last_q_tile = (q_start+block_M) >= end_seq_q
                         T.barrier_wait(bar_qa0_ready, phase_consumer0)

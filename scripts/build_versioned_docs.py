@@ -16,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSIONS_PATH = ROOT / "docs" / "versions.json"
+VERSION_OVERLAYS_DIR = ROOT / "docs" / "version_overlays"
 OVERLAY_FILES = [
     Path("docs/source/conf.py"),
     Path("docs/source/_static/custom.css"),
@@ -105,6 +106,24 @@ def apply_current_ui_overlay(destination: Path) -> None:
         shutil.copy2(source_path, target_path)
 
 
+def apply_version_overlay(version: str, destination: Path) -> None:
+    patch_path = VERSION_OVERLAYS_DIR / f"{version}.patch"
+    if not patch_path.is_file():
+        return
+
+    print(f"Applying documentation overlay for {version}", flush=True)
+    subprocess.run(
+        ["git", "apply", "--check", "--unidiff-zero", str(patch_path)],
+        cwd=destination,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "apply", "--unidiff-zero", str(patch_path)],
+        cwd=destination,
+        check=True,
+    )
+
+
 def build_docs(
     source_root: Path,
     output_dir: Path,
@@ -175,6 +194,7 @@ def main() -> int:
             if build.ref:
                 source_root = temp_root / build.version
                 export_ref(build.ref, source_root)
+                apply_version_overlay(build.version, source_root)
                 if build.overlay_current_ui:
                     apply_current_ui_overlay(source_root)
             else:

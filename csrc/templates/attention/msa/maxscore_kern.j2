@@ -17,8 +17,6 @@ static constexpr int  kHeadDim   = {{ head_dim }};
 static constexpr int  kHeadRatio = {{ head_ratio }};
 static constexpr int  kTileQ     = {{ tile_q }};
 static constexpr int  kTileKV    = 128;
-static constexpr int  kQStages   = {{ q_stages }};
-static constexpr int  kKStages   = {{ k_stages }};
 static constexpr bool kParallelKTiles = {{ "true" if parallel_k_tiles else "false" }};
 
 namespace msa = mate::attention::msa;
@@ -27,11 +25,9 @@ using TileShape = mute::Shape<mute::Int<kTileQ>, mute::Int<kTileKV>, mute::Int<k
 using Builder   = msa::MsaMaxScoreBuilder<Element,
                                           TileShape,
                                           kHeadRatio,
-                                          kQStages,
-                                          kKStages,
-                                          kParallelKTiles,
                                           msa::IsPagedKV<std::integral_constant<bool, kIsPagedKV>>,
-                                          msa::IsCausal<std::integral_constant<bool, kIsCausal>>>;
+                                          msa::IsCausal<std::integral_constant<bool, kIsCausal>>,
+                                          msa::ParallelKTiles<std::integral_constant<bool, kParallelKTiles>>>;
 using Kernel    = typename Builder::Kernel;
 
 }  // namespace

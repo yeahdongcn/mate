@@ -29,3 +29,6 @@ mate/jit/aot-levels.json
 aot-ops/
 temp/
 *.so
+
+# Per-developer Docker Compose settings
+/compose.local.yaml

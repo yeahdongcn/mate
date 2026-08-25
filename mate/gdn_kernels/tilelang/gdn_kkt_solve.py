@@ -111,7 +111,7 @@ def tilelang_kkt_solve(
         diag_input_is_ready = T.alloc_barrier(arrive_count=128)
         diag_inverse_is_ready = T.alloc_barrier(arrive_count=128)
         tx = T.get_thread_binding()
-        T.copy(
+        T.tma_copy(
             k[data_batch_idx, left:right, bhg, 0:DK],
             k_shared,
             barrier=k_load_is_ready,

@@ -327,10 +327,12 @@ def check_is_allclose(
             return False
         return True
 
-    anomalies_check_passed = True
-    anomalies_check_passed &= deal_with_anomalies(float("inf"))
-    anomalies_check_passed &= deal_with_anomalies(float("-inf"))
-    anomalies_check_passed &= deal_with_anomalies(float("nan"))
+    anomaly_checks = [
+        deal_with_anomalies(float("inf")),
+        deal_with_anomalies(float("-inf")),
+        deal_with_anomalies(float("nan")),
+    ]
+    anomalies_check_passed = all(anomaly_checks)
 
     cos_diff = get_cos_diff(ans, ref)
     raw_abs_err = torch.abs(ans - ref)
@@ -452,7 +454,7 @@ def _ref_sparse_mla_prefill_v3_features(
     valid_mask = (indices >= 0) & (indices < sk)
     if topk_length is not None:
         pos = torch.arange(indices.shape[-1], device=indices.device).view(1, 1, -1)
-        valid_mask &= pos < topk_length.view(sq, 1, 1)
+        valid_mask = valid_mask & (pos < topk_length.view(sq, 1, 1))
 
     safe_indices = torch.where(valid_mask, indices, indices.new_zeros(()))
     kv_by_group = kv.permute(1, 0, 2).contiguous()

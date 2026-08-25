@@ -18,7 +18,7 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-    "apache-tvm-ffi==0.1.9.post3",
+    "apache-tvm-ffi>=0.1.11,<0.1.12.dev2",
     "torch>=2.7.0",
     "click>=8.0.0",
     "jinja2",
@@ -81,14 +81,14 @@ exclude=["mate-mubin*"]
 # Full functionality including safetensors support and TileLang-backed ops
 all = [
     "safetensors>=0.4.0",
-    "tilelang-musa==0.1.8",
+    "tilelang-musa==0.1.12",
 ]
 
 # CLI extension for full replay support (safetensors enables tensor dump/replay)
 cli = ["safetensors>=0.4.0"]
 
 # TileLang-backed operators such as FlashMLA / GDN
-tilelang = ["tilelang-musa==0.1.8"]
+tilelang = ["tilelang-musa==0.1.12"]
 
 # Testing dependencies
 testing = [
@@ -110,7 +110,7 @@ dev = [
     "numpy",
     "safetensors>=0.4.0",
     "pytest>=7.0.0",
-    "tilelang-musa==0.1.8",
+    "tilelang-musa==0.1.12",
     "triton",
 ]
 

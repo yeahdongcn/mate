@@ -4,7 +4,6 @@ from typing import Any
 import torch
 import tilelang
 from tilelang import language as T
-from tvm import tir
 import math
 
 from ...utils import cosize
@@ -34,10 +33,8 @@ def sparse_attention_fwd_kernel(
     num_heads,
     dim,
     tail_dim,
-    topk,
     *,
     kv_group=1,
-    sm_scale=None,
     block_h=64,
     block_i=64,
     threads=640,
@@ -53,14 +50,7 @@ def sparse_attention_fwd_kernel(
     assert tail_dim == tilelang.math.next_power_of_2(tail_dim), (
         f"haven't check padding correctness yet, dim={tail_dim}"
     )
-    assert topk % block_i == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
-    if sm_scale is None:
-        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
-    else:
-        sm_scale = sm_scale * 1.44269504  # log2(e)
-
+    topk = T.dynamic("topk")
     batch = T.dynamic("batch")
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
@@ -100,10 +90,10 @@ def sparse_attention_fwd_kernel(
     indices_strides = (indices_stride_b, indices_stride_s, indices_stride_g, 1)
     if use_int64_cosize:
         q_cosize = cosize(
-            q_shape, tuple(tir.Cast("int64", stride) for stride in q_strides)
+            q_shape, tuple(T.cast(stride, "int64") for stride in q_strides)
         )
         kv_cosize = cosize(
-            kv_shape, tuple(tir.Cast("int64", stride) for stride in kv_strides)
+            kv_shape, tuple(T.cast(stride, "int64") for stride in kv_strides)
         )
     else:
         q_cosize = cosize(q_shape, q_strides)
@@ -135,14 +125,12 @@ def sparse_attention_fwd_kernel(
         block_i=block_i,
         out_width=dim_qk // 4,
         accum_dtype=accum_dtype,
-        sm_scale=sm_scale,
     )
     finalize_left = make_scheduled_decode_finalize_left(
         h_per_block=heads_per_block,
         out_width=dim_qk // 4,
         num_heads=num_heads,
         accum_dtype=accum_dtype,
-        sm_scale=sm_scale,
         has_attn_sink=has_attn_sink,
         use_strict_valid=False,
         add_denominator_epsilon=True,
@@ -186,6 +174,7 @@ def sparse_attention_fwd_kernel(
         output_partial,
         output,
         lse,
+        sm_scale,
     ):
         with T.Kernel(
             seq_len * head_repeats, kv_group, num_mp_parts, threads=threads
@@ -273,7 +262,7 @@ def sparse_attention_fwd_kernel(
             h1 = h0 + heads_per_block
             tid = T.get_thread_binding()
             for b_i in range(begin_idx, end_idx + 1, 1):
-                tir.call_extern("void", "__musa_loop_transparent_outermost")
+                T.call_extern("void", "__musa_loop_transparent_outermost")
                 start_block_idx = T.alloc_var(T.int32)
                 end_block_idx = T.alloc_var(T.int32)
                 n_split_idx = T.alloc_var(T.int32)
@@ -294,17 +283,17 @@ def sparse_attention_fwd_kernel(
                 is_unsplit = (num_splits[b_i + 1] - num_splits[b_i]) == 1
                 if tid < 512:
                     # T.barrier_wait(bar_q_free, (b_i - begin_idx+1) & 1)
-                    T.copy(
+                    T.tma_copy(
                         q[b_i, s_i, h0:h1, 0 : dim_qk // 2],
                         q_shared_l,
                         barrier=bar_q,
                     )
-                    T.copy(
+                    T.tma_copy(
                         q[b_i, s_i, h0:h1, dim_qk // 2 : dim_qk],
                         q_shared_r,
                         barrier=bar_q,
                     )
-                    T.copy(
+                    T.tma_copy(
                         q[b_i, s_i, h0:h1, dim_qk:],
                         q_tail_shared,
                         barrier=bar_q,
@@ -504,6 +493,7 @@ def sparse_attention_fwd_kernel(
                             alpha_shared,
                             acc_o_l_0,
                             acc_o_l_1,
+                            sm_scale,
                         )
 
                         T.lma_wait()
@@ -567,6 +557,7 @@ def sparse_attention_fwd_kernel(
                         num_splits,
                         attn_sink,
                         bar_final,
+                        sm_scale,
                     )
                 elif tid >= 256 and tid < 512:
                     acc_o_r_0 = T.alloc_fragment(
@@ -899,7 +890,7 @@ def sparse_attention_fwd_kernel(
         accum_dtype=accum_dtype,
         max_nums_splits=max_nums_splits,
         has_attn_sink=has_attn_sink,
-        max_lse_init=-(2**30) * sm_scale,
+        max_lse_init=-(2**30),
     )
 
     @T.macro
@@ -917,6 +908,7 @@ def sparse_attention_fwd_kernel(
         output_partial,
         output,
         lse,
+        sm_scale,
     ):
         dsa_decode_split(
             q,
@@ -932,9 +924,18 @@ def sparse_attention_fwd_kernel(
             output_partial,
             output,
             lse,
+            sm_scale,
         )
         if support_split:
-            dsa_combine(num_splits, glse, output_partial, attn_sink, output, lse)
+            dsa_combine(
+                tile_scheduler_metadata,
+                num_splits,
+                glse,
+                output_partial,
+                attn_sink,
+                output,
+                lse,
+            )
 
     if support_split:
         glse_type = T.Tensor([batch + num_mp_parts, seq_len, num_heads], accum_dtype)
@@ -958,6 +959,7 @@ def sparse_attention_fwd_kernel(
                 output_partial: output_partial_type,
                 output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
                 lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+                sm_scale: T.float32,
             ):
                 run_decode(
                     q,
@@ -973,6 +975,7 @@ def sparse_attention_fwd_kernel(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_topk_length:
@@ -991,6 +994,7 @@ def sparse_attention_fwd_kernel(
                 output_partial: output_partial_type,
                 output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
                 lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+                sm_scale: T.float32,
             ):
                 run_decode(
                     q,
@@ -1006,6 +1010,7 @@ def sparse_attention_fwd_kernel(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         elif has_attn_sink:
@@ -1024,6 +1029,7 @@ def sparse_attention_fwd_kernel(
                 output_partial: output_partial_type,
                 output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
                 lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+                sm_scale: T.float32,
             ):
                 run_decode(
                     q,
@@ -1039,6 +1045,7 @@ def sparse_attention_fwd_kernel(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
 
         else:
@@ -1056,6 +1063,7 @@ def sparse_attention_fwd_kernel(
                 output_partial: output_partial_type,
                 output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
                 lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+                sm_scale: T.float32,
             ):
                 run_decode(
                     q,
@@ -1071,6 +1079,7 @@ def sparse_attention_fwd_kernel(
                     output_partial,
                     output,
                     lse,
+                    sm_scale,
                 )
     elif has_topk_length and has_attn_sink:
 
@@ -1087,6 +1096,7 @@ def sparse_attention_fwd_kernel(
             num_splits: T.Tensor([batch + 1], T.int32),
             output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
             lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+            sm_scale: T.float32,
         ):
             run_decode(
                 q,
@@ -1102,6 +1112,7 @@ def sparse_attention_fwd_kernel(
                 None,
                 output,
                 lse,
+                sm_scale,
             )
 
     elif has_topk_length:
@@ -1118,6 +1129,7 @@ def sparse_attention_fwd_kernel(
             num_splits: T.Tensor([batch + 1], T.int32),
             output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
             lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+            sm_scale: T.float32,
         ):
             run_decode(
                 q,
@@ -1133,6 +1145,7 @@ def sparse_attention_fwd_kernel(
                 None,
                 output,
                 lse,
+                sm_scale,
             )
 
     elif has_attn_sink:
@@ -1149,6 +1162,7 @@ def sparse_attention_fwd_kernel(
             num_splits: T.Tensor([batch + 1], T.int32),
             output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
             lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+            sm_scale: T.float32,
         ):
             run_decode(
                 q,
@@ -1164,6 +1178,7 @@ def sparse_attention_fwd_kernel(
                 None,
                 output,
                 lse,
+                sm_scale,
             )
 
     else:
@@ -1179,6 +1194,7 @@ def sparse_attention_fwd_kernel(
             num_splits: T.Tensor([batch + 1], T.int32),
             output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
             lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
+            sm_scale: T.float32,
         ):
             run_decode(
                 q,
@@ -1194,6 +1210,7 @@ def sparse_attention_fwd_kernel(
                 None,
                 output,
                 lse,
+                sm_scale,
             )
 
     return dsa_decode
@@ -1237,6 +1254,7 @@ def tilelang_flashmla_interface(
     tail_dim = dim_plus_tail_dim - dim
     _, _, _, topk = indices_shape
     assert indices_shape == (b, seq_len, kv_group, topk)
+    assert topk % 64 == 0, "topk must be a multiple of 64"
     num_mp_parts = int(tile_scheduler_metadata.shape[0])
     support_split = num_mp_parts != 1
     runtime = prepare_scheduled_decode_runtime(
@@ -1268,11 +1286,12 @@ def tilelang_flashmla_interface(
         heads,
         dim,
         tail_dim,
-        topk,
         kv_group=kv_group,
-        sm_scale=sm_scale,
         threads=threads,
-        max_nums_splits=runtime.max_nums_splits,
+        # Match scheduled_max_num_splits(): 32 for <=32 MP parts and 64 for
+        # larger supported metadata.  This keeps the finite AOT dispatch
+        # exhaustive without making max_splits a runtime compile argument.
+        max_nums_splits=runtime.max_nums_splits if support_split else 1,
         has_attn_sink=runtime.has_attn_sink,
         has_topk_length=runtime.topk_length is not None,
         support_split=support_split,
@@ -1291,5 +1310,10 @@ def tilelang_flashmla_interface(
         assert runtime.glse is not None and runtime.out_partial is not None
         args.extend((runtime.glse, runtime.out_partial))
     args.extend((runtime.out, runtime.lse))
+    runtime_sm_scale = (
+        (1.0 / (dim + tail_dim)) ** 0.5 if sm_scale is None else float(sm_scale)
+    )
+    runtime_sm_scale *= 1.44269504
+    args.append(runtime_sm_scale)
     kernel(*args)
     return runtime.out, runtime.lse

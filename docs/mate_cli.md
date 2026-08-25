@@ -58,7 +58,7 @@ Notes:
 - `--force-reinstall` without `--no-deps` can cause pip to reinstall `torch` from package metadata, which is usually wrong in a MUSA environment
 - If your environment cannot access a package index, the extra dependency must also be available locally. For `mate[cli]`, that means `safetensors`
 - Installing only the MATE wheel without resolving `safetensors` is still valid, but replaying `*.safetensors` dumps will fail until `safetensors` is installed
-- MATE also requires a MUSA-enabled `apache-tvm-ffi` build. Install or build it from the MooreThreads MUSA fork at `https://github.com/MooreThreads/tvm-ffi` using a release tag that contains `musa` (for example `v0.1.9.post2+musa.1`); a plain upstream TVM-FFI package is treated as an invalid runtime dependency by `mate check`
+- MATE also requires a MUSA-enabled `apache-tvm-ffi` build. Install or build it from the MooreThreads MUSA fork at `https://github.com/MooreThreads/tvm-ffi` using a release tag that contains `musa` (for example `v0.1.11.post1+musa.1`); a plain upstream TVM-FFI package is treated as an invalid runtime dependency by `mate check`
 
 ## Quick Reference
 
@@ -476,7 +476,7 @@ Command exit behavior is not identical across all subcommands:
 
 - `Failed to load MATE API logging module`: ensure the installed MATE package is complete and importable in the current Python environment
 - `safetensors not installed`: install `safetensors`, or reinstall from a package index with `pip install "mate[cli]"`, or reinstall from a local wheel with `python -m pip install "mate[cli] @ file:///abs/path/your-mate.whl"`
-- `apache-tvm-ffi ... is not a MUSA-enabled build`: reinstall or rebuild `apache-tvm-ffi` from `https://github.com/MooreThreads/tvm-ffi` and use a release tag that contains `musa`, such as `v0.1.9.post2+musa.1`; the upstream public build is not compatible with MATE
+- `apache-tvm-ffi ... is not a MUSA-enabled build`: reinstall or rebuild `apache-tvm-ffi` from `https://github.com/MooreThreads/tvm-ffi` and use a release tag that contains `musa`, such as `v0.1.11.post1+musa.1`; the upstream public build is not compatible with MATE
 - `No dumps found`: `mate list-dumps` and batch replay only scan immediate child directories, not nested trees recursively
 - `compare_outputs=True but no output file found`: the dump is incomplete, often because the original process crashed after saving inputs
 - `AOT libraries not found`: MATE may still work in JIT mode, but startup behavior can differ from an AOT-enabled installation

@@ -8,18 +8,19 @@ MATE (**M**USA **A**I **T**ensor **E**ngine) is a centralized library for Genera
 
 - High-performance attention and GEMM operators for MUSA
 - Mixed-dtype W4A8 MoE GEMM APIs for ragged and masked MoE paths.
-- Compatibility wrappers for `flash_attn_3`, `sageattention`, `flash_mla`,
-  `flash_kda`, `msa` and `deep-gemm`
+- Compatibility wrappers for `flash_attn_3`, `flash_mla`, `flash_kda`,
+  `deep-gemm`, `sageattention`, `fmha_sm100`, and `flashinfer-python`
 - CLI tools for environment checks, configuration inspection, and replay
 
 ## Requirements
 
 | Component | Requirement |
 | --- | --- |
-| Python | `3.10` or later |
-| MUSA Toolkit | `4.3.6` or later |
+| GPU | `S5000` |
+| Toolkit / platform | MUSA SDK `4.3.5` or later (driver `3.3.5` or later) |
+| Python | `3.10` recommended |
+| Build and compilation | MUSA SDK `4.3.8` or later recommended |
 | TorchMUSA | `2.7` or later |
-| Architecture | `Pinghu (MP31)` |
 
 The current external delivery source mainly covers `x86_64` and Python `3.10`
 / `3.12` wheels.
@@ -47,12 +48,13 @@ python -m pip install flash_attn_3 \
   --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 ```
 
-This installs the matching `mate` dependency automatically. Install other
-wrapper packages such as `flash_mla`, `flash_kda`, `deep-gemm`, or
-`sageattention` the same way.
+This installs the matching `mate` dependency automatically. Install
+`flash_mla`, `deep-gemm`, `flash_kda`, `sageattention`, `fmha_sm100`, or
+`flashinfer-python` the same way when that package surface matches your
+framework.
 
 MUSA compatibility wrapper releases use the PEP 440 local version suffix
-`+musa`, for example `0.2.4+musa`. Check the installed distribution with
+`+musa`, for example `0.2.6+musa`. Check the installed distribution with
 `python -m pip show flash_attn_3`; a version ending in `+musa` identifies the
 MATE-backed MUSA wrapper rather than the native implementation. The matching
 `mate` dependency keeps its normal version without this wrapper-only suffix.
@@ -85,6 +87,9 @@ git clone https://github.com/MooreThreads/mate.git --recursive
 cd mate
 python -m pip install --no-build-isolation --no-deps -e . -v
 ```
+
+A complete Docker Compose and VS Code Dev Container workflow is documented in
+[`docker/README.md`](docker/README.md).
 
 For a local wheel instead of an editable install:
 
@@ -128,6 +133,7 @@ dependency automatically.
 | `wrappers/FlashMLA` | `flash_mla` | `flash_mla` | FlashMLA style integration |
 | `wrappers/MSA` | `fmha_sm100` | `fmha_sm100` | MSA fmha_sm100 style integration |
 | `wrappers/FlashKDA` | `flash_kda` | `flash_kda` | FlashKDA style integration |
+| `wrappers/FlashInfer` | `flashinfer-python` | `flashinfer` | FlashInfer style integration |
 | `wrappers/DeepGEMM` | `deep-gemm` | `deep_gemm` | DeepGEMM style integration |
 | `wrappers/SageAttention` | `sageattention` | `sageattention` | SageAttention style integration |
 
@@ -210,6 +216,7 @@ MATE includes a guarded MUSA allocator that can replace the default `torch_musa`
 - CLI documentation: [docs/mate_cli.md](docs/mate_cli.md)
 - Guard allocator debugging: [docs/guard_allocator.md](docs/guard_allocator.md)
 - Environment variables: [docs/environment_variables.md](docs/environment_variables.md)
+- Development container: [docker/README.md](docker/README.md)
 - FlashAttention-3 compatibility summary: [docs/source/wrappers/flash_attention_forward_compatibility.md](docs/source/wrappers/flash_attention_forward_compatibility.md)
 
 ## Acknowledgement

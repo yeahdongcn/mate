@@ -20,11 +20,11 @@ inline void fill_zero_tensor(ffi::TensorView tensor) {
                     0.0);
 }
 
-inline bool gemm_early_return(int m, int n, int k, ffi::TensorView out) {
-  if (m == 0 || n == 0) {
+inline bool gemm_early_return(int batch, int m, int n, int k, ffi::TensorView out, bool has_c) {
+  if (batch == 0 || m == 0 || n == 0) {
     return true;
   }
-  if (k == 0) {
+  if (k == 0 && !has_c) {
     fill_zero_tensor(out);
     return true;
   }

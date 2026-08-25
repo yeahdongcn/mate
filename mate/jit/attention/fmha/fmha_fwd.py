@@ -7,7 +7,10 @@ import math
 import hashlib
 import json
 
+from packaging.version import Version
+
 from ... import env as jit_env
+from ...cpp_ext import get_mcc_version
 from ...core import JitSpec, gen_jit_spec
 from ....utils import ceil_div
 from .fmha_utils import (
@@ -43,6 +46,16 @@ FMHA_FWD_EXTRA_CUDA_CFLAGS = [
     "-mllvm",
     "--num-dwords-of-load-in-mutation=64",
 ]
+
+_MCC_FMHA_WORKAROUND_CUTOFF = Version("5.2.0")
+
+
+def _get_fmha_fwd_extra_cuda_cflags() -> list[str]:
+    flags = list(FMHA_FWD_EXTRA_CUDA_CFLAGS)
+    mcc_version = get_mcc_version()
+    if mcc_version is not None and mcc_version < _MCC_FMHA_WORKAROUND_CUTOFF:
+        flags.extend(("-fno-slp-vectorize", "-DMATE_FMHA_USE_SCALAR_EXP2"))
+    return flags
 
 
 def _fmha_fwd_encode(config: Mapping[str, object]) -> str:
@@ -535,7 +548,7 @@ def gen_fmha_fwd_spec(config: Mapping[str, object]) -> JitSpec:
         name=dispatch_name,
         sources=[source_file],
         generated_sources={source_file: _render_fmha_fwd_source(config)},
-        extra_cuda_cflags=list(FMHA_FWD_EXTRA_CUDA_CFLAGS),
+        extra_cuda_cflags=_get_fmha_fwd_extra_cuda_cflags(),
         extra_include_paths=fmha_extra_include_paths(),
     )
 
@@ -659,6 +672,18 @@ def _fmha_fwd(
         "inputs must be float16, bfloat16, float8_e4m3fn, or float8_e5m2"
     )
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    if q.dtype in (torch.float16, torch.bfloat16) and (
+        head_dim % 2 != 0 or head_dim_v % 2 != 0
+    ):
+        raise ValueError(
+            "FP16/BF16 Q/K and V head dimensions must be divisible by 2, "
+            f"got Q/K={head_dim} and V={head_dim_v}"
+        )
+    if q.dtype in _FP8_DTYPES and (head_dim % 4 != 0 or head_dim_v % 4 != 0):
+        raise ValueError(
+            "FP8 Q/K and V head dimensions must be divisible by 4, "
+            f"got Q/K={head_dim} and V={head_dim_v}"
+        )
     if q_v is not None:
         assert q_v.dtype == q.dtype, "q_v must have the same dtype as q, k and v"
     if k_new is not None:
@@ -936,6 +961,7 @@ def _fmha_fwd(
         kernel_pack_gqa,
         q_v is not None,
         q.dtype in _FP8_DTYPES,
+        is_local and attention_chunk != 0,
     )
     # print(
     #     f"{tile_m=}, {tile_n=}, {stages_k=}, {stages_v=}, {headdim_rounded=}, {headdim_v_rounded=}, {consumers_qk=}, {consumers_pv=}, {enable_packgqa=}"

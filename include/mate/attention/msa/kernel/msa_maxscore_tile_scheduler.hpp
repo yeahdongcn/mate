@@ -17,7 +17,7 @@ struct MsaMaxScoreTileScheduler {
   static constexpr int  HeadRatio      = HeadRatio_;
   static constexpr int  QTokensPerTile = TileQ / HeadRatio;
   static constexpr bool ParallelKTiles = ParallelKTiles_;
-  static constexpr int  CtasPerMp      = ParallelKTiles && TileQ == 16 ? 8 : 1;
+  static constexpr int  CtasPerMp      = ParallelKTiles ? 3 : 1;
 
   struct Arguments {
     int32_t const* ptr_cu_seqlens_q = nullptr;
@@ -184,9 +184,9 @@ struct MsaMaxScoreTileScheduler {
     int total_q_works = q_tiles * problem_size.num_kv_heads * problem_size.batch_size;
     int k_partitions  = 1;
     if constexpr (ParallelKTiles) {
-      int q_works_per_wave = std::max(total_q_works, 1);
-      int target_ctas      = std::max(mp_count, 1) * CtasPerMp;
-      k_partitions         = std::min(k_tiles, mutlass::ceil_div(target_ctas, q_works_per_wave));
+      int q_works      = std::max(total_q_works, 1);
+      int target_works = std::max(mp_count, 1) * CtasPerMp;
+      k_partitions     = std::min(k_tiles, std::max(1, (target_works + q_works / 2) / q_works));
     }
     int total_works = total_q_works * k_partitions;
     return {
@@ -207,7 +207,9 @@ struct MsaMaxScoreTileScheduler {
 
   static dim3 get_grid_shape(Params const& params, int mp_count) {
     int target_ctas = std::max(mp_count, 1) * CtasPerMp;
-    int grid_x      = std::max(1, std::min(target_ctas, std::max(params.total_works, 1)));
+    // Use a persistent launch for both scheduling modes. Each CTA advances by
+    // gridDim.x in get_next_work(), so one CTA per work only adds waves.
+    int grid_x = std::max(1, std::min(target_ctas, std::max(params.total_works, 1)));
     return dim3(static_cast<uint32_t>(grid_x), 1, 1);
   }
 

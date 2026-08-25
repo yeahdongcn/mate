@@ -9,7 +9,11 @@ from mate._backend import resolve_backend
 from mate.jit.gemm.deep_gemm.gemm import (
     GEMM_TYPE_M_GROUPED_CONTIGUOUS,
     GEMM_TYPE_M_GROUPED_MASKED,
+    GEMM_TYPE_NORMAL,
     get_deep_gemm_gemm_module,
+)
+from mate.jit.gemm.masked_moe_gemm_mixed_dtype import (
+    masked_moe_gemm_mixed_dtype_mutlass,
 )
 from mate.jit.gemm_ops import get_gemm_ops_module
 from mate.jit.mubin.gemm import (
@@ -27,11 +31,6 @@ from mate.jit.mubin.gemm import (
 )
 from mate.mate_runtime import resolve_num_mps
 from mate.utils import ceil_div
-
-
-@functools.cache
-def _get_module():
-    return get_gemm_ops_module()
 
 
 class GemmMixedDType(str, Enum):
@@ -64,6 +63,57 @@ def _resolve_moe_gemm_quant_recipe(
         raise TypeError(f"{name} must be a tuple of two int values")
 
     return cast(Tuple[int, int], quant_recipe)
+
+
+_W4A8_MUTLASS_A_QUANT_RECIPES = ((1, -1), (1, 128))
+
+
+def check_w4a8_mutlass(
+    input_a: Tuple[torch.Tensor, torch.Tensor],
+    input_b: Tuple[torch.Tensor, torch.Tensor],
+    masked_tokens_info: torch.Tensor,
+    out: torch.Tensor,
+    a_quant_recipe: Tuple[int, int],
+    enable_overlap: bool,
+) -> bool:
+    if enable_overlap or a_quant_recipe not in _W4A8_MUTLASS_A_QUANT_RECIPES:
+        return False
+
+    a, scale_a = input_a
+    b, scale_b = input_b
+
+    tensors = (a, scale_a, b, scale_b, masked_tokens_info, out)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        return False
+    if not (
+        a.ndim == scale_a.ndim == b.ndim == scale_b.ndim == out.ndim == 3
+        and masked_tokens_info.ndim == 1
+    ):
+        return False
+
+    groups, max_m, k = map(int, a.shape)
+    n = int(b.shape[1])
+    scale_a_k_blocks = 1 if a_quant_recipe == (1, -1) else ceil_div(k, 128)
+    contiguous_tensors = (a, b, scale_b, masked_tokens_info, out)
+    scale_a_layout_supported = a_quant_recipe == (1, -1) or (
+        scale_a.stride(-1) == 1 or scale_a.stride(1) == 1
+    )
+    return (
+        all(tensor.device == a.device for tensor in tensors)
+        and all(tensor.stride(-1) == 1 for tensor in contiguous_tensors)
+        and scale_a_layout_supported
+        and a.dtype == torch.float8_e4m3fn
+        and scale_a.dtype == torch.float32
+        and b.dtype == torch.int8
+        and scale_b.dtype == torch.bfloat16
+        and masked_tokens_info.dtype == torch.int32
+        and out.dtype in (torch.float16, torch.bfloat16)
+        and tuple(scale_a.shape) == (groups, max_m, scale_a_k_blocks)
+        and tuple(b.shape) == (groups, n, ceil_div(k, 2))
+        and tuple(scale_b.shape) == (groups, n, ceil_div(k, 128))
+        and tuple(masked_tokens_info.shape) == (groups,)
+        and tuple(out.shape) == (groups, max_m, n)
+    )
 
 
 @mate_api
@@ -227,7 +277,9 @@ def masked_moe_gemm_16bit(
     enable_overlap : Optional[bool]
         Whether to enable Single-Batch Overlap (SBO). Default is False.
     signal : Optional[Tensor]
-        Signal tensor with shape ``(num_expert * ceil_div(max_m, 64))``for SBO. Required if enable_overlap is True. If None, a new tensor will be created if needed.
+        Signal tensor with shape ``(num_expert * ceil_div(max_m, 64))`` for
+        SBO. Required if enable_overlap is True. If None, a new tensor will be
+        created if needed.
 
     Returns
     -------
@@ -691,7 +743,7 @@ def masked_moe_gemm_mixed_dtype(
     signal: Optional[torch.Tensor] = None,
     *,
     mixed_dtype: GemmMixedDType | str,
-    backend: Optional[Literal["auto", "mubin"]] = "auto",
+    backend: Optional[Literal["auto", "mubin", "mutlass"]] = "auto",
     a_quant_recipe: Tuple[int, int],
     b_quant_recipe: Tuple[int, int],
 ):
@@ -715,8 +767,11 @@ def masked_moe_gemm_mixed_dtype(
         FP4FP8 requires E4M3.
         **scale_tensor** shape and dtype are selected by ``a_quant_recipe``. For
         ``a_quant_recipe=(1, -1)``, it has shape ``(num_expert, max_tokens, 1)``.
+        For ``a_quant_recipe=(1, 128)``, it has shape ``(num_expert,
+        max_tokens, ceil_div(hidden_size, 128))``.
     input_b : Tuple[Tensor, Union[Tensor, Tuple[Tensor, Tensor]]]
-        For S4FP8, scales is one BF16 tensor. For FP4FP8, scales is
+        For S4FP8, scales is one BF16 tensor with shape ``(num_expert,
+        out_hidden_size, ceil_div(hidden_size, 128))``. For FP4FP8, scales is
         ``(residual_e8m0, epilogue_fp32)`` with shapes ``(num_expert,
         out_hidden_size, ceil_div(hidden_size, 32))`` and ``(num_expert,
         out_hidden_size)``.
@@ -727,7 +782,8 @@ def masked_moe_gemm_mixed_dtype(
         Output tensor with shape ``(num_expert, max_tokens, out_hidden_size)``.
         S4FP8 supports FP16 or BF16; FP4FP8 requires BF16.
     expect_tokens : Optional[int]
-        Expected number of tokens. If None, defaults to 0.
+        Expected typical number of tokens per expert. A positive value participates
+        in automatic backend selection. If None or 0, the tensor capacity is used.
     enable_overlap : Optional[bool]
         Whether to enable Single-Batch Overlap (SBO). Default is False.
     signal : Optional[Tensor]
@@ -741,11 +797,20 @@ def masked_moe_gemm_mixed_dtype(
         ``GemmMixedDType.FP4FP8`` and ``"fp4fp8"`` mean E2M1 FP4 weights and
         E4M3 activations.
     backend : Optional[str]
-        Backend selector. Only ``"auto"`` and ``"mubin"`` are supported.
+        Backend selector. ``"mutlass"`` uses the JIT/AOT MP31 kernel.
+        ``"auto"`` selects it for compatible non-overlap inputs with
+        ``min(max_tokens, expect_tokens) <= 32`` when ``expect_tokens`` is
+        positive, and otherwise uses ``max_tokens`` as the threshold input.
+        Grouped-A ``a_quant_recipe=(1, 128)`` always selects MUTLASS when its
+        tensor contract is compatible because MUBIN grouped-A support is not
+        available.
     a_quant_recipe : Tuple[int, int]
         Quantization block-size recipe for input A. The tuple is interpreted as
         ``(m, k)``. ``-1`` means the corresponding axis is not split into
-        smaller quantization blocks. Currently, only ``(1, -1)`` is supported.
+        smaller quantization blocks. ``(1, -1)`` and ``(1, 128)`` are supported
+        by the MUTLASS backend for ``GemmMixedDType.S4FP8``. MUBIN supports only
+        ``(1, -1)``. Grouped Scale-A may be contiguous in either its M or K-block
+        dimension. FP4FP8 supports only ``(1, -1)``.
     b_quant_recipe : Tuple[int, int]
         Quantization block-size recipe for input B. The tuple is interpreted as
         ``(n, k)``. ``-1`` means the corresponding axis is not split into
@@ -768,23 +833,78 @@ def masked_moe_gemm_mixed_dtype(
         expect_tokens = 0
 
     backend = cast(
-        Literal["auto", "mubin"],
-        resolve_backend(backend, supported=("mubin",), default="auto"),
+        Literal["auto", "mubin", "mutlass"],
+        resolve_backend(backend, supported=("mubin", "mutlass"), default="auto"),
     )
-    if backend == "auto":
-        backend = "mubin"
     mixed_dtype = _resolve_gemm_mixed_dtype(mixed_dtype)
     a_quant_recipe = _resolve_moe_gemm_quant_recipe("a_quant_recipe", a_quant_recipe)
     b_quant_recipe = _resolve_moe_gemm_quant_recipe("b_quant_recipe", b_quant_recipe)
-    expected_b_recipe = (1, 32) if mixed_dtype == GemmMixedDType.FP4FP8 else (1, 128)
-    if (
-        a_quant_recipe != (1, -1)
-        or b_quant_recipe != expected_b_recipe
-        or backend != "mubin"
+    if mixed_dtype == GemmMixedDType.FP4FP8:
+        if (
+            a_quant_recipe != (1, -1)
+            or b_quant_recipe != (1, 32)
+            or backend == "mutlass"
+        ):
+            raise NotImplementedError(
+                f"mixed_dtype={mixed_dtype.value}, a_quant_recipe={a_quant_recipe}, "
+                f"b_quant_recipe={b_quant_recipe}, backend={backend} is not supported"
+            )
+        backend = "mubin"
+    elif not (
+        mixed_dtype == GemmMixedDType.S4FP8
+        and a_quant_recipe in _W4A8_MUTLASS_A_QUANT_RECIPES
+        and b_quant_recipe == (1, 128)
     ):
         raise NotImplementedError(
             f"mixed_dtype={mixed_dtype.value}, a_quant_recipe={a_quant_recipe}, "
             f"b_quant_recipe={b_quant_recipe}, backend={backend} is not supported"
+        )
+
+    mutlass_input_b = cast(Tuple[torch.Tensor, torch.Tensor], input_b)
+    if backend != "mubin":
+        mutlass_enabled = check_w4a8_mutlass(
+            input_a,
+            mutlass_input_b,
+            masked_tokens_info,
+            out,
+            a_quant_recipe,
+            enable_overlap,
+        )
+        if backend == "auto":
+            if a_quant_recipe == (1, 128):
+                if not mutlass_enabled:
+                    raise NotImplementedError(
+                        'backend="mutlass" requires non-overlap E4M3 A with FP32 scales matching a_quant_recipe, '
+                        "packed INT4/INT8 B with BF16 scales, FP16/BF16 output, "
+                        "supported Scale-A major order, and compatible contiguous tensor layouts"
+                    )
+                backend = "mutlass"
+            elif mutlass_enabled:
+                max_m = int(input_a[0].shape[1])
+                dispatch_m = min(max_m, expect_tokens) if expect_tokens > 0 else max_m
+                backend = "mutlass" if dispatch_m <= 32 else "mubin"
+            else:
+                backend = "mubin"
+        elif not mutlass_enabled:
+            raise NotImplementedError(
+                'backend="mutlass" requires non-overlap E4M3 A with FP32 scales matching a_quant_recipe, '
+                "packed INT4/INT8 B with BF16 scales, FP16/BF16 output, "
+                "supported Scale-A major order, and compatible contiguous tensor layouts"
+            )
+
+    if backend == "mutlass":
+        return masked_moe_gemm_mixed_dtype_mutlass(
+            input_a,
+            mutlass_input_b,
+            masked_tokens_info,
+            out,
+            expect_tokens,
+            a_quant_recipe,
+        )
+
+    if a_quant_recipe != (1, -1):
+        raise NotImplementedError(
+            f'a_quant_recipe={a_quant_recipe}, backend="mubin" is not supported'
         )
 
     if not enable_overlap:
@@ -964,340 +1084,375 @@ def ragged_k_moe_gemm_16bit(
     return out
 
 
-@mate_api
-def bmm_fp8(
+@functools.cache
+def _get_bmm_module():
+    return get_gemm_ops_module()
+
+
+def _run_bmm_mubin_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-    out_dtype: torch.dtype,
-    out: Optional[torch.Tensor] = None,
-    backend: str = "auto",
-    scale_granularity_mnk: Optional[Tuple[int, int, int]] = None,
-    output_scale: Optional[torch.Tensor] = None,
-    c: Optional[torch.Tensor] = None,
-    major_a_mode: Literal["K", "M"] = "K",
-    major_b_mode: Literal["N", "K"] = "K",
-):
-    """
-    Perform batched matrix multiplication with FP8 quantized tensors.
-
-    This function computes the batched matrix multiplication of two FP8 quantized tensors,
-    applying scaling factors to produce a result in the specified output data type.
-
-    Parameters
-    ----------
-    a : Tensor
-        Input tensor A in FP8 format (e4m3/e5m2). Shape is
-        ``(batch, m, k)`` when ``major_a_mode="K"`` and
-        ``(batch, k, m)`` when ``major_a_mode="M"``. The declared major
-        matrix dimension must have stride 1.
-    b : Tensor
-        Input tensor B in FP8 format (e4m3/e5m2). Shape is
-        ``(batch, n, k)`` by default with ``major_b_mode="K"`` and
-        ``(batch, k, n)`` when ``major_b_mode="N"``. The declared
-        major matrix dimension must have stride 1.
-    a_scale : Tensor
-        Scaling factors for tensor A with shape depending on scale_granularity.
-        Should be of fp32 type.
-    b_scale : Tensor
-        Scaling factors for tensor B with shape depending on scale_granularity.
-        Should be of fp32 type.
-    out_dtype : torch.dtype
-        Data type for the output tensor. torch.bfloat16, torch.float16 and
-        torch.float32 are supported.
-    out : Optional[Tensor]
-        Pre-allocated output tensor with shape ``(batch, m, n)``.
-        Default is None.
-        If None, a new tensor will be allocated.
-    backend : str
-        Backend to use for the operation.
-        Current support backends are "mudnn" and "auto".
-        Default is "auto".
-    scale_granularity_mnk : Optional[Tuple[int, int, int]]
-        Granularity of scaling for batch, m, and n dimensions respectively.
-        ``(-1, -1, -1)``, ``(1, -1, -1)``, ``(1, 128, 128)`` and
-        ``(1, 1, 128)`` are supported.
-        If None, defaults to ``(-1, -1, -1)``.
-    c : Optional[Tensor]
-        Optional FP32 accumulation tensor with shape ``(batch, m, n)``.
-    major_a_mode : str
-        ``"K"`` treats A as ``(batch, m, k)``; ``"M"`` treats A as
-        ``(batch, k, m)`` and asks MatMulLt to transpose A.
-    major_b_mode : str
-        ``"K"`` treats B as ``(batch, n, k)`` and asks MatMulLt to
-        transpose B. ``"N"`` treats B as ``(batch, k, n)``.
-        Default is ``"K"``.
-
-    Returns
-    -------
-    Tensor
-        Result tensor with shape ``(batch, m, n)`` in the specified output data type.
-    """
-    backend = resolve_backend(
-        backend, supported=("mudnn",), allow_auto=True, default="auto"
-    )
-
-    if scale_granularity_mnk is None:
-        scale_granularity_mnk = (-1, -1, -1)
-
-    if major_a_mode not in ("K", "M"):
-        raise ValueError("major_a_mode must be either 'K' or 'M'")
-    if major_b_mode not in ("N", "K"):
-        raise ValueError("major_b_mode must be either 'N' or 'K'")
-
-    batch = a.size(0)
-    if major_a_mode == "K":
-        m = a.size(1)
-        k = a.size(2)
-    else:
-        k = a.size(1)
-        m = a.size(2)
-
-    if major_b_mode == "N":
-        b_k = b.size(1)
-        n = b.size(2)
-    else:
-        n = b.size(1)
-        b_k = b.size(2)
-
-    if b.size(0) != batch or b_k != k:
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    recipe_a: Tuple[int, int],
+    recipe_b: Tuple[int, int],
+    c: Optional[torch.Tensor],
+    trans_a: bool,
+    trans_b: bool,
+    fixed_scale_layout: Optional[bool],
+) -> None:
+    if c is not None:
+        raise ValueError('backend="mubin" does not support C accumulation')
+    if recipe_a[1] != recipe_b[1]:
+        raise ValueError("recipe_a and recipe_b must use matching K granularity")
+    scale_granularity_mnk = (recipe_a[0], recipe_b[0], recipe_a[1])
+    if fixed_scale_layout not in (None, False):
+        raise ValueError('backend="mubin" only supports K-major scales')
+    if fixed_scale_layout is False and (trans_a or not trans_b):
         raise ValueError(
-            "bmm_fp8 expects A as [batch,m,k] or [batch,k,m] according to "
-            "major_a_mode, and B as [batch,k,n] or [batch,n,k] according to "
-            "major_b_mode"
+            'backend="mubin" only supports explicit K-major scales for NT BMM'
         )
 
-    if out is None:
-        if out_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
-            raise ValueError("Only bf16, fp16 and fp32 are supported for out_type!")
-
-        out = torch.empty((batch, m, n), dtype=out_dtype, device=a.device)
-    else:
-        if tuple(out.shape) != (batch, m, n):
+    batch = a.size(0)
+    batch_tensors = {
+        "b": b,
+        "scale_a": scale_a,
+        "scale_b": scale_b,
+        "out": out,
+        "scale_out": scale_out,
+    }
+    for name, tensor in batch_tensors.items():
+        if tensor.size(0) != batch:
             raise ValueError(
-                f"out must have shape {(batch, m, n)}, got {tuple(out.shape)}"
+                f"{name} batch dimension must be {batch}, got {tensor.size(0)}"
             )
-        if out.device != a.device:
-            raise ValueError(f"out must be on device {a.device}, got {out.device}")
-        if out.dtype not in [torch.bfloat16, torch.float16, torch.float32]:
-            raise ValueError("Only bf16, fp16 and fp32 are supported for out_type!")
 
-    if c is not None:
-        if tuple(c.shape) != (batch, m, n):
-            raise ValueError(f"c must have shape {(batch, m, n)}, got {tuple(c.shape)}")
-        if c.device != a.device:
-            raise ValueError(f"c must be on device {a.device}, got {c.device}")
-        if c.dtype != out.dtype:
-            raise ValueError("c must have the same dtype as out")
-        if out.dtype != torch.float32:
-            raise ValueError("bmm_fp8 with c only supports fp32 output")
+    mubin_major_a = "MN" if trans_a else "K"
+    mubin_major_b = "K" if trans_b else "MN"
+    for batch_index in range(batch):
+        groupwise_gemm_8bit_fp8output_mubin(
+            (a[batch_index], scale_a[batch_index]),
+            (b[batch_index], scale_b[batch_index]),
+            scale_granularity_mnk,
+            out[batch_index],
+            scale_out[batch_index],
+            mubin_major_a,
+            mubin_major_b,
+            None,
+        )
 
-    if c is not None and k == 0:
-        if out.data_ptr() != c.data_ptr():
-            out.copy_(c)
-        return out
 
-    _get_module().get_function("bmm_fp8")(
+def _run_bmm_mudnn(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    c: Optional[torch.Tensor],
+    scale_a: Optional[torch.Tensor],
+    scale_b: Optional[torch.Tensor],
+    recipe_a: Optional[Tuple[int, int]],
+    recipe_b: Optional[Tuple[int, int]],
+    trans_a: bool,
+    trans_b: bool,
+    fixed_scale_layout: Optional[bool],
+) -> None:
+    is_fp8 = a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if is_fp8 and (recipe_a is None or recipe_b is None):
+        raise ValueError("FP8 inputs require recipe_a and recipe_b")
+    if is_fp8 and fixed_scale_layout is None:
+        fixed_scale_layout = trans_a or not trans_b
+    elif not is_fp8:
+        scale_a = scale_b = None
+        recipe_a = recipe_b = (-1, -1)
+        fixed_scale_layout = False
+    _get_bmm_module().get_function("bmm")(
         a,
         b,
-        a_scale,
-        b_scale,
         out,
-        scale_granularity_mnk,
-        backend,
         c,
-        major_a_mode,
-        major_b_mode,
+        scale_a,
+        scale_b,
+        recipe_a,
+        recipe_b,
+        trans_a,
+        trans_b,
+        fixed_scale_layout,
     )
-    return out
+
+
+def _run_bmm_mutlass(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    c: Optional[torch.Tensor],
+    scale_a: Optional[torch.Tensor],
+    scale_b: Optional[torch.Tensor],
+    recipe_a: Optional[Tuple[int, int]],
+    recipe_b: Optional[Tuple[int, int]],
+    trans_a: bool,
+    trans_b: bool,
+    fixed_scale_layout: Optional[bool],
+) -> None:
+    if trans_a or not trans_b:
+        raise ValueError('backend="mutlass" only supports NT BMM')
+    if c is not None:
+        raise ValueError('backend="mutlass" does not support C accumulation')
+
+    if a.dtype == torch.bfloat16:
+        if b.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+            raise ValueError('backend="mutlass" requires BF16 A, B, and output')
+        kind = "bf16"
+    elif a.dtype == torch.float8_e4m3fn:
+        if b.dtype != torch.float8_e4m3fn or out.dtype != torch.bfloat16:
+            raise ValueError(
+                'backend="mutlass" requires FP8 E4M3 A and B with BF16 output'
+            )
+        if scale_a is None or scale_b is None:
+            raise ValueError('backend="mutlass" requires scale_a and scale_b')
+        if recipe_a != (1, 128) or recipe_b != (128, 128):
+            raise ValueError(
+                'backend="mutlass" requires recipe_a=(1, 128) and recipe_b=(128, 128)'
+            )
+        if fixed_scale_layout not in (None, False):
+            raise ValueError('backend="mutlass" only supports K-major scales')
+        kind = "fp8"
+    else:
+        raise ValueError('backend="mutlass" only supports BF16 or FP8 E4M3 inputs')
+
+    dispatch_name, mod = get_deep_gemm_gemm_module(
+        kind=kind,
+        gemm_type=GEMM_TYPE_NORMAL,
+        config_m=a.size(1),
+    )
+    func = mod.get_function(dispatch_name)
+    num_mps = resolve_num_mps(a.device)
+    for batch_index in range(a.size(0)):
+        if kind == "bf16":
+            func(a[batch_index], b[batch_index], out[batch_index], None, 0, num_mps)
+        else:
+            assert scale_a is not None and scale_b is not None
+            func(
+                a[batch_index],
+                scale_a[batch_index],
+                b[batch_index],
+                scale_b[batch_index],
+                out[batch_index],
+                None,
+                0,
+                num_mps,
+            )
 
 
 @mate_api
-def bmm_fp16(
+def bmm(
     a: torch.Tensor,
     b: torch.Tensor,
-    out_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: str = "auto",
+    *,
+    trans_a: bool = False,
+    trans_b: bool = True,
+    scale_a: Optional[torch.Tensor] = None,
+    scale_b: Optional[torch.Tensor] = None,
+    scale_out: Optional[torch.Tensor] = None,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
     c: Optional[torch.Tensor] = None,
-):
-    backend = resolve_backend(
-        backend, supported=("mudnn",), allow_auto=True, default="auto"
-    )
-    if out is None:
-        batch = a.size(0)
-        m = a.size(1)
-        n = b.size(2)
-
-        if out_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
-            raise ValueError("Only bf16, fp16 and fp32 are supported for out_type!")
-
-        out = torch.empty((batch, m, n), dtype=out_dtype, device=a.device)
-
-    if c is not None and a.size(2) == 0:
-        if out.data_ptr() != c.data_ptr():
-            out.copy_(c)
-        return out
-
-    _get_module().get_function("bmm_fp16")(a, b, out, c, backend)
-    return out
-
-
-@mate_api
-def gemm_fp8_nt_groupwise(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-    scale_major_mode: Optional[Literal["MN", "K"]] = None,
-    mma_sm: Optional[int] = None,
-    scale_granularity_mnk: Optional[Tuple[int, int, int]] = None,
-    out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    fixed_scale_layout: Optional[bool] = None,
     backend: str = "auto",
-    output_scale: Optional[torch.Tensor] = None,
-):
-    """
-    Perform groupwise FP8 GEMM operation with scaling.
+) -> torch.Tensor:
+    """Perform FP8, FP16, or BF16 batched matrix multiplication.
 
-    This function computes the matrix multiplication of two FP8 quantized tensors, applying scaling factors to produce a result
-    in the specified output data type. It supports groupwise quantization with configurable
-    scale granularity.
+    This function computes the batched matrix product of A and B, optionally
+    adds C, and stores the result in the requested output dtype. It supports
+    unscaled FP16/BF16 inputs and FP8 inputs with tensorwise, channelwise, or
+    groupwise scaling.
 
     Parameters
     ----------
-    a : Tensor
-        Input tensor A with shape ``(m, k)`` in FP8 format (e4m3/e5m2).
-        Tensor must be contiguous.
-    b : Tensor
-        Input tensor B with shape ``(n, k)`` in FP8 format (e4m3/e5m2).
-        Tensor must be contiguous.
-    a_scale : Tensor
-        Scaling factors for tensor A. Shape depends on scale_granularity_mnk parameter.
-        Should be of fp32 type. Must be contiguous.
-    b_scale : Tensor
-        Scaling factors for tensor B. Shape depends on scale_granularity_mnk parameter.
-        Should be of fp32 type. Must be contiguous.
-    scale_major_mode : str
-        Scale major mode "MN" or "K" for groupwise operations. Default is "K".
-    mma_sm : Optional[int]
-        MMA SM configuration. Currently only supports 1. Default is 1.
-    scale_granularity_mnk : Optional[Tuple[int, int, int]]
-        Granularity of scaling for m, n, and k dimensions respectively.
-        Default is ``(1, 128, 128)``.
-    out : Optional[Tensor]
-        Pre-allocated output tensor with shape ``(m, n)``.
-        Should be bf16/fp16 when ``output_scale`` is None, or fp8_e4m3 when
-        ``output_scale`` is provided. If None, a new tensor will be allocated.
+    a : torch.Tensor
+        Input A. Its physical shape is ``(batch, m, k)`` when
+        ``trans_a=False`` or ``(batch, k, m)`` when ``trans_a=True``.
+        Supported dtypes are FP16, BF16, FP8 E4M3, and FP8 E5M2. The final
+        physical dimension must have stride 1.
+    b : torch.Tensor
+        Input B. Its physical shape is ``(batch, n, k)`` when
+        ``trans_b=True`` or ``(batch, k, n)`` when ``trans_b=False``.
+        It must use the same 16-bit dtype as A for unscaled BMM, or an FP8
+        dtype for scaled BMM. The final physical dimension must have stride 1.
+    out : Optional[torch.Tensor]
+        Preallocated output D with shape ``(batch, m, n)``. When omitted, a
+        tensor is allocated using ``out_dtype``. The default dtype is the input
+        dtype for 16-bit BMM and BF16 for FP8 BMM without ``scale_out``.
+    trans_a : bool
+        Whether to transpose the final two dimensions of physical A before
+        multiplication. Default is False.
+    trans_b : bool
+        Whether to transpose the final two dimensions of physical B before
+        multiplication. Default is True.
+    scale_a : Optional[torch.Tensor]
+        FP32 scaling factors for A. Required for FP8 inputs and ignored for
+        16-bit inputs. Its logical granularity is specified by ``recipe_a``.
+    scale_b : Optional[torch.Tensor]
+        FP32 scaling factors for B. Required for FP8 inputs and ignored for
+        16-bit inputs. Its logical granularity is specified by ``recipe_b``.
+    scale_out : Optional[torch.Tensor]
+        FP32 output scales for FP8 E4M3 output. Providing this tensor selects
+        the MUBIN backend; its shape is ``(batch, m, ceil(n / 128))``.
+        Ignored for 16-bit inputs.
+    recipe_a : Optional[Tuple[int, int]]
+        Required FP8 quantization recipe ``(m_granularity, k_granularity)``
+        for A. ``(-1, -1)``, ``(1, -1)``, and ``(1, 128)`` represent
+        tensorwise, channelwise, and K-grouped scaling, respectively.
+    recipe_b : Optional[Tuple[int, int]]
+        Required FP8 quantization recipe ``(n_granularity, k_granularity)``
+        for B. In addition to tensorwise, channelwise, and grouped scaling,
+        ``(128, 128)`` represents block scaling. Its K granularity must match
+        ``recipe_a``.
+    c : Optional[torch.Tensor]
+        Optional accumulation tensor with shape ``(batch, m, n)``. It must
+        match the output dtype. FP8 BMM with C requires FP32 output. The MUBIN
+        and MUTLASS backends do not support C.
     out_dtype : Optional[torch.dtype]
-        Data type for the output tensor when ``out`` is None. If ``out`` is
-        provided, ``out.dtype`` is validated instead.
-        Defaults to torch.bfloat16 without ``output_scale`` and fp8_e4m3 with
-        ``output_scale``.
+        Output dtype used only when ``out`` is omitted. The muDNN backend
+        accepts the 16-bit input dtype or FP32 for unscaled BMM, and FP16,
+        BF16, or FP32 for FP8 BMM. MUBIN requires FP8 E4M3 output. MUTLASS
+        requires BF16 output.
+    fixed_scale_layout : Optional[bool]
+        Common packed layout for non-scalar FP8 scales. False selects K-major,
+        True selects MN-major, and None selects K-major for NT or MN-major for
+        NN, TN, and TT. Ignored for 16-bit inputs.
     backend : str
-        Backend to use for the operation. Use ``"mudnn"`` when
-        ``output_scale`` is None and ``"mubin"`` when ``output_scale`` is
-        provided. ``"auto"`` selects the supported backend for the selected
-        output path.
-    output_scale: Optional[torch.Tensor]
-        Quantization scale tensor for FP8 output. If provided, the operation
-        uses the mubin FP8-output path. If None, output is not quantized.
-        Default is None.
+        Backend selector. ``"auto"`` uses muDNN unless ``scale_out`` selects
+        MUBIN. Explicitly supported backends are ``"mudnn"``, ``"mubin"``, and
+        ``"mutlass"``. MUTLASS supports NT BF16 or group/block FP8 E4M3 BMM
+        with BF16 output.
 
     Returns
     -------
-    Tensor
-        Result tensor with shape ``(m, n)`` in the specified output data type.
+    torch.Tensor
+        Output D with shape ``(batch, m, n)``. If ``out`` is provided, the same
+        tensor is returned.
     """
-
-    if output_scale is None:
+    is_fp8 = a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and b.dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
+    if is_fp8:
+        if scale_a is None or scale_b is None:
+            raise ValueError("FP8 inputs require scale_a and scale_b")
+        if recipe_a is None or recipe_b is None:
+            raise ValueError("FP8 inputs require recipe_a and recipe_b")
+        group_or_block_scaled = (
+            recipe_a[0] == 1
+            and recipe_a[1] == 128
+            and recipe_b[0] in (1, 128)
+            and recipe_b[1] == 128
+        )
+        if (
+            group_or_block_scaled
+            and a.dtype == torch.float8_e4m3fn
+            and b.dtype == torch.float8_e5m2
+        ):
+            raise ValueError(
+                "FP8 bmm group/block scaling does not support E4M3 a with E5M2 b"
+            )
         backend = resolve_backend(
-            backend, supported=("mudnn",), allow_auto=True, default="auto"
+            backend,
+            supported=("mudnn", "mubin", "mutlass"),
+            allow_auto=True,
+            default="auto",
+        )
+        if scale_out is not None:
+            if backend == "auto":
+                backend = "mubin"
+            elif backend != "mubin":
+                raise ValueError("scale_out requires the mubin backend")
+        elif backend == "mubin":
+            raise ValueError('backend="mubin" requires scale_out')
+        elif backend == "auto":
+            backend = "mudnn"
+    else:
+        if a.dtype not in (torch.float16, torch.bfloat16) or b.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise ValueError("unscaled bmm only supports FP16 or BF16 inputs")
+        backend = resolve_backend(
+            backend,
+            supported=("mudnn", "mutlass"),
+            allow_auto=True,
+            default="auto",
         )
         if backend == "auto":
             backend = "mudnn"
-    else:
-        # The FP8-output kernel is implemented by the mubin backend.
-        backend = resolve_backend(
-            backend, supported=("mubin",), allow_auto=True, default="auto"
-        )
-        if backend == "auto":
-            backend = "mubin"
 
-    if scale_major_mode is None:
-        scale_major_mode = "K"
-
-    if mma_sm is None:
-        mma_sm = 1
-
-    if mma_sm != 1:
-        mma_sm = 1
-        print("Warning: only mma_sm=1 is supported now, set mma_sm=1")
-
-    if scale_granularity_mnk is None:
-        scale_granularity_mnk = (1, 128, 128)
-
-    major_a_mode = "K"
-    major_b_mode = "K"
-
-    m = a.size(0)
-    n = b.size(0)
-    expected_out_shape = (m, n)
-
-    supported_out_dtypes: Tuple[torch.dtype, ...]
-    if output_scale is not None:
-        supported_out_dtypes = (torch.float8_e4m3fn,)
-        default_out_dtype = torch.float8_e4m3fn
-        out_dtype_error = "fp8_output only supports e4m3 now"
-    else:
-        supported_out_dtypes = (torch.bfloat16, torch.float16)
-        default_out_dtype = torch.bfloat16
-        out_dtype_error = "Only bf16 and fp16 are supported for out_type!"
-
+    batch = a.size(0)
+    m = a.size(2) if trans_a else a.size(1)
+    n = b.size(1) if trans_b else b.size(2)
     if out is None:
         if out_dtype is None:
-            out_dtype = default_out_dtype
-
-        if out_dtype not in supported_out_dtypes:
-            raise ValueError(out_dtype_error)
-
-        out = torch.empty(expected_out_shape, dtype=out_dtype, device=a.device)
-    else:
-        if not isinstance(out, torch.Tensor):
-            raise TypeError("out must be a torch.Tensor")
-        if tuple(out.shape) != expected_out_shape:
-            raise ValueError(
-                f"out must have shape {expected_out_shape}, got {tuple(out.shape)}"
+            out_dtype = (
+                torch.float8_e4m3fn if is_fp8 and scale_out is not None else a.dtype
             )
-        if out.device != a.device:
-            raise ValueError(f"out must be on device {a.device}, got {out.device}")
-        if out.dtype not in supported_out_dtypes:
-            raise ValueError(out_dtype_error)
-        if output_scale is None and out.stride(-1) != 1:
-            raise ValueError("out must be contiguous at the last dimension")
+        if (
+            is_fp8
+            and scale_out is None
+            and out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        ):
+            out_dtype = torch.bfloat16
+        out = torch.empty((batch, m, n), dtype=out_dtype, device=a.device)
 
-    if output_scale is not None:
-        groupwise_gemm_8bit_fp8output_mubin(
-            (a, a_scale),
-            (b, b_scale),
-            scale_granularity_mnk,
-            out,
-            output_scale,
-            major_a_mode,
-            major_b_mode,
-            None,
-        )
-    else:
-        _get_module().get_function("gemm_fp8_nt_groupwise")(
+    if backend == "mudnn":
+        _run_bmm_mudnn(
             a,
             b,
-            a_scale,
-            b_scale,
-            scale_major_mode,
-            mma_sm,
-            scale_granularity_mnk,
             out,
-            backend,
+            c,
+            scale_a,
+            scale_b,
+            recipe_a,
+            recipe_b,
+            trans_a,
+            trans_b,
+            fixed_scale_layout,
+        )
+    elif backend == "mutlass":
+        _run_bmm_mutlass(
+            a,
+            b,
+            out,
+            c,
+            scale_a,
+            scale_b,
+            recipe_a,
+            recipe_b,
+            trans_a,
+            trans_b,
+            fixed_scale_layout,
+        )
+    else:
+        if (
+            scale_a is None
+            or scale_b is None
+            or scale_out is None
+            or recipe_a is None
+            or recipe_b is None
+        ):
+            raise ValueError('backend="mubin" requires FP8 scales and scale_out')
+        _run_bmm_mubin_fp8(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            out,
+            scale_out,
+            recipe_a,
+            recipe_b,
+            c,
+            trans_a,
+            trans_b,
+            fixed_scale_layout,
         )
     return out

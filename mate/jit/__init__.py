@@ -53,6 +53,9 @@ from .gemm.deep_gemm.paged_mqa_logits import (
 from .gemm.deep_gemm.paged_mqa_logits import (
     get_paged_mqa_logits_module as get_paged_mqa_logits_module,
 )
+from .gemm.masked_moe_gemm_mixed_dtype import (
+    gen_masked_moe_gemm_mixed_dtype_aot as gen_masked_moe_gemm_mixed_dtype_aot,
+)
 from .gemm_ops import gen_gemm_ops_aot as gen_gemm_ops_aot
 from .gemm_ops import gen_gemm_ops_spec as gen_gemm_ops_spec
 from .gemm_ops import get_gemm_ops_module as get_gemm_ops_module
@@ -116,6 +119,7 @@ __all__ = [
     "gen_mqa_logits_aot",
     "gen_mqa_logits_spec",
     "get_mqa_logits_module",
+    "gen_masked_moe_gemm_mixed_dtype_aot",
     "gen_paged_mqa_logits_aot",
     "gen_paged_mqa_logits_spec",
     "get_paged_mqa_logits_module",
@@ -192,8 +196,12 @@ def prewarm_modules(
         specs.append(gen_gemm_ops_spec())
     if include_deep_gemm:
         from .gemm.deep_gemm import gen_deep_gemm_gemm_aot
+        from .gemm.masked_moe_gemm_mixed_dtype import (
+            gen_masked_moe_gemm_mixed_dtype_aot,
+        )
 
         specs.extend(gen_deep_gemm_gemm_aot())
+        specs.extend(gen_masked_moe_gemm_mixed_dtype_aot())
     if include_hyperconnection:
         from .gemm.deep_gemm.hyperconnection import gen_hyperconnection_aot
 

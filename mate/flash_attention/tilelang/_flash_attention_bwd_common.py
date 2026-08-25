@@ -6,7 +6,6 @@ import tilelang
 from tilelang.autotuner import *
 import tilelang.language as T
 import itertools
-from tvm import tir
 from ...utils import cosize
 
 TARGET = "musa"
@@ -53,10 +52,14 @@ JIT_COMPILE_FLAGS = [
 ]
 
 
-def perm_n(n, block_N):
-    # assume n in blockN
-    l = block_N // 8
-    return (n % 8) * l + (n // 8)
+def perm_n(n, block_N, atom_n=None):
+    # assume n in blockN; optionally permute independently inside atom_n chunks
+    if atom_n is None:
+        atom_n = block_N
+    local_n = n % atom_n
+    atom_base = n // atom_n * atom_n
+    l = atom_n // 8
+    return atom_base + (local_n % 8) * l + (local_n // 8)
 
 
 def _check_last_dim_stride_one(name, tensor):
@@ -127,16 +130,17 @@ def _jit_for_index_type_promotion(jit_impl, enable_index_type_promotion):
 
 
 def _annotate_sqmma(buffer, k_major, continuity=None):
+    buffer_view = buffer if hasattr(buffer, "buffer") else buffer[:, :]
     if continuity is None:
         layout = tilelang.layout.make_sqmma_swizzled_layout(
-            buffer[:, :], k_major=k_major
+            buffer_view, k_major=k_major
         )
     else:
         layout = tilelang.layout.make_sqmma_swizzled_layout(
-            buffer[:, :], k_major=k_major, continuity=continuity
+            buffer_view, k_major=k_major, continuity=continuity
         )
     T.annotate_layout(
-        {buffer[:, :]: layout},
+        {buffer_view: layout},
         allow_reannotation=True,
         allow_buffer_region=True,
     )

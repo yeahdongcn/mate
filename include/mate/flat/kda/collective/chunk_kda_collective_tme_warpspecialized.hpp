@@ -358,6 +358,7 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
         NumStateWarps + NumOutputWarps,  // OperandsConsumed
         NumOutputWarps,                  // PReady
         NumProducerWarps,                // DtBiasLoaded
+        mutlass::NumWarpsPerWarpSquad,   // BetaLoaded
         mutlass::NumWarpsPerWarpSquad,   // InverseReadySmemReady
         NumStateWarps + NumOutputWarps,  // VUpdatedConsumed
         NumOutputWarps,                  // StateConsumed
@@ -794,6 +795,7 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
       // we put load_beta after warpsquad_wait to avoid the weird compiler MTGPU-DEPENDENCY-GRAPH warning
       bool is_not_full_chunk = IsFinalChunk::value && work_desc.actual_len(chunk_idx) < kChunk;
       load_beta(sBeta, params, problem_size, work_desc, chunk_idx, local_tid, is_not_full_chunk);
+      named_barrier_arrive_and_wait(KdaNamedBarrier::BetaLoaded);
       CollectiveInverseNxN inverse_nxn;
       auto sInverseOut = make_tensor(make_smem_ptr(shared_storage.smem_inverse.data()), SmemLayoutInverseA{})(_, _, 0);
       inverse_nxn(
@@ -1157,9 +1159,11 @@ struct ChunkKdaCollectiveTmeWarpSpecialized {
 
       MUTLASS_PRAGMA_UNROLL
       for (int vec_idx = 0; vec_idx < size(w_vec); ++vec_idx) {
-        auto   row         = get<0>(tCcV(vec_idx * VecSize));
-        auto   col         = get<1>(tCcV(vec_idx * VecSize));
-        auto   natural_col = PermuteVTile{}(col);
+        auto row = get<0>(tCcV(vec_idx * VecSize));
+        auto col = get<1>(tCcV(vec_idx * VecSize));
+        // QS C coordinates transpose each 64-element V half independently.
+        // A single 8x16 transpose would write the residual into the wrong U rows.
+        auto   natural_col = InternalToNaturalVLayout{}(col);
         float4 v_old       = simd::load_packed4_as_float4(&sV(make_coord(natural_col, row)));
         float4 update      = reinterpret_cast<float4 const&>(w_vec(vec_idx));
         simd::store_float4_to_packed4_rn(&sU(make_coord(natural_col, row)), simd::vsub(v_old, update));

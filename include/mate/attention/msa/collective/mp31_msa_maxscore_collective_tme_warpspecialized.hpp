@@ -22,7 +22,7 @@ namespace mate::attention::msa::collective {
 
 using namespace mute;
 
-template <class Element_, class TileShape_, int HeadRatio_, int QStages_, int KStages_, class... Options_>
+template <class Element_, class TileShape_, int HeadRatio_, class... Options_>
 struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   using Element            = Element_;
   using ElementAccumulator = float;
@@ -31,21 +31,45 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   static constexpr bool IsPagedKV = find_option_t<Tag::IsPagedKV, std::false_type, Options_...>::value;
   static constexpr bool IsCausal  = find_option_t<Tag::IsCausal, std::false_type, Options_...>::value;
   static constexpr int  HeadRatio = HeadRatio_;
-  static constexpr int  QStages   = QStages_;
-  static constexpr int  KStages   = KStages_;
+  static constexpr int  QStages   = 1;
+  static constexpr int  KStages   = 1;
 
   static constexpr int  TileQ              = get<0>(TileShape{});
   static constexpr int  TileKV             = get<1>(TileShape{});
   static constexpr int  HeadDim            = get<2>(TileShape{});
   static constexpr int  QTokensPerTile     = TileQ / HeadRatio;
   static constexpr int  SmemAlignmentBytes = 256;
-  static constexpr bool EnableKPrefetch    = TileQ > 16 && KStages == 1;
+  static constexpr bool EnableKPrefetch    = TileQ > 16;
+
+  static constexpr int MmaAlignment = 32 / sizeof_bits_v<Element>;
+  static constexpr int MmaTileQ     = 16;
+  using BuilderTileShape            = Shape<Int<MmaTileQ>, Int<TileKV>, Int<HeadDim>>;
+
+  using BuilderCollective =
+      typename mutlass::gemm::collective::CollectiveBuilder<mutlass::arch::Mp31,
+                                                            mutlass::arch::OpClassTensorOp,
+                                                            Element,
+                                                            mutlass::layout::RowMajor,
+                                                            MmaAlignment,
+                                                            Element,
+                                                            mutlass::layout::ColumnMajor,
+                                                            MmaAlignment,
+                                                            ElementAccumulator,
+                                                            BuilderTileShape,
+                                                            Shape<_1, _1, _1>,
+                                                            mutlass::gemm::collective::StageCount<2>,
+                                                            mutlass::gemm::KernelTmeWarpSpecialized>::CollectiveOp;
+
+  using BuilderTiledMma = typename BuilderCollective::TiledMma;
+  using BuilderMmaOp    = typename BuilderTiledMma::Atom::MMA_Op;
+  using AtomLayoutQK    = Layout<Shape<Int<TileQ / MmaTileQ>, _1, _1>>;
+  using TiledMmaQK      = decltype(make_tiled_mma(BuilderMmaOp{}, AtomLayoutQK{}));
 
   static constexpr int NumThreadsPerWarp      = mutlass::NumThreadsPerWarp;
   static constexpr int NumThreadsPerWarpSquad = mutlass::NumThreadsPerWarpSquad;
   static constexpr int WarpsPerWarpSquad      = mutlass::NumWarpsPerWarpSquad;
   static constexpr int NumProducerWarpSquads  = 1;
-  static constexpr int NumMmaWarpSquads       = TileQ == 16 ? 1 : 4;
+  static constexpr int NumMmaWarpSquads       = TileQ / MmaTileQ;
   static constexpr int NumProducerWarps       = NumProducerWarpSquads * WarpsPerWarpSquad;
   static constexpr int NumConsumerWarps       = NumMmaWarpSquads * WarpsPerWarpSquad;
   static constexpr int NumProducerThreads     = NumProducerWarps * NumThreadsPerWarp;
@@ -57,30 +81,18 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   static_assert(HeadRatio > 0);
   static_assert(TileQ > 0 && TileKV == 128 && HeadDim > 0);
   static_assert(TileQ % HeadRatio == 0);
+  static_assert(TileQ % MmaTileQ == 0);
   static_assert(TileQ % NumMmaWarpSquads == 0);
   static_assert(QStages > 0 && KStages > 0);
   static_assert(HeadDim % 8 == 0);
 
-  using AtomLayoutQK = Layout<Shape<Int<NumMmaWarpSquads>, _1, _1>>;
-  using TiledMmaQK   = decltype(mute::make_tiled_mma(mute::MP31::SQMMA::ss_op_selector<Element,
-                                                                                       Element,
-                                                                                       ElementAccumulator,
-                                                                                       TileShape,
-                                                                                       TCE::Major::K,
-                                                                                       TCE::Major::K,
-                                                                                       Int<TileQ / NumMmaWarpSquads>>(),
-                                                   AtomLayoutQK{}));
   static_assert(decltype(size(TiledMmaQK{}))::value == NumConsumerThreads);
 
-  using SmemAtomLayoutQ =
-      decltype(mutlass::gemm::collective::detail::
-                   ss_smem_selector_A<TCE::Major::K, Element, typename TiledMmaQK::Atom::MMA_Op, TileShape>());
-  using SmemAtomLayoutK =
-      decltype(mutlass::gemm::collective::detail::
-                   ss_smem_selector_B<TCE::Major::K, Element, typename TiledMmaQK::Atom::MMA_Op, TileShape>());
-  using SmemLayoutQ = decltype(tile_to_shape(SmemAtomLayoutQ{},
+  using SmemAtomLayoutQ = typename BuilderCollective::SmemLayoutAtomA;
+  using SmemAtomLayoutK = typename BuilderCollective::SmemLayoutAtomB;
+  using SmemLayoutQ     = decltype(tile_to_shape(SmemAtomLayoutQ{},
                                              make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<QStages>{})));
-  using SmemLayoutK = decltype(tile_to_shape(SmemAtomLayoutK{},
+  using SmemLayoutK     = decltype(tile_to_shape(SmemAtomLayoutK{},
                                              make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<KStages>{})));
 
   using QRowTile       = Layout<Shape<Int<HeadRatio>, Int<QTokensPerTile>>, Stride<_1, Int<HeadRatio>>>;

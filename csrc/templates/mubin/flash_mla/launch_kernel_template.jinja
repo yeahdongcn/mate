@@ -86,6 +86,138 @@ struct MLAAsmParams {
 
 }  // namespace mate::flash_mla::mubin
 
+{# Validate tensors shared by fixed and varlen specializations. #}
+{% macro emit_common_validation() %}
+  CHECK_MUSA(q_nope);
+  CHECK_MUSA(q_pe);
+  CHECK_MUSA(ckv);
+  CHECK_MUSA(kpe);
+  CHECK_MUSA(seqlens_k);
+  CHECK_MUSA(block_table);
+  CHECK_MUSA(tile_scheduler_metadata);
+  CHECK_MUSA(num_splits);
+  CHECK_MUSA(out);
+  CHECK_MUSA(out_lse);
+  CHECK_DEVICE(q_nope, q_pe);
+  CHECK_DEVICE(q_nope, ckv);
+  CHECK_DEVICE(q_nope, kpe);
+  CHECK_DEVICE(q_nope, seqlens_k);
+  CHECK_DEVICE(q_nope, block_table);
+  CHECK_DEVICE(q_nope, tile_scheduler_metadata);
+  CHECK_DEVICE(q_nope, num_splits);
+  CHECK_DEVICE(q_nope, out);
+  CHECK_DEVICE(q_nope, out_lse);
+
+  DLDataType data_type = q_nope.dtype();
+  TVM_FFI_ICHECK(dtype_equal(data_type, {{ "dl_float16" if asm_dtype == "half" else "dl_bfloat16" }}))
+      << "q_nope dtype must match the generated kernel";
+  TVM_FFI_ICHECK(dtype_equal(q_pe.dtype(), data_type) && dtype_equal(ckv.dtype(), data_type) &&
+                 dtype_equal(kpe.dtype(), data_type))
+      << "q_nope, q_pe, ckv, and kpe must have the same dtype";
+  TVM_FFI_ICHECK(dtype_equal(out.dtype(), data_type)) << "out must have the same dtype as q_nope";
+  TVM_FFI_ICHECK(dtype_equal(out_lse.dtype(), dl_float32)) << "out_lse must have dtype float32";
+  CHECK_INPUT_TYPE(tile_scheduler_metadata, dl_int32);
+  CHECK_INPUT_TYPE(num_splits, dl_int32);
+  CHECK_INPUT_TYPE(seqlens_k, dl_int32);
+  CHECK_INPUT_TYPE(block_table, dl_int32);
+
+  CHECK_DIM(1, seqlens_k);
+  CHECK_DIM(2, block_table);
+  CHECK_DIM(2, tile_scheduler_metadata);
+  CHECK_DIM(1, num_splits);
+  CHECK_CONTIGUOUS(tile_scheduler_metadata);
+  CHECK_CONTIGUOUS(num_splits);
+  CHECK_CONTIGUOUS(seqlens_k);
+  TVM_FFI_ICHECK_EQ(block_table.stride(-1), 1) << "block_table must have contiguous last dimension";
+  TVM_FFI_ICHECK_EQ(tile_scheduler_metadata.size(1), 8)
+      << "tile_scheduler_metadata has unexpected second dimension";
+{% endmacro %}
+
+{# Validate fixed-query shapes and output layouts. #}
+{% macro emit_fixed_validation() %}
+  static_cast<void>(cu_seqlens_q);
+  static_cast<void>(max_seqlen_q);
+  CHECK_DIM(4, q_nope);
+  CHECK_DIM(4, q_pe);
+  CHECK_DIM(4, out);
+  CHECK_DIM(3, out_lse);
+
+  auto batch    = q_nope.size(0);
+  auto seqlen_q = q_nope.size(1);
+  auto nr_heads = q_nope.size(2);
+  auto total_q  = batch * seqlen_q;
+  expect_shape(q_nope, {batch, seqlen_q, nr_heads, 512}, "q_nope");
+  expect_shape(q_pe, {batch, seqlen_q, nr_heads, 64}, "q_pe");
+  expect_shape(out, {batch, seqlen_q, nr_heads, 512}, "out");
+  expect_shape(out_lse, {batch, seqlen_q, nr_heads}, "out_lse");
+  TVM_FFI_ICHECK_EQ(out.stride(1), out.size(-2) * out.stride(2))
+      << "out sequence layout is not representable";
+  TVM_FFI_ICHECK_EQ(out_lse.stride(1), out_lse.size(-1) * out_lse.stride(2))
+      << "out_lse sequence layout is not representable";
+{% endmacro %}
+
+{# Validate varlen-query metadata, shapes, and output layouts. #}
+{% macro emit_varlen_validation() %}
+  CHECK_HAS_VALUE_WITH_MSG(cu_seqlens_q, "cu_seqlens_q must be provided for varlen FlashMLA");
+  CHECK_HAS_VALUE_WITH_MSG(max_seqlen_q, "max_seqlen_q must be provided when cu_seqlens_q is set");
+  auto input_cu_q = cu_seqlens_q.value();
+  CHECK_MUSA(input_cu_q);
+  CHECK_DEVICE(q_nope, input_cu_q);
+  CHECK_CONTIGUOUS(input_cu_q);
+  CHECK_INPUT_TYPE(input_cu_q, dl_int32);
+  CHECK_DIM(3, q_nope);
+  CHECK_DIM(3, q_pe);
+  CHECK_DIM(3, out);
+  CHECK_DIM(2, out_lse);
+
+  auto batch    = input_cu_q.size(0) - 1;
+  auto seqlen_q = max_seqlen_q.value();
+  auto total_q  = q_nope.size(0);
+  auto nr_heads = q_nope.size(1);
+  expect_shape(q_nope, {total_q, nr_heads, 512}, "q_nope");
+  expect_shape(q_pe, {total_q, nr_heads, 64}, "q_pe");
+  expect_shape(out, {total_q, nr_heads, 512}, "out");
+  expect_shape(out_lse, {nr_heads, total_q}, "out_lse");
+{% endmacro %}
+
+{# Validate paged-cache, batch metadata, and last-dimension layouts. #}
+{% macro emit_cache_and_metadata_validation() %}
+  TVM_FFI_ICHECK(ckv.ndim() == 3 || ckv.ndim() == 4) << "ckv must be 3D or 4D";
+  auto nr_block        = ckv.size(0);
+  auto page_block_size = ckv.size(1);
+  TVM_FFI_ICHECK_EQ(page_block_size, 64) << "page block size must be 64";
+  if (ckv.ndim() == 4) {
+    expect_shape(ckv, {nr_block, page_block_size, 1, 512}, "ckv");
+    expect_shape(kpe, {nr_block, page_block_size, 1, 64}, "kpe");
+    TVM_FFI_ICHECK_EQ(ckv.stride(-3) % 576, 0) << "ckv/kpe head strides must be multiples of 576";
+    TVM_FFI_ICHECK_EQ(kpe.stride(-3) % 576, 0) << "ckv/kpe head strides must be multiples of 576";
+  } else {
+    expect_shape(ckv, {nr_block, page_block_size, 512}, "ckv");
+    expect_shape(kpe, {nr_block, page_block_size, 64}, "kpe");
+    TVM_FFI_ICHECK_EQ(ckv.stride(-2) % 576, 0) << "ckv/kpe page strides must be multiples of 576";
+    TVM_FFI_ICHECK_EQ(kpe.stride(-2) % 576, 0) << "ckv/kpe page strides must be multiples of 576";
+  }
+  TVM_FFI_ICHECK_EQ(ckv.stride(0) % 576, 0) << "ckv/kpe block strides must be multiples of 576";
+  TVM_FFI_ICHECK_EQ(kpe.stride(0) % 576, 0) << "ckv/kpe block strides must be multiples of 576";
+
+  expect_shape(seqlens_k, {batch}, "seqlens_k");
+  expect_shape(block_table, {batch, block_table.size(1)}, "block_table");
+  expect_shape(num_splits, {batch + 1}, "num_splits");
+
+  TVM_FFI_ICHECK(q_nope.size(-1) <= 1 || q_nope.stride(-1) == 1)
+      << "q_nope must have contiguous last dimension";
+  TVM_FFI_ICHECK(q_pe.size(-1) <= 1 || q_pe.stride(-1) == 1)
+      << "q_pe must have contiguous last dimension";
+  TVM_FFI_ICHECK(ckv.size(-1) <= 1 || ckv.stride(-1) == 1)
+      << "ckv must have contiguous last dimension";
+  TVM_FFI_ICHECK(kpe.size(-1) <= 1 || kpe.stride(-1) == 1)
+      << "kpe must have contiguous last dimension";
+  TVM_FFI_ICHECK(out.size(-1) <= 1 || out.stride(-1) == 1)
+      << "out must have contiguous last dimension";
+  TVM_FFI_ICHECK(out_lse.size(-1) <= 1 || out_lse.stride(-1) == 1)
+      << "out_lse must have contiguous last dimension";
+{% endmacro %}
+
 void run_{{ func_name }}(const std::string&                 object_path,
                          ffi::TensorView                    q_nope,
                          ffi::TensorView                    q_pe,
@@ -100,6 +232,17 @@ void run_{{ func_name }}(const std::string&                 object_path,
                          double                             softmax_scale,
                          std::optional<ffi::TensorView>     cu_seqlens_q,
                          std::optional<int64_t>             max_seqlen_q) {
+
+{{ emit_common_validation() }}
+
+{% if spec.is_varlen_q %}
+{{ emit_varlen_validation() }}
+{% else %}
+{{ emit_fixed_validation() }}
+{% endif %}
+
+{{ emit_cache_and_metadata_validation() }}
+
   check_mp31(q_nope.device(), "run_{{ func_name }}");
   ffi::MUSADeviceGuard device_guard(q_nope.device().device_id);
 
@@ -111,25 +254,7 @@ void run_{{ func_name }}(const std::string&                 object_path,
 
   static_cast<void>(kpe);
 
-  DLDataType data_type       = q_nope.dtype();
-  auto       page_block_size = int64_t{64};
-  auto       nr_block        = ckv.size(0);
-{% if spec.is_varlen_q %}
-  auto       batch = cu_seqlens_q.value().size(0) - 1;
-  auto       seqlen_q = max_seqlen_q.value();
-{% else %}
-  static_cast<void>(cu_seqlens_q);
-  static_cast<void>(max_seqlen_q);
-  auto       batch = q_nope.size(0);
-  auto       seqlen_q = q_nope.size(1);
-{% endif %}
-  auto       nr_heads   = q_nope.size(-2);
-  auto       headdim_qk = int64_t{576};
-{% if spec.is_varlen_q %}
-  auto       total_q = q_nope.size(0);
-{% else %}
-  auto       total_q = q_nope.size(0) * q_nope.size(1);
-{% endif %}
+  auto headdim_qk = int64_t{576};
   auto seqlen_kv   = page_block_size;
   auto nr_heads_kv = int64_t{1};
   auto headdim_v   = int64_t{headdim_latent};
@@ -454,7 +579,7 @@ void run_{{ func_name }}(const std::string&                 object_path,
   combine_params.batch_size           = static_cast<int>(batch);
   combine_params.num_mp_parts         = static_cast<int>(num_mp_parts);
 
-{% if spec.dtype == "half" %}
+{% if asm_dtype == "half" %}
   run_mla_combine_kernel<mutlass::half_t, {{ "true" if spec.is_varlen_q else "false" }}>(combine_params, get_stream(q_nope.device()));
 {% else %}
   run_mla_combine_kernel<mutlass::bfloat16_t, {{ "true" if spec.is_varlen_q else "false" }}>(combine_params, get_stream(q_nope.device()));

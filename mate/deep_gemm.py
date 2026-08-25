@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 from mate.api_logging import mate_api
 from mate.mate_runtime import (
     get_num_mps as get_num_mps,
@@ -7,16 +7,16 @@ from mate.mate_runtime import (
     set_num_mps as set_num_mps,
 )
 from mate.gemm import (
-    bmm_fp8,
+    bmm as mate_bmm,
     ragged_m_moe_gemm_16bit,
     masked_moe_gemm_16bit,
     ragged_k_moe_gemm_16bit,
     ragged_m_moe_gemm_8bit,
     masked_moe_gemm_8bit,
-    gemm_fp8_nt_groupwise,
     ragged_k_moe_gemm_8bit,
 )
 from mate.jit.gemm.deep_gemm.gemm import (
+    DEEP_GEMM_EPILOGUE_HEAD_SPLITS,
     GEMM_TYPE_NORMAL,
     get_deep_gemm_gemm_module,
 )
@@ -194,23 +194,22 @@ def bf16_gemm_nt(
     c: Optional[torch.Tensor] = None,
     compiled_dims: str = "nk",
     backend: str = "auto",
-):
-    assert c is None, "Not support GEMM with C"
-    if backend not in ("auto", "mutlass"):
-        raise ValueError(f"bf16_gemm_nt only supports mutlass backend, got {backend}")
+) -> torch.Tensor:
+    r"""Perform BF16 NT GEMM and write the result to ``d``.
 
-    dispatch_name, mod = get_deep_gemm_gemm_module(
-        kind="bf16",
-        gemm_type=GEMM_TYPE_NORMAL,
-        config_m=a.shape[0],
-    )
-    mod.get_function(dispatch_name)(
-        a,
-        b,
-        d,
-        None,
-        0,
-        resolve_num_mps(a.device),
+    This compatibility API computes ``d = a @ b.T`` or ``d = c + a @ b.T``
+    through :func:`mate.gemm.bmm`. ``compiled_dims`` is accepted for
+    DeepGEMM compatibility and is ignored.
+    """
+    _ = compiled_dims
+    mate_bmm(
+        a.unsqueeze(0),
+        b.unsqueeze(0),
+        d.unsqueeze(0),
+        c=c.unsqueeze(0) if c is not None else None,
+        trans_a=False,
+        trans_b=True,
+        backend=backend,
     )
     return d
 
@@ -224,28 +223,73 @@ def fp8_gemm_nt(
     compiled_dims: str = "nk",
     disable_ue8m0_cast: bool = True,
     backend: str = "auto",
-):
-    assert c is None, "Not support GEMM with C"
-    if not disable_ue8m0_cast:
-        raise Exception("fp8_gemm_nt UE8M0 cast is not supported!")
+) -> torch.Tensor:
+    r"""Perform scaled FP8 NT GEMM and write the result to ``d``.
 
-    if backend in ("auto", "mudnn"):
-        return gemm_fp8_nt_groupwise(
-            a[0],
-            b[0],
-            a[1],
-            b[1],
-            scale_granularity_mnk=recipe,
-            out=d,
-            backend=backend,
+    This compatibility API computes ``d = a @ b.T`` or ``d = c + a @ b.T``
+    through :func:`mate.gemm.bmm`. ``compiled_dims`` is accepted for
+    DeepGEMM compatibility and is ignored. UE8M0 scale casting is not
+    supported.
+    """
+    _ = compiled_dims
+    if not disable_ue8m0_cast:
+        raise ValueError("fp8_gemm_nt does not support UE8M0 casting")
+    if recipe is None:
+        recipe = (1, 128, 128)
+
+    mate_bmm(
+        a[0].unsqueeze(0),
+        b[0].unsqueeze(0),
+        d.unsqueeze(0),
+        scale_a=a[1].unsqueeze(0),
+        scale_b=b[1].unsqueeze(0),
+        c=c.unsqueeze(0) if c is not None else None,
+        trans_a=False,
+        trans_b=True,
+        recipe_a=(recipe[0], recipe[2]),
+        recipe_b=(recipe[1], recipe[2]),
+        backend=backend,
+    )
+    return d
+
+
+@mate_api
+def fp8_gemm_nt_skip_head_mid(
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    head_splits: Tuple[int, int, int],
+    recipe: Optional[Tuple[int, int, int]] = None,
+    compiled_dims: str = "nk",
+    disable_ue8m0_cast: bool = True,
+):
+    if not disable_ue8m0_cast:
+        raise Exception("fp8_gemm_nt_skip_head_mid UE8M0 cast is not supported!")
+    if len(head_splits) != 3:
+        raise ValueError(f"head_splits must have 3 elements, got {head_splits}")
+
+    left, mid, right = head_splits
+    if left <= 0 or mid < 0 or right <= 0:
+        raise ValueError(f"Invalid head_splits: {head_splits}")
+
+    compact_head_dim = left + right
+    if b[0].shape[0] % compact_head_dim != 0:
+        raise ValueError(
+            f"b.shape[0] must be divisible by left + right, got {b[0].shape[0]}"
         )
-    if backend != "mutlass":
-        raise ValueError(f"Unsupported fp8_gemm_nt backend: {backend}")
+
+    full_n = b[0].shape[0] // compact_head_dim * (left + mid + right)
+    if d.shape[0] != a[0].shape[0] or d.shape[1] != full_n:
+        raise ValueError(
+            f"d shape must be ({a[0].shape[0]}, {full_n}), got {tuple(d.shape)}"
+        )
 
     dispatch_name, mod = get_deep_gemm_gemm_module(
         kind="fp8",
         gemm_type=GEMM_TYPE_NORMAL,
         config_m=a[0].shape[0],
+        epilogue=DEEP_GEMM_EPILOGUE_HEAD_SPLITS,
+        head_splits=head_splits,
     )
     mod.get_function(dispatch_name)(
         a[0],
@@ -257,7 +301,6 @@ def fp8_gemm_nt(
         0,
         resolve_num_mps(a[0].device),
     )
-    return d
 
 
 def _validate_fp8_einsum_pair(
@@ -296,6 +339,8 @@ def fp8_einsum(
     recipe = (recipe_values[0], recipe_values[1], recipe_values[2])
     if recipe not in ((1, 128, 128), (1, 1, 128)):
         raise ValueError("fp8_einsum only supports recipe (1, 128, 128) or (1, 1, 128)")
+    recipe_a = (recipe[0], recipe[2])
+    recipe_b = (recipe[1], recipe[2])
 
     a_fp8, a_scale = _validate_fp8_einsum_pair("a", a)
     b_fp8, b_scale = _validate_fp8_einsum_pair("b", b)
@@ -315,17 +360,17 @@ def fp8_einsum(
         if heads != h_b or r_dim != r_b or tuple(d.shape) != (batch, heads, d_dim):
             raise ValueError("expected a[b,h,r], b[h,d,r] and d[b,h,d]")
         c_view = c.permute(1, 0, 2) if c is not None else None
-        bmm_fp8(
+        mate_bmm(
             a_fp8.permute(1, 0, 2),
             b_fp8,
-            a_scale.permute(1, 0, 2),
-            b_scale,
-            d.dtype,
-            out=d.permute(1, 0, 2),
-            scale_granularity_mnk=recipe,
+            d.permute(1, 0, 2),
+            scale_a=a_scale.permute(1, 0, 2),
+            scale_b=b_scale,
             c=c_view,
-            major_a_mode="K",
-            major_b_mode="K",
+            trans_a=False,
+            trans_b=True,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
         return None
 
@@ -337,17 +382,17 @@ def fp8_einsum(
         if heads != h_b or d_dim != d_b or tuple(d.shape) != (batch, heads, r_dim):
             raise ValueError("expected a[b,h,d], b[h,d,r] and d[b,h,r]")
         c_view = c.permute(1, 0, 2) if c is not None else None
-        bmm_fp8(
+        mate_bmm(
             a_fp8.permute(1, 0, 2),
             b_fp8,
-            a_scale.permute(1, 0, 2),
-            b_scale,
-            d.dtype,
-            out=d.permute(1, 0, 2),
-            scale_granularity_mnk=recipe,
+            d.permute(1, 0, 2),
+            scale_a=a_scale.permute(1, 0, 2),
+            scale_b=b_scale,
             c=c_view,
-            major_a_mode="K",
-            major_b_mode="N",
+            trans_a=False,
+            trans_b=False,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
         return None
 
@@ -358,17 +403,17 @@ def fp8_einsum(
         b_batch, h_b, r_dim = b_fp8.shape
         if batch != b_batch or heads != h_b or tuple(d.shape) != (heads, d_dim, r_dim):
             raise ValueError("expected a[b,h,d], b[b,h,r] and d[h,d,r]")
-        bmm_fp8(
+        mate_bmm(
             a_fp8.permute(1, 0, 2),
             b_fp8.permute(1, 0, 2),
-            a_scale.permute(1, 0, 2),
-            b_scale.permute(1, 0, 2),
-            d.dtype,
-            out=d,
-            scale_granularity_mnk=recipe,
+            d,
+            scale_a=a_scale.permute(1, 0, 2),
+            scale_b=b_scale.permute(1, 0, 2),
             c=c,
-            major_a_mode="M",
-            major_b_mode="N",
+            trans_a=True,
+            trans_b=False,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
         return None
 
@@ -503,7 +548,8 @@ def fp8_mqa_logits(
         FP8 query tensor with shape ``(seq_len, heads, head_dim)`` and dtype
         ``torch.float8_e4m3fn``.
     kv : tuple[torch.Tensor, torch.Tensor]
-        A tuple ``(kv_fp8, kv_scale)``:
+        A tuple ``(kv_fp8, kv_scale)`` containing:
+
         - ``kv_fp8``: FP8 KV tensor with shape ``(seq_len_kv, head_dim)`` and dtype
           ``torch.float8_e4m3fn``. (MQA uses a single KV head.)
         - ``kv_scale``: FP32 scale tensor with shape ``(seq_len_kv,)`` and dtype
@@ -526,10 +572,10 @@ def fp8_mqa_logits(
     Returns
     -------
     torch.Tensor
-        FP32 logits tensor with shape:
+        FP32 logits tensor with dtype ``torch.float32`` and shape:
+
         - ``(seq_len, seq_len_kv)`` if ``max_seqlen_k == 0``
         - ``(seq_len, max_seqlen_k)`` if ``max_seqlen_k > 0``
-        and dtype ``torch.float32``.
     """
     kv_fp8, kv_scale = kv
     if max_seqlen_k > 0 and clean_logits:

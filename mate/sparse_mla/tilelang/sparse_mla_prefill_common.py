@@ -32,9 +32,9 @@ SPARSE_PREFILL_COMPILE_FLAGS = [
     "-mllvm",
     "-mtgpu-tiny-offset-hint=1",
     "-mllvm",
-    "-misched-recompute-slotindex=1",
-    "-mllvm",
     "-mtgpu-combine-fop-instr=1",
+    "-mllvm",
+    "-mtgpu-load-store-2d=1",
 ]
 
 

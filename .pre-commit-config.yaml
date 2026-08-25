@@ -69,6 +69,14 @@ repos:
 
   - repo: local
     hooks:
+      - id: validate-agent-skills
+        name: validate-agent-skills
+        entry: python scripts/validate_skills.py
+        language: system
+        pass_filenames: false
+        files: (^|/)(AGENTS\.md|SKILL\.md|skills/.*|scripts/validate_skills\.py|tests/test_validate_skills\.py)$
+
+
       - id: check-api-docs
         name: check-api-docs
         entry: python scripts/check_api_docs.py

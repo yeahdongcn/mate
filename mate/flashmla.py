@@ -50,6 +50,49 @@ def _prepare_mla_query_input(
     return x
 
 
+def _dispatch_mla_metadata(
+    cache_seqlens: Optional[torch.Tensor],
+    num_q_tokens_per_head_k: int,
+    num_heads_k: int,
+    num_heads_q: Optional[int] = None,
+    is_fp8_kvcache: bool = False,
+    topk: Optional[int] = None,
+    extra_topk: Optional[int] = None,
+    q: Optional[torch.Tensor] = None,
+    bs: Optional[int] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    *,
+    tile_scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch MLA metadata into new or caller-owned output tensors."""
+    if (tile_scheduler_metadata is None) != (num_splits is None):
+        raise ValueError(
+            "tile_scheduler_metadata and num_splits must be provided together"
+        )
+
+    func = _get_module().get_function("get_mla_decoding_metadata")
+    raise_complete_if_dry_run()
+    return ffi_to_torch(
+        func(
+            cache_seqlens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+            num_heads_q,
+            is_fp8_kvcache,
+            topk,
+            tile_scheduler_metadata,
+            num_splits,
+            q,
+            bs,
+            topk_length,
+            extra_topk_length,
+            extra_topk,
+        )
+    )
+
+
 @mate_api
 def get_mla_metadata(
     cache_seqlens: Optional[torch.Tensor],
@@ -96,26 +139,18 @@ def get_mla_metadata(
         * tile_scheduler_metadata, shape ``(num_sm_parts, TileSchedulerMetaDataSize)``
         * num_splits, shape ``(batch_size + 1)``
     """
-    func = _get_module().get_function("get_mla_decoding_metadata")
-
-    raise_complete_if_dry_run()
-
-    return ffi_to_torch(
-        func(
-            cache_seqlens,
-            num_q_tokens_per_head_k,
-            num_heads_k,
-            num_heads_q,
-            is_fp8_kvcache,
-            topk,
-            None,
-            None,
-            q,
-            bs,
-            topk_length,
-            extra_topk_length,
-            extra_topk,
-        )
+    return _dispatch_mla_metadata(
+        cache_seqlens,
+        num_q_tokens_per_head_k,
+        num_heads_k,
+        num_heads_q,
+        is_fp8_kvcache,
+        topk,
+        extra_topk,
+        q,
+        bs,
+        topk_length,
+        extra_topk_length,
     )
 
 

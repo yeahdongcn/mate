@@ -714,7 +714,7 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
 
       // Softmax
       if constexpr (FirstRound) {
-        softmax.template step(acc_qk, tiled_mma_qk, softmax_state, tPcP, problem_size);
+        softmax.step(acc_qk, tiled_mma_qk, softmax_state, tPcP, problem_size);
       } else {
         softmax.template step<EnableFusion>(
             acc_qk, tiled_mma_qk, softmax_state, acc_pv_final, tiled_mma_pv, tPcP, problem_size);

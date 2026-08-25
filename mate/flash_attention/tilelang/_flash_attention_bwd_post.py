@@ -7,7 +7,6 @@ from ._flash_attention_bwd_common import (
     JIT_PASS_CONFIGS,
     T,
     tilelang,
-    tir,
 )
 
 
@@ -142,15 +141,15 @@ def singleton_k_dv_ws(
                         )
                     if valid:
                         if is_varlen:
-                            dv_accum[0] += tir.Cast(
-                                "float32", dO[begin_seq_q + q_local, bx, tid]
+                            dv_accum[0] += T.cast(
+                                dO[begin_seq_q + q_local, bx, tid], "float32"
                             )
                         else:
-                            dv_accum[0] += tir.Cast("float32", dO[by, q_local, bx, tid])
+                            dv_accum[0] += T.cast(dO[by, q_local, bx, tid], "float32")
                 if is_varlen:
-                    dV[begin_seq_kv, bx, tid] = tir.Cast(dtype, dv_accum[0])
+                    dV[begin_seq_kv, bx, tid] = T.cast(dv_accum[0], dtype)
                 else:
-                    dV[by, 0, bx, tid] = tir.Cast(dtype, dv_accum[0])
+                    dV[by, 0, bx, tid] = T.cast(dv_accum[0], dtype)
 
     return singleton_k_dv_kernel
 
@@ -362,9 +361,9 @@ def compute_delta_ws(
                     output_local[d_local] = q_elem(Output, q_idx, by, d_start + d_local)
                     do_local[d_local] = q_elem(dO, q_idx, by, d_start + d_local)
                 for d_local in range(values_per_lane):
-                    delta_local[0] += tir.Cast(
-                        "float32", output_local[d_local]
-                    ) * tir.Cast("float32", do_local[d_local])
+                    delta_local[0] += T.cast(output_local[d_local], "float32") * T.cast(
+                        do_local[d_local], "float32"
+                    )
             delta_local[0] += T.shfl_xor(delta_local[0], 16)
             delta_local[0] += T.shfl_xor(delta_local[0], 8)
             delta_local[0] += T.shfl_xor(delta_local[0], 4)

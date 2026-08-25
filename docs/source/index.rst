@@ -38,6 +38,7 @@ comprehensive logging, and environment inspection tools.
    FlashMLA Wrapper <wrappers/flash_mla_wrapper>
    MSA Wrapper <wrappers/fmha_sm100_wrapper>
    FlashKDA Wrapper <wrappers/flash_kda_wrapper>
+   FlashInfer Wrapper <wrappers/flashinfer_wrapper>
    DeepGEMM Wrapper <wrappers/deep_gemm_wrapper>
 
 .. toctree::
@@ -46,6 +47,7 @@ comprehensive logging, and environment inspection tools.
 
    Design and Architecture <design_and_architecture>
    Choosing Wrappers vs. Python APIs <choosing_wrappers_vs_python_apis>
+   Development Environment <development_environment>
 
 .. toctree::
    :maxdepth: 1
@@ -70,11 +72,15 @@ comprehensive logging, and environment inspection tools.
    :caption: API Reference
 
    Python APIs <api_reference>
+   FlashInfer Wrapper APIs <api/flashinfer>
+   FlashInfer FP8 MLA example <examples/fp8_mla_decode.py>
    Attention <api/attention>
+   Sparse MLA <api/sparse_mla>
    GEMM <api/gemm>
    Mega MoE <api/mega_moe>
    HyperConnection <api/hyperconnection>
    KDA <api/kda>
+   MSA <api/msa>
 
 .. toctree::
    :maxdepth: 1

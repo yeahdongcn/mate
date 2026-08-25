@@ -197,6 +197,194 @@ struct KVCacheSageAttentionParams {
 
 }  // namespace
 
+{# Validate tensors and layouts shared by dense and KV-cache specializations. #}
+{% macro emit_common_validation() %}
+  CHECK_MUSA(q);
+  CHECK_MUSA(out);
+  CHECK_MUSA(out_lse);
+  CHECK_MUSA(q_scale);
+  CHECK_MUSA(k_scale);
+  CHECK_MUSA(v_scale);
+  CHECK_DEVICE(q, out);
+  CHECK_DEVICE(q, out_lse);
+  CHECK_DEVICE(q, q_scale);
+  CHECK_DEVICE(q, k_scale);
+  CHECK_DEVICE(q, v_scale);
+
+  CHECK_DIM(4, q);
+  CHECK_DIM(4, out);
+  CHECK_DIM(3, out_lse);
+  CHECK_DIM(4, q_scale);
+  CHECK_DIM(4, k_scale);
+  CHECK_DIM(4, v_scale);
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(out_lse);
+  TVM_FFI_ICHECK(q.size(-1) <= 1 || q.stride(-1) == 1) << "q must have contiguous last dimension";
+  TVM_FFI_ICHECK(q_scale.size(-1) <= 1 || q_scale.stride(-1) == 1)
+      << "q_scale must have contiguous last dimension";
+  TVM_FFI_ICHECK(k_scale.size(-1) <= 1 || k_scale.stride(-1) == 1)
+      << "k_scale must have contiguous last dimension";
+  TVM_FFI_ICHECK(v_scale.size(-1) <= 1 || v_scale.stride(-1) == 1)
+      << "v_scale must have contiguous last dimension";
+  CHECK_INPUT_TYPE(q_scale, dl_float32);
+  CHECK_INPUT_TYPE(k_scale, dl_float32);
+  CHECK_INPUT_TYPE(v_scale, dl_float32);
+  CHECK_INPUT_TYPE(out_lse, dl_float32);
+
+{% if spec.is_qk_int8 %}
+  CHECK_INPUT_TYPE(q, dl_int8);
+{% else %}
+  CHECK_INPUT_TYPE(q, dl_float8_e4m3fn);
+{% endif %}
+{% if spec.fp8_output %}
+  CHECK_HAS_VALUE_WITH_MSG(out_scale, "out_scale must be provided for the generated FP8-output kernel");
+  auto output_scale = out_scale.value();
+  CHECK_MUSA(output_scale);
+  CHECK_DEVICE(q, output_scale);
+  CHECK_DIM(4, output_scale);
+  CHECK_INPUT_TYPE(output_scale, dl_float32);
+  CHECK_INPUT_TYPE(out, dl_float8_e4m3fn);
+{% else %}
+  TVM_FFI_ICHECK(!out_scale.has_value()) << "out_scale must not be provided for the generated non-FP8-output kernel";
+  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(out.dtype()))
+      << "out must be fp16 or bf16 when fp8_output is disabled";
+{% endif %}
+{% endmacro %}
+
+{# Validate dense Q/K/V relationships and mode-specific scale layouts. #}
+{% macro emit_dense_validation() %}
+  CHECK_MUSA(k);
+  CHECK_MUSA(v);
+  CHECK_DEVICE(q, k);
+  CHECK_DEVICE(q, v);
+  CHECK_DIM(4, k);
+  CHECK_DIM(4, v);
+  TVM_FFI_ICHECK(k.size(-1) <= 1 || k.stride(-1) == 1) << "k must have contiguous last dimension";
+  TVM_FFI_ICHECK(v.size(-1) <= 1 || v.stride(-1) == 1) << "v must have contiguous last dimension";
+{% if spec.is_qk_int8 %}
+  CHECK_INPUT_TYPE(k, dl_int8);
+{% else %}
+  CHECK_INPUT_TYPE(k, dl_float8_e4m3fn);
+{% endif %}
+  CHECK_INPUT_TYPE(v, dl_float8_e4m3fn);
+
+  auto batch       = q.size(0);
+  auto seqlen_q    = q.size(1);
+  auto nr_heads    = q.size(2);
+  auto headdim_qk  = q.size(3);
+  auto seqlen_kv   = k.size(1);
+  auto nr_heads_kv = k.size(2);
+  auto headdim_v   = v.size(3);
+  expect_shape(q, {batch, seqlen_q, nr_heads, headdim_qk}, "q");
+  expect_shape(k, {batch, seqlen_kv, nr_heads_kv, headdim_qk}, "k");
+  expect_shape(v, {batch, seqlen_kv, nr_heads_kv, headdim_v}, "v");
+  expect_shape(out, {batch, seqlen_q, nr_heads, headdim_v}, "out");
+  expect_shape(out_lse, {batch, nr_heads, seqlen_q}, "out_lse");
+{% if spec.fp8_output %}
+  expect_shape(output_scale, {batch, seqlen_q, nr_heads, 1}, "out_scale");
+{% endif %}
+  TVM_FFI_ICHECK_GT(nr_heads_kv, 0) << "num_heads_kv must be positive";
+  TVM_FFI_ICHECK_EQ(nr_heads % nr_heads_kv, 0) << "num_heads must be divisible by num_heads_kv";
+  TVM_FFI_ICHECK_GT(headdim_qk, 0) << "headdim_qk must be in range (0, 128]";
+  TVM_FFI_ICHECK_LE(headdim_qk, 128) << "headdim_qk must be in range (0, 128]";
+  TVM_FFI_ICHECK_GT(headdim_v, 0) << "headdim_v must be in range (0, 128]";
+  TVM_FFI_ICHECK_LE(headdim_v, 128) << "headdim_v must be in range (0, 128]";
+
+{% if spec.quant_mode == 0 %}
+  expect_shape(q_scale, {1, 1, 1, 1}, "q_scale");
+  expect_shape(k_scale, {1, 1, 1, 1}, "k_scale");
+  expect_shape(v_scale, {1, 1, 1, 1}, "v_scale");
+{% else %}
+  auto q_seq_scale_num = mutlass::ceil_div(seqlen_q, int64_t{128});
+  auto k_seq_scale_num = mutlass::ceil_div(seqlen_kv, int64_t{128});
+{% if spec.quant_mode == 6 %}
+  k_seq_scale_num = k_seq_scale_num * 128 / 16;
+{% endif %}
+  expect_shape(q_scale, {batch, q_seq_scale_num, nr_heads, 1}, "q_scale");
+  expect_shape(k_scale, {batch, k_seq_scale_num, nr_heads_kv, 1}, "k_scale");
+{% if spec.quant_mode == 7 %}
+  auto v_seq_scale_num = mutlass::ceil_div(seqlen_kv, int64_t{128});
+  expect_shape(v_scale, {batch, v_seq_scale_num, nr_heads_kv, 1}, "v_scale");
+{% else %}
+  expect_shape(v_scale, {batch, 1, nr_heads_kv, headdim_v}, "v_scale");
+{% endif %}
+{% endif %}
+  auto head_group = static_cast<int>(nr_heads / nr_heads_kv);
+{% endmacro %}
+
+{# Validate paged KV-cache metadata and mode-specific scale layouts. #}
+{% macro emit_kv_cache_validation() %}
+  CHECK_MUSA(k_cache);
+  CHECK_MUSA(v_cache);
+  CHECK_MUSA(page_table);
+  CHECK_MUSA(cache_seqlens);
+  CHECK_DEVICE(q, k_cache);
+  CHECK_DEVICE(q, v_cache);
+  CHECK_DEVICE(q, page_table);
+  CHECK_DEVICE(q, cache_seqlens);
+  CHECK_DIM(4, k_cache);
+  CHECK_DIM(4, v_cache);
+  CHECK_DIM(2, page_table);
+  CHECK_DIM(1, cache_seqlens);
+  CHECK_CONTIGUOUS(page_table);
+  CHECK_CONTIGUOUS(cache_seqlens);
+  TVM_FFI_ICHECK(k_cache.size(-1) <= 1 || k_cache.stride(-1) == 1)
+      << "k_cache must have contiguous last dimension";
+  TVM_FFI_ICHECK(v_cache.size(-1) <= 1 || v_cache.stride(-1) == 1)
+      << "v_cache must have contiguous last dimension";
+{% if spec.is_qk_int8 %}
+  CHECK_INPUT_TYPE(k_cache, dl_int8);
+{% else %}
+  CHECK_INPUT_TYPE(k_cache, dl_float8_e4m3fn);
+{% endif %}
+  CHECK_INPUT_TYPE(v_cache, dl_float8_e4m3fn);
+  CHECK_INPUT_TYPE(page_table, dl_int32);
+  CHECK_INPUT_TYPE(cache_seqlens, dl_int32);
+
+  auto batch           = q.size(0);
+  auto seqlen_q        = q.size(1);
+  auto nr_heads        = q.size(2);
+  auto headdim_qk      = q.size(3);
+  auto num_blocks      = k_cache.size(0);
+  auto page_block_size = k_cache.size(1);
+  auto nr_heads_kv     = k_cache.size(2);
+  auto headdim_v       = v_cache.size(3);
+  expect_shape(q, {batch, seqlen_q, nr_heads, headdim_qk}, "q");
+  expect_shape(k_cache, {num_blocks, page_block_size, nr_heads_kv, headdim_qk}, "k_cache");
+  expect_shape(v_cache, {num_blocks, page_block_size, nr_heads_kv, headdim_v}, "v_cache");
+  expect_shape(out, {batch, seqlen_q, nr_heads, headdim_v}, "out");
+  expect_shape(out_lse, {batch, nr_heads, seqlen_q}, "out_lse");
+  expect_shape(page_table, {batch, page_table.size(1)}, "page_table");
+  expect_shape(cache_seqlens, {batch}, "cache_seqlens");
+{% if spec.fp8_output %}
+  expect_shape(output_scale, {batch, seqlen_q, nr_heads, 1}, "out_scale");
+{% endif %}
+  TVM_FFI_ICHECK_GT(nr_heads_kv, 0) << "num_heads_kv must be positive";
+  TVM_FFI_ICHECK_EQ(nr_heads % nr_heads_kv, 0) << "num_heads must be divisible by num_heads_kv";
+  TVM_FFI_ICHECK_GT(headdim_qk, 0) << "headdim_qk must be in range (0, 128]";
+  TVM_FFI_ICHECK_LE(headdim_qk, 128) << "headdim_qk must be in range (0, 128]";
+  TVM_FFI_ICHECK_GT(headdim_v, 0) << "headdim_v must be in range (0, 128]";
+  TVM_FFI_ICHECK_LE(headdim_v, 128) << "headdim_v must be in range (0, 128]";
+  TVM_FFI_ICHECK(page_block_size == 64 || page_block_size == 128)
+      << "page_block_size must be 64 or 128";
+
+{% if spec.quant_mode == 0 %}
+  expect_shape(q_scale, {1, 1, 1, 1}, "q_scale");
+  expect_shape(k_scale, {1, 1, 1, 1}, "k_scale");
+  expect_shape(v_scale, {1, 1, 1, 1}, "v_scale");
+{% else %}
+  auto q_seq_scale_num   = mutlass::ceil_div(seqlen_q, int64_t{128});
+  auto k_scale_per_block = mutlass::ceil_div(page_block_size, int64_t{128});
+{% if spec.quant_mode == 6 %}
+  k_scale_per_block = mutlass::ceil_div(page_block_size, int64_t{16});
+{% endif %}
+  expect_shape(q_scale, {batch, q_seq_scale_num, nr_heads, 1}, "q_scale");
+  expect_shape(k_scale, {num_blocks, k_scale_per_block, nr_heads_kv, 1}, "k_scale");
+  expect_shape(v_scale, {num_blocks, 1, nr_heads_kv, headdim_v}, "v_scale");
+{% endif %}
+  auto head_group = static_cast<int>(nr_heads / nr_heads_kv);
+{% endmacro %}
+
 {% if spec.is_kv_cache %}
 void run_{{ func_name }}(const std::string&       object_path,
                          ffi::TensorView                out,
@@ -221,9 +409,16 @@ void run_{{ func_name }}(const std::string&       object_path,
                          ffi::TensorView                v,
                          ffi::TensorView                q_scale,
                          ffi::TensorView                k_scale,
-                         ffi::TensorView                v_scale,
-                         double                         softmax_scale) {
+                          ffi::TensorView                v_scale,
+                          double                         softmax_scale) {
 {% endif %}
+{{ emit_common_validation() }}
+{% if spec.is_kv_cache %}
+{{ emit_kv_cache_validation() }}
+{% else %}
+{{ emit_dense_validation() }}
+{% endif %}
+
   check_mp31(q.device(), "run_{{ func_name }}");
 
   constexpr int nr_thr    = 512;
@@ -235,7 +430,6 @@ void run_{{ func_name }}(const std::string&       object_path,
   constexpr bool fp8_output = {{ "true" if spec.fp8_output else "false" }};
   constexpr int quant_mode = {{ spec.quant_mode }};
 
-  TVM_FFI_ICHECK_EQ(out_scale.has_value(), fp8_output) << "SageAttention mubin fp8_output mode mismatch";
   ffi::MUSADeviceGuard device_guard(q.device().device_id);
   musaStream_t stream = get_stream(q.device());
 
@@ -253,16 +447,6 @@ void run_{{ func_name }}(const std::string&       object_path,
   const double log2e = std::log2(std::exp(1.0));
 
 {% if spec.is_kv_cache %}
-  auto batch = q.size(0);
-  auto seqlen_q = q.size(1);
-  auto nr_heads = q.size(2);
-  auto headdim_qk = q.size(3);
-  auto num_blocks = k_cache.size(0);
-  auto page_block_size = k_cache.size(1);
-  auto nr_heads_kv = k_cache.size(2);
-  auto headdim_v = v_cache.size(3);
-  auto head_group = static_cast<int>(nr_heads / nr_heads_kv);
-
   TmeDesc tensor_desc_q(mute::make_tuple(headdim_qk, nr_heads, seqlen_q, batch),
                         mute::make_tuple(q.stride(2), q.stride(1), q.stride(0)),
                         q.data_ptr(),
@@ -462,15 +646,6 @@ void run_{{ func_name }}(const std::string&       object_path,
                            &params.tile_out_dim2,
                            &params.tile_out_dim3};
 {% else %}
-  auto batch = q.size(0);
-  auto seqlen_q = q.size(1);
-  auto nr_heads = q.size(2);
-  auto headdim_qk = q.size(3);
-  auto seqlen_kv = k.size(1);
-  auto nr_heads_kv = k.size(2);
-  auto headdim_v = v.size(3);
-  auto head_group = static_cast<int>(nr_heads / nr_heads_kv);
-
   TmeDesc tensor_desc_q(mute::make_tuple(headdim_qk, seqlen_q, nr_heads, batch),
                         mute::make_tuple(q.stride(1), q.stride(2), q.stride(0)),
                         q.data_ptr(),

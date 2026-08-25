@@ -42,6 +42,10 @@ Wrapper support at a glance
 
 Select a wrapper package to open its documentation page.
 
+All wrapper packages in the table below are available from the MUSA Python
+wheel source. Install the package that matches the import surface expected by
+your framework.
+
 MSA (MiniMax Sparse Attention) workloads map to the ``fmha_sm100`` wrapper.
 Use it when your project already targets the ``fmha_sm100`` package surface
 and you want the same import path on MUSA.
@@ -77,6 +81,10 @@ want the same import path on MUSA.
      - ``flash_kda``
      - FlashKDA / KDA style APIs
      - KDA forward, workspace-size compatibility helper
+   * - :doc:`flashinfer-python <wrappers/flashinfer_wrapper>`
+     - ``flashinfer``
+     - FlashInfer style APIs
+     - BF16/FP8 GEMM, FP8 MLA RoPE quantization, and sparse decode
    * - :doc:`deep-gemm <wrappers/deep_gemm_wrapper>`
      - ``deep_gemm``
      - DeepGEMM style APIs

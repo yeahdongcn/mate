@@ -1,8 +1,5 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
-
-import torch
 
 from ..common import Arch
 
@@ -41,63 +38,6 @@ class MxScaleMode(Enum):
     E8M0 = 1
     E4M3 = 2
     FP4_E8M0 = 3
-
-
-@dataclass
-class MoeGemmArgs:
-    type_a: torch.dtype
-    type_b: torch.dtype
-    type_d: torch.dtype
-
-    m: int
-    n: int
-    k: int
-    num_expert: int
-    batch: int = 1
-
-    type_scale_a: torch.dtype = torch.float32
-    type_scale_b: torch.dtype = torch.float32
-    b_pack_bits: int = 8
-    mx_scale: MxScaleMode = MxScaleMode.NONE
-    n_split: bool = False
-
-    quant_tile: int = 128
-    alignment_m: int = 0
-    expected_m: int = 0
-    total_mp_count: int = 0
-    target_mp_count: int = 0
-
-    stride_m_a: int = 0
-    stride_k_a: int = 1
-    stride_batch_a: int = 0
-    stride_n_b: int = 0
-    stride_k_b: int = 1
-    stride_batch_b: int = 0
-    stride_m_out: int = 0
-    stride_batch_out: int = 0
-
-    major_a: TensorMajor = TensorMajor.K
-    major_b: TensorMajor = TensorMajor.K
-    quant_mode_a: TensorQuantMode = TensorQuantMode.GROUP
-    quant_mode_b: TensorQuantMode = TensorQuantMode.BLOCK
-    major_scale_a: TensorMajor = TensorMajor.K
-    major_scale_b: TensorMajor = TensorMajor.K
-
-    scale_a_m: int = 0
-    scale_a_k: int = 0
-    scale_a_nr_elem: int = 0
-    scale_b_n: int = 0
-    scale_b_k: int = 0
-    scale_b_nr_elem: int = 0
-
-    p_a: Optional[torch.Tensor] = None
-    p_b: Optional[torch.Tensor] = None
-    p_d: Optional[torch.Tensor] = None
-    p_scale_a: Optional[torch.Tensor] = None
-    p_scale_b: Optional[torch.Tensor] = None
-    p_scale_out: Optional[torch.Tensor] = None
-    p_m_indices: Optional[torch.Tensor] = None
-    p_signal: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)

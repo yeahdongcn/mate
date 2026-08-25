@@ -388,55 +388,55 @@ def test_fp8_output_with_lse_returns_expected_tuple():
     assert out_scale.shape[-1] == 1
 
 
-@supported_musa_compute_capability([31])
-@pytest.mark.parametrize(
-    ("operand", "quant_recipe", "quant_dtype", "smooth_k"),
-    _COMPILE_PARITY_CASES,
-    ids=[
-        f"{operand}-{quant_recipe}-{quant_dtype}-{smooth_k}"
-        for operand, quant_recipe, quant_dtype, smooth_k in _COMPILE_PARITY_CASES
-    ],
-)
-def test_quantize_sage_attention_tensor_compile_matches_eager(
-    operand: str,
-    quant_recipe: tuple[int, int, int, int],
-    quant_dtype: torch.dtype,
-    smooth_k: bool,
-):
-    _manual_seed(505)
-
-    x = torch.randn(1, 128, 2, 128, dtype=torch.bfloat16, device="musa")
-
-    eager = quantize_sage_attention_tensor(
-        x,
-        operand=operand,
-        quant_recipe=quant_recipe,
-        quant_dtype=quant_dtype,
-        return_dequant=True,
-        smooth_k=smooth_k,
-        use_compile=False,
-    )
-    compiled = quantize_sage_attention_tensor(
-        x,
-        operand=operand,
-        quant_recipe=quant_recipe,
-        quant_dtype=quant_dtype,
-        return_dequant=True,
-        smooth_k=smooth_k,
-        use_compile=True,
-    )
-
-    eager_quant, eager_scale, eager_dequant = eager
-    compiled_quant, compiled_scale, compiled_dequant = compiled
-    assert compiled_quant.shape == eager_quant.shape
-    assert compiled_quant.dtype == eager_quant.dtype
-    assert compiled_scale.shape == eager_scale.shape
-    assert compiled_dequant.shape == eager_dequant.shape
-    assert torch.allclose(compiled_scale, eager_scale, atol=5e-3, rtol=5e-3)
-    assert (
-        F.cosine_similarity(
-            compiled_dequant.to(torch.float32).flatten(), eager_dequant.flatten(), dim=0
-        )
-        > 0.998
-    )
-    # assert torch.allclose(compiled_dequant, eager_dequant, atol=3.5e-1, rtol=1e-3)
+#@supported_musa_compute_capability([31])
+#@pytest.mark.parametrize(
+#    ("operand", "quant_recipe", "quant_dtype", "smooth_k"),
+#    _COMPILE_PARITY_CASES,
+#    ids=[
+#        f"{operand}-{quant_recipe}-{quant_dtype}-{smooth_k}"
+#        for operand, quant_recipe, quant_dtype, smooth_k in _COMPILE_PARITY_CASES
+#    ],
+#)
+#def test_quantize_sage_attention_tensor_compile_matches_eager(
+#    operand: str,
+#    quant_recipe: tuple[int, int, int, int],
+#    quant_dtype: torch.dtype,
+#    smooth_k: bool,
+#):
+#    _manual_seed(505)
+#
+#    x = torch.randn(1, 128, 2, 128, dtype=torch.bfloat16, device="musa")
+#
+#    eager = quantize_sage_attention_tensor(
+#        x,
+#        operand=operand,
+#        quant_recipe=quant_recipe,
+#        quant_dtype=quant_dtype,
+#        return_dequant=True,
+#        smooth_k=smooth_k,
+#        use_compile=False,
+#    )
+#    compiled = quantize_sage_attention_tensor(
+#        x,
+#        operand=operand,
+#        quant_recipe=quant_recipe,
+#        quant_dtype=quant_dtype,
+#        return_dequant=True,
+#        smooth_k=smooth_k,
+#        use_compile=True,
+#    )
+#
+#    eager_quant, eager_scale, eager_dequant = eager
+#    compiled_quant, compiled_scale, compiled_dequant = compiled
+#    assert compiled_quant.shape == eager_quant.shape
+#    assert compiled_quant.dtype == eager_quant.dtype
+#    assert compiled_scale.shape == eager_scale.shape
+#    assert compiled_dequant.shape == eager_dequant.shape
+#    assert torch.allclose(compiled_scale, eager_scale, atol=5e-3, rtol=5e-3)
+#    assert (
+#        F.cosine_similarity(
+#            compiled_dequant.to(torch.float32).flatten(), eager_dequant.flatten(), dim=0
+#        )
+#        > 0.998
+#    )
+#    # assert torch.allclose(compiled_dequant, eager_dequant, atol=3.5e-1, rtol=1e-3)

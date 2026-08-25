@@ -130,15 +130,15 @@ def flashattn_bwd_ws_unsplit_dq(
 
     def q_block(tensor, batch_idx, q_start, begin_seq, head):
         if is_varlen:
-            return tensor[q_start : q_start + block_M, head, :]
+            return tensor[q_start : q_start + block_M, head, 0:dim]
         local_q_start = q_start - begin_seq
-        return tensor[batch_idx, local_q_start : local_q_start + block_M, head, :]
+        return tensor[batch_idx, local_q_start : local_q_start + block_M, head, 0:dim]
 
     def kv_block(tensor, batch_idx, kv_start, begin_seq, head):
         if is_varlen:
-            return tensor[kv_start : kv_start + block_N, head, :]
+            return tensor[kv_start : kv_start + block_N, head, 0:dim]
         local_kv_start = kv_start - begin_seq
-        return tensor[batch_idx, local_kv_start : local_kv_start + block_N, head, :]
+        return tensor[batch_idx, local_kv_start : local_kv_start + block_N, head, 0:dim]
 
     def kv_elem(tensor, batch_idx, kv_idx, begin_seq, head, dim_idx):
         if is_varlen:
@@ -200,6 +200,9 @@ def flashattn_bwd_ws_unsplit_dq(
             T.assume(do_stride_h % 8 == 0)
             T.assume(dq_stride_s % 8 == 0)
             T.assume(dq_stride_h % 8 == 0)
+            if has_softcap:
+                softcap_scale = T.alloc_var(T.float32)
+                softcap_scale = smscale / softcap
             if not is_varlen:
                 T.assume(q_stride_b % 8 == 0)
                 T.assume(k_stride_b % 8 == 0)
@@ -284,8 +287,20 @@ def flashattn_bwd_ws_unsplit_dq(
             causal_kv_local_end = T.alloc_var(T.int32)
             kv_loop_start = begin_seq_kv
             kv_loop_end = end_seq_kv
-            if is_causal:
+            if has_window_left:
+                kv_local_start = T.alloc_var(T.int32)
+                kv_local_start = bx * block_M + causal_offset - window_size_left
+                kv_local_start = T.if_then_else(kv_local_start > 0, kv_local_start, 0)
+                kv_local_start = T.if_then_else(
+                    kv_local_start < local_seq_kv, kv_local_start, local_seq_kv
+                )
+                kv_loop_start = (
+                    begin_seq_kv + T.floordiv(kv_local_start, block_N) * block_N
+                )
+            if is_causal or has_window_right:
                 causal_kv_local_end = (bx + 1) * block_M + causal_offset
+                if has_window_right:
+                    causal_kv_local_end = causal_kv_local_end + window_size_right
                 causal_kv_local_end = T.if_then_else(
                     causal_kv_local_end > 0, causal_kv_local_end, 0
                 )
@@ -305,14 +320,14 @@ def flashattn_bwd_ws_unsplit_dq(
             if tid < producer_threads:
                 phase_producer = T.alloc_var(T.int32)
                 phase_producer = 0
-                T.copy(
+                T.tma_copy(
                     q_block(Q, bz, block_q_start, begin_seq_q, by),
                     Qa_shared_0,
                     barrier=bar_q_ready,
                 )
                 T.barrier_arrive(bar_q_ready)
 
-                T.copy(
+                T.tma_copy(
                     q_block(dO, bz, block_q_start, begin_seq_q, by),
                     dOa_shared_0,
                     barrier=bar_do_ready,
@@ -323,7 +338,7 @@ def flashattn_bwd_ws_unsplit_dq(
                     T.barrier_arrive(bar_producer_protect)
 
                     T.barrier_wait(bar_kt0_free, phase_producer ^ 1)
-                    T.copy(
+                    T.tma_copy(
                         kv_block(K, bz, kv_start, begin_seq_kv, kv_group),
                         Kt_shared_0,
                         barrier=bar_kt0_ready,
@@ -331,7 +346,7 @@ def flashattn_bwd_ws_unsplit_dq(
                     T.barrier_arrive(bar_kt0_ready)
 
                     T.barrier_wait(bar_vt0_free, phase_producer ^ 1)
-                    T.copy(
+                    T.tma_copy(
                         kv_block(V, bz, kv_start, begin_seq_kv, kv_group),
                         Vt_shared_0,
                         barrier=bar_vt0_ready,

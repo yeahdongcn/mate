@@ -170,20 +170,18 @@ enum class TensorQuantMode {
   GROUP,
 };  // enum class TensorQuantMode
 
-enum class MatMulScalingMode {
-
-  // TODO: replace by TensorQuantMode
-
-  // Mat A + Mat B
-  // for example
-  // GROUP_BLOCK means Mat A is per group scaling and Mat B is per block scaling
-
-  TENSOR_TENSOR,
-  CHANNEL_TENSOR,
-  CHANNEL_CHANNEL,
-  GROUP_BLOCK,
-
-};  // struct MatMulScalingMode
+inline TensorQuantMode get_tensor_quant_mode(int granularity_mn, int granularity_k) {
+  if (granularity_mn == -1 && granularity_k == -1) {
+    return TensorQuantMode::TENSOR;
+  }
+  if (granularity_mn == 1 && granularity_k == -1) {
+    return TensorQuantMode::CHANNEL;
+  }
+  if (granularity_mn == 1 || granularity_k == -1) {
+    return TensorQuantMode::GROUP;
+  }
+  return TensorQuantMode::BLOCK;
+}
 
 template <class T>
 auto get_fast_div_mod(T val) {

@@ -146,51 +146,172 @@ struct VarlenFlashAttentionParams {
 
 }  // namespace
 
-void run_{{ func_name }}(const std::string&                 object_path,
-                               ffi::TensorView                    q,
-                               ffi::TensorView                    k,
-                               ffi::TensorView                    v,
-                               double                             softmax_scale,
-                               ffi::TensorView                    out,
-                               ffi::TensorView                    out_lse,
-                               std::optional<ffi::TensorView>     input_cu_seqlen_q,
-                               std::optional<ffi::TensorView>     input_cu_seqlen_k,
-                               std::optional<int64_t>             max_seqlen_q,
-                               std::optional<int64_t>             max_seqlen_kv) {
-  check_mp31(q.device(), "run_{{ func_name }}");
-
-  constexpr int nr_thr    = 512;
-  constexpr int tile_m    = 256;
-{% if spec.headdim_qk == 128 %}
-  constexpr int tile_n    = 128;
-{% else %}
-  constexpr int tile_n    = 64;
-{% endif %}
-  constexpr int tile_k    = 64;
-  constexpr int tile_hdim = 128;
-
-  ffi::MUSADeviceGuard device_guard(q.device().device_id);
-  musaStream_t stream = get_stream(q.device());
-  musaDeviceProp dprops{};
-  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, q.device().device_id));
-  const int num_mp = dprops.multiProcessorCount;
-  DLDataType data_type = q.dtype();
-
-  static MUmodule asm_module = [&object_path]() {
-    MUmodule module;
-    MATE_MUSA_DRIVER_CHECK(muModuleLoad(&module, object_path.c_str()));
-    return module;
-  }();
-  static MUfunction asm_func = []() {
-    MUfunction func;
-    MATE_MUSA_DRIVER_CHECK(muModuleGetFunction(&func, asm_module, "{{ func_name }}"));
-    return func;
-  }();
-
-{% if spec.is_varlen %}
-  static_cast<void>(num_mp);
+{# Validate varlen inputs and derive launch metadata. #}
+{% macro emit_varlen_validation() %}
+  CHECK_HAS_VALUE_WITH_MSG(input_cu_seqlen_q, "input_cu_seqlen_q must be provided for varlen flash attention");
+  CHECK_HAS_VALUE_WITH_MSG(input_cu_seqlen_k, "input_cu_seqlen_k must be provided for varlen flash attention");
+  CHECK_HAS_VALUE_WITH_MSG(max_seqlen_q, "max_seqlen_q must be provided for varlen flash attention");
+  CHECK_HAS_VALUE_WITH_MSG(max_seqlen_kv, "max_seqlen_kv must be provided for varlen flash attention");
   auto input_cu_q = input_cu_seqlen_q.value();
   auto input_cu_k = input_cu_seqlen_k.value();
+  CHECK_MUSA(input_cu_q);
+  CHECK_MUSA(input_cu_k);
+  CHECK_DEVICE(q, input_cu_q);
+  CHECK_DEVICE(q, input_cu_k);
+  CHECK_DIM(3, q);
+  CHECK_DIM(3, k);
+  CHECK_DIM(3, v);
+  CHECK_DIM(3, out);
+  CHECK_DIM(2, out_lse);
+  CHECK_DIM(1, input_cu_q);
+  CHECK_DIM(1, input_cu_k);
+  CHECK_CONTIGUOUS(input_cu_q);
+  CHECK_CONTIGUOUS(input_cu_k);
+  TVM_FFI_ICHECK(dtype_equal(input_cu_q.dtype(), dl_int32)) << "input_cu_seqlen_q must be int32";
+  TVM_FFI_ICHECK(dtype_equal(input_cu_k.dtype(), dl_int32)) << "input_cu_seqlen_k must be int32";
+  TVM_FFI_ICHECK_EQ(input_cu_k.size(0), input_cu_q.size(0))
+      << "input_cu_seqlen_q and input_cu_seqlen_k must have the same size";
+  TVM_FFI_ICHECK_GT(input_cu_k.size(0), 1) << "input_cu_seqlen_k must describe at least one batch";
+  TVM_FFI_ICHECK_GT(max_seqlen_q.value(), 0) << "max_seqlen_q must be positive";
+  TVM_FFI_ICHECK_GT(max_seqlen_kv.value(), 0) << "max_seqlen_kv must be positive";
+
+  {
+    auto total_seqlen_q = q.size(0);
+    auto nr_heads = q.size(1);
+    auto headdim_qk = q.size(2);
+    auto total_seqlen_kv = k.size(0);
+    auto nr_heads_kv = k.size(1);
+    auto headdim_v = v.size(2);
+    TVM_FFI_ICHECK_GT(total_seqlen_q, 0) << "total_seqlen_q must be positive";
+    TVM_FFI_ICHECK_GT(total_seqlen_kv, 0) << "total_seqlen_kv must be positive";
+    TVM_FFI_ICHECK_GT(headdim_qk, 0) << "headdim_qk must be positive";
+    TVM_FFI_ICHECK_GT(headdim_v, 0) << "headdim_v must be positive";
+    expect_shape(k, {total_seqlen_kv, nr_heads_kv, headdim_qk}, "k");
+    expect_shape(v, {total_seqlen_kv, nr_heads_kv, headdim_v}, "v");
+    expect_shape(out, {total_seqlen_q, nr_heads, headdim_v}, "out");
+    expect_shape(out_lse, {nr_heads, total_seqlen_q}, "out_lse");
+    TVM_FFI_ICHECK_GT(nr_heads_kv, 0) << "nr_heads_kv must be positive";
+    TVM_FFI_ICHECK_GE(nr_heads, nr_heads_kv) << "nr_heads must be >= nr_heads_kv";
+    TVM_FFI_ICHECK_EQ(nr_heads % nr_heads_kv, 0) << "nr_heads must be divisible by nr_heads_kv";
+{% if spec.headdim_qk == 128 %}
+    TVM_FFI_ICHECK_EQ(headdim_qk, headdim_v) << "HeadDim unsupported";
+    TVM_FFI_ICHECK_LE(headdim_qk, 128) << "HeadDim unsupported";
+{% else %}
+    TVM_FFI_ICHECK_EQ(headdim_qk, 192) << "HeadDim unsupported";
+    TVM_FFI_ICHECK_EQ(headdim_v, 128) << "HeadDim unsupported";
+{% endif %}
+  }
+{% endmacro %}
+
+{# Prepare fixed-dispatch views for batch-1 varlen inputs. #}
+{% macro emit_batch1_varlen_setup() %}
+  const bool has_varlen_metadata = input_cu_seqlen_q.has_value() || input_cu_seqlen_k.has_value();
+  ffi::TensorView dense_q = q;
+  ffi::TensorView dense_k = k;
+  ffi::TensorView dense_v = v;
+  ffi::TensorView dense_out = out;
+  ffi::TensorView dense_out_lse = out_lse;
+  std::array<int64_t, 4> q_shape{};
+  std::array<int64_t, 4> q_strides{};
+  std::array<int64_t, 4> k_shape{};
+  std::array<int64_t, 4> k_strides{};
+  std::array<int64_t, 4> v_shape{};
+  std::array<int64_t, 4> v_strides{};
+  std::array<int64_t, 4> out_shape{};
+  std::array<int64_t, 4> out_strides{};
+  std::array<int64_t, 3> out_lse_shape{};
+  std::array<int64_t, 3> out_lse_strides{};
+  if (has_varlen_metadata) {
+    CHECK_HAS_VALUE_WITH_MSG(input_cu_seqlen_q, "input_cu_seqlen_q must be provided for varlen flash attention");
+    CHECK_HAS_VALUE_WITH_MSG(input_cu_seqlen_k, "input_cu_seqlen_k must be provided for varlen flash attention");
+    CHECK_HAS_VALUE_WITH_MSG(max_seqlen_q, "max_seqlen_q must be provided for varlen flash attention");
+    CHECK_HAS_VALUE_WITH_MSG(max_seqlen_kv, "max_seqlen_kv must be provided for varlen flash attention");
+    auto input_cu_q = input_cu_seqlen_q.value();
+    auto input_cu_k = input_cu_seqlen_k.value();
+    CHECK_MUSA(input_cu_q);
+    CHECK_MUSA(input_cu_k);
+    CHECK_DEVICE(q, input_cu_q);
+    CHECK_DEVICE(q, input_cu_k);
+    CHECK_DIM(3, q);
+    CHECK_DIM(3, k);
+    CHECK_DIM(3, v);
+    CHECK_DIM(3, out);
+    CHECK_DIM(2, out_lse);
+    CHECK_DIM(1, input_cu_q);
+    CHECK_DIM(1, input_cu_k);
+    CHECK_CONTIGUOUS(input_cu_q);
+    CHECK_CONTIGUOUS(input_cu_k);
+    TVM_FFI_ICHECK(dtype_equal(input_cu_q.dtype(), dl_int32)) << "input_cu_seqlen_q must be int32";
+    TVM_FFI_ICHECK(dtype_equal(input_cu_k.dtype(), dl_int32)) << "input_cu_seqlen_k must be int32";
+    TVM_FFI_ICHECK_EQ(input_cu_q.size(0), 2) << "fixed dispatch only supports batch-1 varlen metadata";
+    TVM_FFI_ICHECK_EQ(input_cu_k.size(0), input_cu_q.size(0))
+        << "input_cu_seqlen_q and input_cu_seqlen_k must have the same size";
+    TVM_FFI_ICHECK_GT(max_seqlen_q.value(), 0) << "max_seqlen_q must be positive";
+    TVM_FFI_ICHECK_GT(max_seqlen_kv.value(), 0) << "max_seqlen_kv must be positive";
+
+    q_shape = {1, q.size(0), q.size(1), q.size(2)};
+    q_strides = {q.size(0) * q.stride(0), q.stride(0), q.stride(1), q.stride(2)};
+    k_shape = {1, k.size(0), k.size(1), k.size(2)};
+    k_strides = {k.size(0) * k.stride(0), k.stride(0), k.stride(1), k.stride(2)};
+    v_shape = {1, v.size(0), v.size(1), v.size(2)};
+    v_strides = {v.size(0) * v.stride(0), v.stride(0), v.stride(1), v.stride(2)};
+    out_shape = {1, out.size(0), out.size(1), out.size(2)};
+    out_strides = {out.size(0) * out.stride(0), out.stride(0), out.stride(1), out.stride(2)};
+    out_lse_shape = {1, out_lse.size(0), out_lse.size(1)};
+    out_lse_strides = {out_lse.size(0) * out_lse.stride(0), out_lse.stride(0), out_lse.stride(1)};
+    dense_q = q.as_strided(ffi::ShapeView(q_shape.data(), q_shape.size()),
+                           ffi::ShapeView(q_strides.data(), q_strides.size()));
+    dense_k = k.as_strided(ffi::ShapeView(k_shape.data(), k_shape.size()),
+                           ffi::ShapeView(k_strides.data(), k_strides.size()));
+    dense_v = v.as_strided(ffi::ShapeView(v_shape.data(), v_shape.size()),
+                           ffi::ShapeView(v_strides.data(), v_strides.size()));
+    dense_out = out.as_strided(ffi::ShapeView(out_shape.data(), out_shape.size()),
+                               ffi::ShapeView(out_strides.data(), out_strides.size()));
+    dense_out_lse = out_lse.as_strided(ffi::ShapeView(out_lse_shape.data(), out_lse_shape.size()),
+                                       ffi::ShapeView(out_lse_strides.data(), out_lse_strides.size()));
+  }
+{% endmacro %}
+
+{# Validate non-varlen tensor views. #}
+{% macro emit_non_varlen_validation() %}
+  CHECK_DIM(4, dense_q);
+  CHECK_DIM(4, dense_k);
+  CHECK_DIM(4, dense_v);
+  CHECK_DIM(4, dense_out);
+  CHECK_DIM(3, dense_out_lse);
+  {
+    auto batch = dense_q.size(0);
+    auto seqlen_q = dense_q.size(1);
+    auto nr_heads = dense_q.size(2);
+    auto headdim_qk = dense_q.size(3);
+    auto seqlen_kv = dense_k.size(1);
+    auto nr_heads_kv = dense_k.size(2);
+    auto headdim_v = dense_v.size(3);
+    TVM_FFI_ICHECK_GT(batch, 0) << "batch must be positive";
+    TVM_FFI_ICHECK_GT(seqlen_q, 0) << "seqlen_q must be positive";
+    TVM_FFI_ICHECK_GT(seqlen_kv, 0) << "seqlen_kv must be positive";
+    TVM_FFI_ICHECK_GT(headdim_qk, 0) << "headdim_qk must be positive";
+    TVM_FFI_ICHECK_GT(headdim_v, 0) << "headdim_v must be positive";
+    expect_shape(dense_k, {batch, seqlen_kv, nr_heads_kv, headdim_qk}, "k");
+    expect_shape(dense_v, {batch, seqlen_kv, nr_heads_kv, headdim_v}, "v");
+    expect_shape(dense_out, {batch, seqlen_q, nr_heads, headdim_v}, "out");
+    expect_shape(dense_out_lse, {batch, nr_heads, seqlen_q}, "out_lse");
+    TVM_FFI_ICHECK_GT(nr_heads_kv, 0) << "nr_heads_kv must be positive";
+    TVM_FFI_ICHECK_GE(nr_heads, nr_heads_kv) << "nr_heads must be >= nr_heads_kv";
+    TVM_FFI_ICHECK_EQ(nr_heads % nr_heads_kv, 0) << "nr_heads must be divisible by nr_heads_kv";
+{% if spec.headdim_qk == 128 %}
+    TVM_FFI_ICHECK_EQ(headdim_qk, headdim_v) << "HeadDim unsupported";
+    TVM_FFI_ICHECK_LE(headdim_qk, 128) << "HeadDim unsupported";
+{% else %}
+    TVM_FFI_ICHECK_EQ(headdim_qk, 192) << "HeadDim unsupported";
+    TVM_FFI_ICHECK_EQ(headdim_v, 128) << "HeadDim unsupported";
+{% endif %}
+  }
+{% endmacro %}
+
+{# Build and launch a varlen kernel. #}
+{% macro emit_varlen_launch() %}
+  static_cast<void>(num_mp);
   auto batch = input_cu_q.size(0) - 1;
   auto total_seqlen_q = q.size(0);
   auto nr_heads = q.size(1);
@@ -314,7 +435,15 @@ void run_{{ func_name }}(const std::string&                 object_path,
                            &params.tile_v_dim1,
                            &params.tile_v_dim2};
   MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, asm_func, kernel_params, nullptr));
-{% else %}
+{% endmacro %}
+
+{# Build and launch a non-varlen kernel. #}
+{% macro emit_non_varlen_launch() %}
+  auto launch_dense = [&](ffi::TensorView q,
+                          ffi::TensorView k,
+                          ffi::TensorView v,
+                          ffi::TensorView out,
+                          ffi::TensorView out_lse) {
   static_cast<void>(input_cu_seqlen_q);
   static_cast<void>(input_cu_seqlen_k);
   static_cast<void>(max_seqlen_q);
@@ -484,6 +613,86 @@ void run_{{ func_name }}(const std::string&                 object_path,
                            &params.tile_out_dim2,
                            &params.tile_out_dim3};
   MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, asm_func, kernel_params, nullptr));
+  };
+  launch_dense(dense_q, dense_k, dense_v, dense_out, dense_out_lse);
+{% endmacro %}
+
+void run_{{ func_name }}(const std::string&                 object_path,
+                               ffi::TensorView                    q,
+                               ffi::TensorView                    k,
+                               ffi::TensorView                    v,
+                               double                             softmax_scale,
+                               ffi::TensorView                    out,
+                               ffi::TensorView                    out_lse,
+                               std::optional<ffi::TensorView>     input_cu_seqlen_q,
+                               std::optional<ffi::TensorView>     input_cu_seqlen_k,
+                               std::optional<int64_t>             max_seqlen_q,
+                               std::optional<int64_t>             max_seqlen_kv) {
+  CHECK_MUSA(q);
+  CHECK_MUSA(k);
+  CHECK_MUSA(v);
+  CHECK_MUSA(out);
+  CHECK_MUSA(out_lse);
+  CHECK_DEVICE(q, k);
+  CHECK_DEVICE(q, v);
+  CHECK_DEVICE(q, out);
+  CHECK_DEVICE(q, out_lse);
+
+  DLDataType data_type = q.dtype();
+  TVM_FFI_ICHECK(dtype_equal(data_type, k.dtype()) && dtype_equal(data_type, v.dtype()) &&
+                 dtype_equal(data_type, out.dtype()))
+      << "q, k, v and out must have the same dtype";
+  TVM_FFI_ICHECK(dtype_equal(data_type, {{ "dl_float16" if asm_dtype == "half" else "dl_bfloat16" }}))
+      << "q, k, v and out dtype must match the generated kernel";
+  TVM_FFI_ICHECK(dtype_equal(out_lse.dtype(), dl_float32)) << "out_lse must be float32";
+
+{# Emit validation for the selected kernel family. #}
+{% if spec.is_varlen %}
+{{ emit_varlen_validation() }}
+{% else %}
+{{ emit_batch1_varlen_setup() }}
+{{ emit_non_varlen_validation() }}
+{% endif %}
+
+  TVM_FFI_ICHECK(q.size(-1) <= 1 || q.stride(-1) == 1) << "q must have contiguous last dimension";
+  TVM_FFI_ICHECK(k.size(-1) <= 1 || k.stride(-1) == 1) << "k must have contiguous last dimension";
+  TVM_FFI_ICHECK(v.size(-1) <= 1 || v.stride(-1) == 1) << "v must have contiguous last dimension";
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(out_lse);
+  check_mp31(q.device(), "run_{{ func_name }}");
+
+  constexpr int nr_thr    = 512;
+  constexpr int tile_m    = 256;
+{% if spec.headdim_qk == 128 %}
+  constexpr int tile_n    = 128;
+{% else %}
+  constexpr int tile_n    = 64;
+{% endif %}
+  constexpr int tile_k    = 64;
+  constexpr int tile_hdim = 128;
+
+  ffi::MUSADeviceGuard device_guard(q.device().device_id);
+  musaStream_t stream = get_stream(q.device());
+  musaDeviceProp dprops{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, q.device().device_id));
+  const int num_mp = dprops.multiProcessorCount;
+
+  static MUmodule asm_module = [&object_path]() {
+    MUmodule module;
+    MATE_MUSA_DRIVER_CHECK(muModuleLoad(&module, object_path.c_str()));
+    return module;
+  }();
+  static MUfunction asm_func = []() {
+    MUfunction func;
+    MATE_MUSA_DRIVER_CHECK(muModuleGetFunction(&func, asm_module, "{{ func_name }}"));
+    return func;
+  }();
+
+{# Emit launch setup for the selected kernel family. #}
+{% if spec.is_varlen %}
+{{ emit_varlen_launch() }}
+{% else %}
+{{ emit_non_varlen_launch() }}
 {% endif %}
   MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }

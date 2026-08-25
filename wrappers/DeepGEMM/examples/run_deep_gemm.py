@@ -32,12 +32,12 @@ def run_fp8_grouped_gemm_example():
     b = torch.rand((num_expert, n, k), device=device, dtype=torch.float)
     d = torch.empty((m, n), device=device, dtype=out_dtype)
 
-    m_indices = torch.full((m,), -1, device=device, dtype=torch.int32)
+    grouped_layout = torch.full((m,), -1, device=device, dtype=torch.int32)
 
     m_base = 0
     for i in range(num_expert):
         valid_m = ms_per_group[i]
-        m_indices[m_base : m_base + valid_m] = i
+        grouped_layout[m_base : m_base + valid_m] = i
         m_base += aligned_ms[i]
 
     quant_tile_shape_a = (1, quant_tile)
@@ -60,12 +60,12 @@ def run_fp8_grouped_gemm_example():
         "K",
     )
 
-    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
         (fp8_a, scale_a),
         (fp8_b, scale_b),
         d,
-        m_indices,
-        scale_granularity_mnk,
+        grouped_layout=grouped_layout,
+        recipe=scale_granularity_mnk,
         alignment_m=alignment_m,
     )
 
@@ -77,7 +77,7 @@ def run_fp8_grouped_gemm_example():
     print(f"scale_a.shape = {tuple(scale_a.shape)}")
     print(f"fp8_b.shape   = {tuple(fp8_b.shape)}")
     print(f"scale_b.shape = {tuple(scale_b.shape)}")
-    print(f"m_indices.shape = {tuple(m_indices.shape)}")
+    print(f"grouped_layout.shape = {tuple(grouped_layout.shape)}")
     print(f"out.shape     = {tuple(d.shape)}")
     print(f"out.dtype     = {d.dtype}")
 

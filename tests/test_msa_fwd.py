@@ -3,11 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mate.jit.msa_fwd import (
+from mate.jit.msa_ops import (
     _msa_fwd,
+    gen_msa_ops_aot,
     make_msa_fwd_config,
 )
-from mate.jit.msa_ops import gen_msa_ops_aot
 
 
 _HAS_MUSA = hasattr(torch, "musa") and torch.musa.is_available()
@@ -110,7 +110,7 @@ def _online_same_dtype_p_reference(
                 kv_positions = logical_block * 128 + torch.arange(128, device="cpu")
                 valid = kv_positions < kv_len
                 if causal:
-                    valid &= kv_positions <= q_idx + qo_offset
+                    valid = valid & (kv_positions <= q_idx + qo_offset)
                 scores = scores.masked_fill(~valid, -torch.inf)
 
                 block_max = scores.max()

@@ -12,6 +12,32 @@
 #include "mutlass/transform/thread/unary_op.h"
 
 namespace mutlass {
+/// Partial specialization for Array<half_t, 4> <= Array<float_e4m3_t, 4>, round to nearest
+template <>
+struct NumericArrayConverter<mutlass::half_t, mutlass::float_e4m3_t, 4, FloatRoundStyle::round_to_nearest> {
+  using result_type                        = Array<mutlass::half_t, 4>;
+  using source_type                        = Array<mutlass::float_e4m3_t, 4>;
+  static FloatRoundStyle const round_style = FloatRoundStyle::round_to_nearest;
+
+  MUTLASS_HOST_DEVICE
+  static result_type convert(source_type const &source) {
+    using SourceVector = unsigned char __attribute__((ext_vector_type(4)));
+    using ResultVector = _Float16 __attribute__((ext_vector_type(4)));
+
+    static_assert(sizeof(source_type) == sizeof(SourceVector));
+    static_assert(sizeof(result_type) == sizeof(ResultVector));
+
+    SourceVector packed    = __builtin_bit_cast(SourceVector, source);
+    ResultVector converted = __musa_e4m32f16_rn_bst4(packed);
+    return __builtin_bit_cast(result_type, converted);
+  }
+
+  MUTLASS_HOST_DEVICE
+  result_type operator()(source_type const &source) const {
+    return convert(source);
+  }
+};
+
 /// Partial specialization for Array<mutlass::float_e4m3_t, 4> <= Array<float, 4>, round to nearest
 template <>
 struct NumericArrayConverter<mutlass::float_e4m3_t, float, 4, FloatRoundStyle::round_to_nearest> {

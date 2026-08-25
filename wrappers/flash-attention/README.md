@@ -19,7 +19,7 @@ with minimal code changes. The current compatibility target is the
 - Runtime backend: MATE attention operators on MUSA
 
 MUSA wrapper releases use the PEP 440 local version suffix `+musa`, for
-example `0.2.4+musa`. Use `python -m pip show flash_attn_3` to distinguish
+example `0.2.6+musa`. Use `python -m pip show flash_attn_3` to distinguish
 this wrapper from the native package.
 
 For the current compatibility scope and known limitations, see
@@ -87,6 +87,7 @@ Import individual APIs:
 ```python
 from flash_attn_interface import (
     flash_attn_func,
+    flash_attn_qkvpacked_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
     get_scheduler_metadata,
@@ -98,9 +99,18 @@ from flash_attn_interface import (
 The wrapper currently exposes:
 
 - `flash_attn_func`: FlashAttention-compatible dense QKV entry
+- `flash_attn_qkvpacked_func`: FlashAttention-compatible packed QKV entry
 - `flash_attn_varlen_func`: FlashAttention-compatible varlen / ragged FMHA entry
 - `flash_attn_with_kvcache`: FlashAttention-compatible KV-cache entry, including paged KV cache use cases
 - `get_scheduler_metadata`: helper for split-KV scheduler metadata preparation
+
+### Low-level compatibility entry point
+
+The wrapper also exports `_flash_attn_forward` for integrations, such as ring
+attention, that call the FlashAttention-3 low-level forward interface directly.
+It accepts the upstream-style scheduler, paged-KV, RoPE, and split controls and
+returns the output plus softmax metadata tensors. Use the high-level functions
+above for ordinary model integration.
 
 ## Quick Start
 

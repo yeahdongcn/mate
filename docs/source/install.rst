@@ -18,26 +18,37 @@ Steps at a glance
 Step 1. Check Requirements
 --------------------------
 
-MATE currently requires the following runtime baseline:
+MATE 0.2.6 uses the following baseline:
 
-+----------------+----------------------+
-| Component      | Requirement          |
-+================+======================+
-| Python         | ``3.10`` or later    |
-+----------------+----------------------+
-| MUSA Toolkit   | ``4.3.6`` or later   |
-+----------------+----------------------+
-| TorchMUSA      | ``2.7`` or later     |
-+----------------+----------------------+
-| Architecture   | ``Pinghu (MP31)``    |
-+----------------+----------------------+
+.. list-table::
+   :header-rows: 1
 
-The table above shows the repository-wide baseline. Some feature paths need
-newer toolchains. The current external delivery source mainly covers
-``x86_64`` and Python ``3.10`` / ``3.12`` wheels. When a wrapper or API page
-lists a stricter requirement, follow that page. For example, FlashKDA
-currently builds on MUSA SDK / MTCC 5.1.0+, and FlashAttention ``Local +
-attention_chunk`` requires MUSA SDK 5.1.0+.
+   * - Component
+     - Requirement
+   * - GPU
+     - S5000
+   * - Toolkit / platform
+     - MUSA SDK 4.3.5 or later (driver 3.3.5 or later)
+   * - Python
+     - 3.10 recommended
+   * - Build and compilation
+     - MUSA SDK 4.3.8 or later recommended
+   * - TorchMUSA
+     - 2.7 or later
+
+The current external delivery source mainly covers ``x86_64`` and Python
+``3.10`` / ``3.12`` wheels. Some feature paths need a newer build toolchain
+than the baseline:
+
+- Some CP cases compiled with MUSA SDK 4.3.6 can produce incorrect results.
+  This issue is fixed in MUSA SDK 5.1.0.
+- DSA needs MUSA SDK 5.1.0 to deliver its intended performance. MUSA SDK
+  4.3.6 is a compatibility path that guarantees functional correctness only.
+- FlashAttention ``Local + attention_chunk`` must be compiled with MUSA SDK
+  5.1.0.
+- For best FP8 attention performance, use the MUSA SDK 5.2.0 compiler.
+
+When a wrapper or API page lists a stricter requirement, follow that page.
 
 Before continuing, make sure the MUSA-enabled ``torch`` / ``torch_musa`` stack
 is already installed and working in your environment.
@@ -102,11 +113,11 @@ Step 3. Install a Delivered Package or Build from Source
 Choose one installation path:
 
 - Delivered wrapper install: recommended when your framework already expects
-  ``flash_attn_3``, ``flash_mla``, ``flash_kda``, ``deep-gemm``, or
-  ``sageattention``. Each delivered wrapper installs the matching ``mate``
-  dependency automatically.
-- Local wrapper install: use this for wrapper surfaces that are not part of
-  the delivered package set, such as ``fmha_sm100``.
+  ``flash_attn_3``, ``flash_mla``, ``deep-gemm``, ``flash_kda``,
+  ``sageattention``, ``fmha_sm100``, or ``flashinfer-python``. Each delivered
+  wrapper installs the matching ``mate`` dependency automatically.
+- Local wrapper install: use this when developing a wrapper locally or when
+  you need a locally built wrapper artifact.
 - Direct MATE install: use this when you need direct ``mate`` APIs without a
   wrapper.
 - Build from source: use this when you are developing MATE locally or need a
@@ -128,6 +139,13 @@ To install both packages:
    python -m pip install mate mate-mubin \
      --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 
+If ``mate`` is already installed, install only the optional MUBIN package:
+
+.. code-block:: bash
+
+   python -m pip install mate-mubin \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+
 To preload artifacts:
 
 .. code-block:: bash
@@ -141,7 +159,8 @@ Delivered wrapper install
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Supported delivered wrapper packages are ``flash_attn_3``, ``flash_mla``,
-``flash_kda``, ``deep-gemm``, and ``sageattention``.
+``deep-gemm``, ``flash_kda``, ``sageattention``, ``fmha_sm100``, and
+``flashinfer-python``.
 
 Before reinstalling a delivered package set, uninstall the packages you plan
 to replace:
@@ -149,7 +168,8 @@ to replace:
 .. code-block:: bash
 
    python -m pip uninstall -y \
-     mate flash_mla flash_kda deep-gemm sageattention flash_attn_3
+     mate flash_attn_3 flash_mla deep-gemm flash_kda sageattention \
+     fmha_sm100 flashinfer-python
 
 Install the wrapper package that matches your framework surface. ``pip``
 installs the matching ``mate`` dependency automatically.
@@ -158,12 +178,23 @@ installs the matching ``mate`` dependency automatically.
 
    python -m pip install flash_attn_3 \
      --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+   python -m pip install flash_mla \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+   python -m pip install deep-gemm \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+   python -m pip install flash_kda \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+   python -m pip install sageattention \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+   python -m pip install fmha_sm100 \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+   python -m pip install flashinfer-python \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 
-Replace ``flash_attn_3`` with ``flash_mla``, ``flash_kda``, ``deep-gemm``, or
-``sageattention`` when those package surfaces match your framework.
+Run only the command for the package surface used by your framework.
 
 Delivered MUSA wrapper versions use the PEP 440 local version suffix
-``+musa``, for example ``0.2.4+musa``. Check the installed distribution to
+``+musa``, for example ``0.2.6+musa``. Check the installed distribution to
 distinguish the MATE-backed MUSA wrapper from the native implementation:
 
 .. code-block:: bash
@@ -185,6 +216,32 @@ want direct MATE Python APIs without a wrapper package.
 
    python -m pip install mate \
      --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+
+Optional TileLang and TVM-FFI extensions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Install the TileLang extra for operators that use the TileLang-backed path:
+
+.. code-block:: bash
+
+   python -m pip install "mate[tilelang]" \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+
+For MATE 0.2.6, this extra uses the ``tilelang-musa==0.1.12`` dependency line
+from the MUSA package source.
+
+Install the optional TVM-FFI extension packages when your integration needs
+their additional cross-language or DLPack path:
+
+.. code-block:: bash
+
+   python -m pip install apache-tvm-ffi==0.1.11.post1 \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+   python -m pip install torch_c_dlpack_ext \
+     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+
+Use the MUSA-provided ``apache-tvm-ffi`` wheel from this package source. The
+upstream public build is not compatible with MATE on MUSA.
 
 Build from source
 ~~~~~~~~~~~~~~~~~
@@ -382,6 +439,10 @@ installs, not the delivered wheel source.
      - ``flash_kda``
      - ``flash_kda``
      - FlashKDA style integration
+   * - ``wrappers/FlashInfer``
+     - ``flashinfer-python``
+     - ``flashinfer``
+     - FlashInfer style integration
    * - ``wrappers/DeepGEMM``
      - ``deep-gemm``
      - ``deep_gemm``
@@ -411,8 +472,8 @@ Wheel install pattern:
    python -m pip install --no-deps dist/flash_attn_3-*.whl
 
 Repeat the same workflow for ``wrappers/FlashMLA``, ``wrappers/MSA``,
-``wrappers/FlashKDA``, ``wrappers/DeepGEMM``, and ``wrappers/SageAttention``
-when those package surfaces match your framework.
+``wrappers/FlashKDA``, ``wrappers/FlashInfer``, ``wrappers/DeepGEMM``, and
+``wrappers/SageAttention`` when those package surfaces match your framework.
 
 Optional Step 6. Pre-Build AOT Kernels
 --------------------------------------

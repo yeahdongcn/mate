@@ -19,6 +19,13 @@ Use direct MATE Python APIs when:
 Supported API Entrypoints
 -------------------------
 
+FlashInfer wrapper
+------------------
+
+The :doc:`FlashInfer wrapper API reference <api/flashinfer>` documents the
+supported ``flashinfer.rope`` and ``flashinfer.decode`` functions, including
+their signatures, parameters, and return values.
+
 Attention
 ---------
 
@@ -31,6 +38,17 @@ metadata, and MLA-related :doc:`attention <api/attention>` paths.
 - ``mate.get_scheduler_metadata``
 - ``mate.get_mla_metadata``
 - ``mate.flash_mla_with_kvcache``
+- ``mate.flashmla.flash_mla_sparse_fwd``
+- ``mate.flashmla.flash_mla_sparse_fwd_pack8``
+
+Sparse MLA
+----------
+
+Native :doc:`sparse MLA <api/sparse_mla>` entrypoints for fused RoPE FP8
+quantization, reusable decode scheduler metadata, and FP8 sparse decode.
+
+- ``mate.sparse_mla_interface.mla_rope_quantize_fp8``
+- ``mate.sparse_mla_interface.sparse_mla_fp8_decode``
 
 SageAttention
 -------------
@@ -49,13 +67,18 @@ mixed-dtype MoE GEMM, batched GEMM, and DeepGEMM-specific metadata / logits
 helpers.
 
 - ``mate.gemm.ragged_m_moe_gemm_8bit``
+- ``mate.gemm.ragged_m_moe_gemm_16bit``
 - ``mate.gemm.ragged_k_moe_gemm_8bit``
+- ``mate.gemm.ragged_k_moe_gemm_16bit``
 - ``mate.gemm.masked_moe_gemm_8bit``
+- ``mate.gemm.masked_moe_gemm_16bit``
 - ``mate.gemm.ragged_moe_gemm_mixed_dtype``
 - ``mate.gemm.masked_moe_gemm_mixed_dtype``
-- ``mate.gemm.bmm_fp16``
-- ``mate.gemm.bmm_fp8``
-- ``mate.gemm.gemm_fp8_nt_groupwise``
+- ``mate.gemm.bmm``
+- ``mate.deep_gemm.fp8_einsum``
+- ``mate.deep_gemm.fp8_mqa_logits``
+- ``mate.deep_gemm.tf32_hc_prenorm_gemm``
+- ``mate.deep_gemm.fp8_gemm_nt_skip_head_mid``
 - ``mate.deep_gemm.get_paged_mqa_logits_metadata``
 - ``mate.deep_gemm.fp8_paged_mqa_logits``
 
@@ -100,6 +123,24 @@ the ``flash_kda`` wrapper is not the right integration surface.
 - ``mate.chunk_kda``
 - ``mate.kda.chunk_kda``
 - ``mate.kda.gated_delta_rule_decode``
+
+MSA
+---
+
+MSA (MiniMax Sparse Attention) covers MATE's direct dense, paged, and sparse
+attention APIs on MUSA. Use the ``fmha_sm100`` wrapper first when your project
+already targets that package surface. Use the direct MATE APIs below when you
+need the native planning and runtime contract.
+
+- ``mate.msa_interface.msa_plan``
+- ``mate.msa_interface.msa``
+- ``mate.msa_interface.sparse_msa_plan``
+- ``mate.msa_interface.sparse_msa``
+- ``mate.msa_interface.sparse_topk_select``
+- ``mate.msa_interface.sparse_decode_atten_func``
+
+The detail page documents the plan types, runtime metadata, and page table
+helper used by the direct API path.
 
 MoE Routing & Gating
 --------------------

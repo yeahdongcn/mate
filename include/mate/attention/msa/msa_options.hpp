@@ -38,6 +38,7 @@ enum class Tag {
   UseLSULoadK,
   UseLSULoadV,
   PackQueryPair,
+  ParallelKTiles,
 };
 
 template <class Value>
@@ -75,5 +76,8 @@ using UseLSULoadV = Option<Tag::UseLSULoadV, Value>;
 
 template <class Value>
 using PackQueryPair = Option<Tag::PackQueryPair, Value>;
+
+template <class Value>
+using ParallelKTiles = Option<Tag::ParallelKTiles, Value>;
 
 }  // namespace mate::attention::msa

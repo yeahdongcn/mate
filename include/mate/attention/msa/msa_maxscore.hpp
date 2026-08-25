@@ -7,22 +7,14 @@
 
 namespace mate::attention::msa {
 
-template <class Element_,
-          class TileShape_,
-          int  HeadRatio_,
-          int  QStages_,
-          int  KStages_,
-          bool ParallelKTiles_,
-          class... Options_>
+template <class Element_, class TileShape_, int HeadRatio_, class... Options_>
 struct MsaMaxScoreBuilder {
   using Element                        = Element_;
   using TileShape                      = TileShape_;
   static constexpr int  HeadRatio      = HeadRatio_;
-  static constexpr int  QStages        = QStages_;
-  static constexpr int  KStages        = KStages_;
-  static constexpr bool ParallelKTiles = ParallelKTiles_;
-  using CollectiveMainloop             = collective::
-      Mp31MsaMaxScoreCollectiveTmeWarpSpecialized<Element, TileShape, HeadRatio, QStages, KStages, Options_...>;
+  static constexpr bool ParallelKTiles = find_option_t<Tag::ParallelKTiles, std::false_type, Options_...>::value;
+  using CollectiveMainloop =
+      collective::Mp31MsaMaxScoreCollectiveTmeWarpSpecialized<Element, TileShape, HeadRatio, Options_...>;
   using TileScheduler = MsaMaxScoreTileScheduler<TileShape, HeadRatio, ParallelKTiles>;
   using Kernel        = MsaMaxScoreKernelTmeWarpSpecialized<CollectiveMainloop, TileScheduler>;
 };

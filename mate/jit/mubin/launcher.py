@@ -41,6 +41,7 @@ def render_gemm_mubin_launcher(asm_id, kernel_name: str) -> str:
     return render_mubin_launcher(
         "gemm",
         func_name=kernel_name,
+        b_type=asm_id.b_type,
         b_pack_bits=asm_id.b_pack_bits,
         num_thread=block.num_thread,
         tile_m=block.tile_m,
@@ -56,6 +57,7 @@ def render_gemm_mubin_launcher(asm_id, kernel_name: str) -> str:
         quant_mode_a=quant_mode[asm_id.quant_mode_a],
         quant_mode_b=quant_mode[asm_id.quant_mode_b],
         group_mode=group_mode,
+        fixed_scale_layout_a=asm_id.fixed_scale_layout_a,
     )
 
 

@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 import mate.msa_interface as msa  # noqa: E402
-from mate.jit.msa_fwd import (  # noqa: E402
+from mate.jit.msa_ops import (  # noqa: E402
     _msa_fwd,
 )
 from mate.mha_interface import (  # noqa: E402
@@ -96,13 +96,13 @@ def _accuracy(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     expected_f = expected.float().cpu()
     diff = actual_f - expected_f
     return {
-        "max_abs": float(diff.abs().max().item()),
-        "mean_abs": float(diff.abs().mean().item()),
-        "rms": float(diff.square().mean().sqrt().item()),
+        "max_abs": float(diff.abs().max().tolist()),
+        "mean_abs": float(diff.abs().mean().tolist()),
+        "rms": float(diff.square().mean().sqrt().tolist()),
         "cosine": float(
             torch.nn.functional.cosine_similarity(
                 actual_f.reshape(-1), expected_f.reshape(-1), dim=0
-            ).item()
+            ).tolist()
         ),
     }
 
@@ -118,12 +118,19 @@ def run_case(
     dtype: torch.dtype,
     q_heads: int,
     kv_heads: int,
+    q_len_override: int | None = None,
 ) -> dict[str, object]:
     if kv_heads <= 0 or q_heads % kv_heads != 0 or q_heads // kv_heads not in (8, 16):
         raise ValueError(f"q_heads/kv_heads must be 8 or 16, got {q_heads}/{kv_heads}")
     device = _device(dtype)
-    q_len = seq_len if mode == "prefill" else 1
+    q_len = (
+        (seq_len if q_len_override is None else q_len_override)
+        if mode == "prefill"
+        else 1
+    )
     kv_len = seq_len
+    if q_len > kv_len:
+        raise ValueError(f"q_len must not exceed kv_len, got {q_len} > {kv_len}")
     num_pages = (kv_len + PAGE_SIZE - 1) // PAGE_SIZE
     qo_offset_value = kv_len - q_len
     softmax_scale = HEAD_DIM**-0.5
@@ -137,6 +144,7 @@ def run_case(
     qo_lens = torch.tensor([q_len], dtype=torch.int32, device=device)
     kv_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
     cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
     qo_offset = torch.tensor([qo_offset_value], dtype=torch.int32, device=device)
     query_positions = (
         torch.arange(q_len, dtype=torch.int64, device=device) + qo_offset_value
@@ -147,16 +155,25 @@ def run_case(
     flat_page_table = page_table.view(-1)
     page_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
 
-    maxscore_plan = msa._msa_plan_from_lengths(
-        qo_lens,
-        kv_lens,
-        kv_heads,
+    maxscore_plan = msa.msa_plan(
+        batch_size=1,
+        max_seqlen_q=q_len,
+        max_seqlen_k=kv_len,
+        total_seqlen_k=num_pages * PAGE_SIZE,
+        num_qo_heads=kv_heads,
         num_kv_heads=kv_heads,
-        qo_offset=qo_offset,
         page_size=PAGE_SIZE,
         causal=True,
         output_maxscore=True,
-        split_prefill_decode=False,
+    )
+    maxscore_runtime = msa.MsaRuntimeMetadata(
+        qo_lens=qo_lens,
+        kv_lens=kv_lens,
+        qo_offset=qo_offset,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        seqused_k=kv_lens,
+        page_table=page_table,
     )
     padded_pages = ((num_pages + 127) // 128) * 128
     max_score = torch.empty(
@@ -182,10 +199,10 @@ def run_case(
             k,
             v,
             maxscore_plan,
-            kv_indices=flat_page_table,
             output_o=False,
             output_maxscore=True,
             max_score=max_score,
+            runtime_metadata=maxscore_runtime,
         )
 
     def topk_stage():
@@ -326,6 +343,12 @@ def main() -> None:
     parser.add_argument("--dtype", choices=tuple(DTYPES), default=DEFAULT_DTYPE)
     parser.add_argument("--q-heads", type=int, choices=(8, 16, 32), default=8)
     parser.add_argument("--kv-heads", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--q-len",
+        type=int,
+        default=None,
+        help="override prefill Q length while --lengths controls KV length",
+    )
     parser.add_argument("--skip-dense", action="store_true")
     args = parser.parse_args()
 
@@ -342,6 +365,7 @@ def main() -> None:
                 dtype=DTYPES[args.dtype],
                 q_heads=args.q_heads,
                 kv_heads=args.kv_heads,
+                q_len_override=args.q_len,
             )
             print(json.dumps(row, sort_keys=True), flush=True)
             del row

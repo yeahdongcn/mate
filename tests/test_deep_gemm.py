@@ -50,6 +50,70 @@ def _quantize_einsum_batch_k(x: torch.Tensor):
     )
 
 
+def _apply_skip_head_mid(
+    d: torch.Tensor,
+    head_splits: tuple[int, int, int],
+) -> torch.Tensor:
+    left, mid, right = head_splits
+    m, n = d.shape
+    assert n % (left + right) == 0
+    num_heads = n // (left + right)
+
+    d = d.view(m, num_heads, left + right)
+    d_left = d[:, :, :left]
+    d_right = d[:, :, -right:]
+    d_mid = torch.zeros((m, num_heads, mid), dtype=d.dtype, device=d.device)
+    return torch.cat([d_left, d_mid, d_right], dim=2).view(m, -1)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("m, compact_n, k", [(128, 8192, 512), (4096, 8192, 512)])
+def test_fp8_gemm_nt_skip_head_mid(m, compact_n, k):
+    torch.manual_seed(0)
+    head_splits = (128, 64, 128)
+    left, mid, right = head_splits
+    assert compact_n % (left + right) == 0
+    num_heads = compact_n // (left + right)
+    full_n = num_heads * (left + mid + right)
+
+    a = torch.randn((m, k), device="musa", dtype=torch.bfloat16)
+    b = torch.randn((compact_n, k), device="musa", dtype=torch.bfloat16)
+    fp8_a, scale_a = group_quantize_fp8(
+        a,
+        (m, ceil_div(k, 128)),
+        (1, 128),
+        torch.float8_e4m3fn,
+        "K",
+    )
+    fp8_b, scale_b = group_quantize_fp8(
+        b,
+        (ceil_div(compact_n, 128), ceil_div(k, 128)),
+        (128, 128),
+        torch.float8_e4m3fn,
+        "K",
+    )
+    scale_a = scale_a.float()
+    scale_b = scale_b.float()
+
+    d = torch.zeros((m, full_n), device="musa", dtype=torch.bfloat16)
+    ref_d = (
+        group_dequantize_fp8(fp8_a, scale_a, "K")
+        @ group_dequantize_fp8(fp8_b, scale_b, "K").T
+    )
+    ref_d = _apply_skip_head_mid(ref_d, head_splits)
+
+    mate.deep_gemm.fp8_gemm_nt_skip_head_mid(
+        (fp8_a, scale_a),
+        (fp8_b, scale_b),
+        d,
+        head_splits,
+        disable_ue8m0_cast=True,
+    )
+
+    diff = calc_diff(d, ref_d)
+    assert diff < 1e-3, f"{m=}, {compact_n=}, {k=}, {head_splits=}, {diff=}"
+
+
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize("recipe", [(1, 128, 128), (1, 1, 128)])
 def test_fp8_einsum_bhr_hdr_bhd(recipe):

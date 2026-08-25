@@ -7,6 +7,7 @@ from mate.utils import ceil_div
 from mate.testing.utils import (
     group_quantize_fp8,
     group_dequantize_fp8,
+    tensor_quantize_fp8,
     align,
     check_gemm_sbo_signal,
 )
@@ -35,15 +36,45 @@ def _dequant_w4a8_a_per_channel(x: torch.Tensor, scale: torch.Tensor) -> torch.T
     return x.float() * scale
 
 
+def _quantize_w4a8_a_grouped(x: torch.Tensor, out_dtype: torch.dtype):
+    block_k = 128
+    k = x.size(-1)
+    padded_k = ceil_div(k, block_k) * block_k
+    padded = torch.zeros((*x.shape[:-1], padded_k), device=x.device, dtype=x.dtype)
+    padded[..., :k].copy_(x)
+    blocks = padded.reshape(*x.shape[:-1], padded_k // block_k, block_k)
+    fp8_amax = torch.tensor(
+        torch.finfo(out_dtype).max, device=x.device, dtype=torch.float32
+    )
+    abs_max = blocks.abs().amax(dim=-1).clamp(1e-4)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(abs_max / fp8_amax)))
+    quantized = (blocks / (scale.unsqueeze(-1) + 1e-8)).to(out_dtype)
+    return quantized.reshape(*x.shape[:-1], padded_k)[..., :k].contiguous(), scale
+
+
+def _dequant_w4a8_a_grouped(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    expanded_scale = scale.repeat_interleave(128, dim=-1)[..., : x.size(-1)]
+    return x.float() * expanded_scale
+
+
 def _make_w4a8_b_nk(num_expert: int, n: int, k: int, device):
     b = torch.rand((num_expert, n, k), device=device, dtype=torch.float) * 2 - 1
-    b_blocks = b.reshape(num_expert, n, k // 128, 128)
+    padded_k = ceil_div(k, 128) * 128
+    padded_b = torch.zeros((num_expert, n, padded_k), device=device, dtype=torch.float)
+    padded_b[..., :k].copy_(b)
+    b_blocks = padded_b.reshape(num_expert, n, padded_k // 128, 128)
     scale_b = (b_blocks.abs().amax(dim=3).clamp(1e-4) / 7.0).to(torch.bfloat16)
-    b_int4 = (
+    padded_b_int4 = (
         (b_blocks / scale_b.float().unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
     )
-    b_int4 = b_int4.reshape(num_expert, n, k).contiguous()
-    return b_int4, _pack_int4_k(b_int4), scale_b
+    b_int4 = padded_b_int4.reshape(num_expert, n, padded_k)[..., :k].contiguous()
+    packed_input = b_int4
+    if k % 2:
+        packed_input = torch.zeros(
+            (num_expert, n, k + 1), device=device, dtype=torch.int8
+        )
+        packed_input[..., :k].copy_(b_int4)
+    return b_int4, _pack_int4_k(packed_input), scale_b
 
 
 def _dequant_w4a8_b_nk(
@@ -94,10 +125,12 @@ def _w4a8_ragged_cases():
     ]
 
 
-def _w4a8_masked_cases():
+def mixed_dtype_masked_moe_gemm_test_cases():
     return [
         ([64, 128], 512, 512, 128),
         ([256, 256], 1024, 1024, 512),
+        ([0, 1, 17, 32], 256, 384, 256),
+        ([1, 16, 17, 64], 256, 384, 16),
     ]
 
 
@@ -124,6 +157,7 @@ def test_moe_gemm_quant_recipe_validation():
 
 def get_ragged_moe_gemm_16bit_cases():
     return [
+        [1, 0, 0],
         [111],
         [111, 222, 333, 444],
         [4096 for _ in range(8)],
@@ -174,8 +208,9 @@ def test_ragged_moe_gemm_16bit(
         m_base = 0
         for i in range(num_expert):
             r = slice(m_base, m_base + ms_per_group[i])
+            aligned_r = slice(m_base, m_base + aligned_ms[i])
             m_indices[r] = i
-            ref_d[r] = torch.matmul(a[r], b[i].t())
+            ref_d[r] = torch.matmul(a[aligned_r], b[i].t())[: ms_per_group[i]]
             m_base += aligned_ms[i]
 
         g.replay()
@@ -183,8 +218,9 @@ def test_ragged_moe_gemm_16bit(
         m_base = 0
         for i in range(num_expert):
             r = slice(m_base, m_base + ms_per_group[i])
+            aligned_r = slice(m_base, m_base + aligned_ms[i])
             m_indices[r] = i
-            ref_d[r] = torch.matmul(a[r], b[i].t())
+            ref_d[r] = torch.matmul(a[aligned_r], b[i].t())[: ms_per_group[i]]
             m_base += aligned_ms[i]
 
         mate.gemm.ragged_m_moe_gemm_16bit(
@@ -289,6 +325,7 @@ def test_masked_moe_gemm_16bit(
 
 def get_ragged_moe_gemm_8bit_cases():
     return [
+        [1, 0, 0],
         [111],
         [111, 222, 333, 444],
         [256],
@@ -602,7 +639,10 @@ def test_ragged_moe_gemm_mixed_dtype(
 
 
 @supported_musa_compute_capability([31])
-@pytest.mark.parametrize("ms_per_group,n,k,expected_m", _w4a8_masked_cases())
+@pytest.mark.parametrize(
+    "ms_per_group,n,k,expected_m",
+    mixed_dtype_masked_moe_gemm_test_cases(),
+)
 @pytest.mark.parametrize(
     "mixed_dtype,a_fp8_type,out_dtype",
     [
@@ -614,6 +654,12 @@ def test_ragged_moe_gemm_mixed_dtype(
     ],
 )
 @pytest.mark.parametrize("enable_overlap", [False, True])
+@pytest.mark.parametrize("backend", ["auto", "mubin", "mutlass"])
+@pytest.mark.parametrize(
+    "a_quant_recipe,scale_a_major",
+    [((1, -1), "K"), ((1, 128), "K"), ((1, 128), "M")],
+    ids=["Apertoken", "Apergroup-Kmajor", "Apergroup-Mmajor"],
+)
 def test_masked_moe_gemm_mixed_dtype(
     ms_per_group,
     n,
@@ -623,14 +669,45 @@ def test_masked_moe_gemm_mixed_dtype(
     a_fp8_type,
     out_dtype,
     enable_overlap,
+    backend,
+    a_quant_recipe,
+    scale_a_major,
 ):
+    if mixed_dtype == mate.gemm.GemmMixedDType.FP4FP8 and a_quant_recipe != (1, -1):
+        pytest.skip("FP4FP8 does not support grouped A quantization")
+    if mixed_dtype == mate.gemm.GemmMixedDType.FP4FP8 and backend == "mutlass":
+        pytest.skip("MUTLASS does not support FP4FP8")
+    if a_quant_recipe == (1, 128) and backend == "mubin":
+        pytest.skip("MUBIN does not support grouped A quantization")
+    if (backend == "mutlass" or a_quant_recipe == (1, 128)) and (
+        a_fp8_type != torch.float8_e4m3fn or enable_overlap
+    ):
+        pytest.skip("MUTLASS does not support this dtype or overlap configuration")
+
     torch.manual_seed(1)
     num_expert = len(ms_per_group)
     max_m = max(ms_per_group)
     device = torch.device("musa")
 
     a = torch.rand((num_expert, max_m, k), device=device, dtype=torch.float)
-    fp8_a, scale_a = _quantize_w4a8_a_per_channel(a, a_fp8_type)
+    if a_quant_recipe == (1, -1):
+        fp8_a, scale_a = _quantize_w4a8_a_per_channel(a, a_fp8_type)
+        dequant_a = _dequant_w4a8_a_per_channel(fp8_a, scale_a)
+        if backend == "mutlass":
+            scale_a_storage = torch.empty(
+                (*scale_a.shape[:-1], 2), device=device, dtype=scale_a.dtype
+            )
+            scale_a_storage[..., ::2].copy_(scale_a)
+            scale_a = scale_a_storage[..., ::2]
+            assert scale_a.stride(-1) == 2
+    else:
+        fp8_a, scale_a = _quantize_w4a8_a_grouped(a, a_fp8_type)
+        dequant_a = _dequant_w4a8_a_grouped(fp8_a, scale_a)
+        if scale_a_major == "M":
+            scale_a = scale_a.transpose(1, 2).contiguous().transpose(1, 2)
+            assert scale_a.stride(1) == 1
+            assert scale_a.stride(2) > 1
+
     if mixed_dtype == mate.gemm.GemmMixedDType.FP4FP8:
         effective_b, packed_b, residual_e8m0, epilogue_fp32 = _make_fp4fp8_b_nk(
             num_expert, n, k, device
@@ -653,7 +730,6 @@ def test_masked_moe_gemm_mixed_dtype(
             device=device,
         )
 
-    dequant_a = _dequant_w4a8_a_per_channel(fp8_a, scale_a)
     ref = torch.zeros((num_expert, max_m, n), device=device, dtype=torch.float)
     for expert_id, expert_m in enumerate(ms_per_group):
         if mixed_dtype == mate.gemm.GemmMixedDType.FP4FP8:
@@ -673,8 +749,8 @@ def test_masked_moe_gemm_mixed_dtype(
         enable_overlap=enable_overlap,
         signal=signal,
         mixed_dtype=mixed_dtype,
-        backend="mubin",
-        a_quant_recipe=(1, -1),
+        backend=backend,
+        a_quant_recipe=a_quant_recipe,
         b_quant_recipe=b_quant_recipe,
     )
 
@@ -927,12 +1003,13 @@ def test_m_contig_gemm_16bit(
 
     m_indices = torch.tensor(ms_per_group, device="musa", dtype=torch.int32)
 
-    ref_d = torch.zeros((m, n), device="musa", dtype=data_type)
+    ref_d = torch.zeros((m, n), device="musa", dtype=torch.float)
 
     m_base = 0
     for i in range(num_expert):
         r = slice(m_base, m_base + ms_per_group[i])
-        ref_d[r] = torch.matmul(a[r], b[i])
+        if ms_per_group[i] > 0:
+            ref_d[r] = torch.matmul(a[r].float(), b[i].float())
         m_base += ms_per_group[i]
 
     mate.gemm.ragged_m_moe_gemm_16bit(
@@ -945,9 +1022,7 @@ def test_m_contig_gemm_16bit(
         major_b_mode="N",
     )
 
-    torch.testing.assert_close(
-        d.to(data_type), ref_d.to(data_type), rtol=5e-3, atol=5e-3
-    )
+    torch.testing.assert_close(d.float(), ref_d, rtol=5e-3, atol=5e-3)
 
 
 @supported_musa_compute_capability([31])
@@ -1000,3 +1075,429 @@ def test_m_contig_gemm_16bit_zero_k_fills_output():
     )
 
     torch.testing.assert_close(out, torch.zeros_like(out))
+
+
+def _make_groupwise_bmm_inputs(
+    batch,
+    m,
+    n,
+    k,
+    recipe,
+    a_fp8_type=torch.float8_e4m3fn,
+    b_fp8_type=torch.float8_e4m3fn,
+    scale_major="K",
+):
+    a = torch.rand((batch, m, k), device="musa", dtype=torch.float)
+    b = torch.rand((batch, n, k), device="musa", dtype=torch.float)
+    _, scale_granularity_n, scale_granularity_k = recipe
+
+    scale_a_shape = (batch, m, ceil_div(k, scale_granularity_k))
+    scale_b_shape = (
+        batch,
+        ceil_div(n, scale_granularity_n),
+        ceil_div(k, scale_granularity_k),
+    )
+    if scale_major == "MN":
+        scale_a_shape = (scale_a_shape[0], scale_a_shape[2], scale_a_shape[1])
+        scale_b_shape = (scale_b_shape[0], scale_b_shape[2], scale_b_shape[1])
+
+    fp8_a, scale_a = group_quantize_fp8(
+        a,
+        scale_a_shape,
+        (1, 1, scale_granularity_k),
+        a_fp8_type,
+        scale_major,
+    )
+    fp8_b, scale_b = group_quantize_fp8(
+        b,
+        scale_b_shape,
+        (1, scale_granularity_n, scale_granularity_k),
+        b_fp8_type,
+        scale_major,
+    )
+    return fp8_a, scale_a, fp8_b, scale_b
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("batch", [8])
+@pytest.mark.parametrize("m", [128, 2048])
+@pytest.mark.parametrize("n", [128, 2048])
+@pytest.mark.parametrize("k", [128, 2048])
+@pytest.mark.parametrize(
+    "a_fp8_type,b_fp8_type",
+    [
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.float8_e5m2, torch.float8_e4m3fn),
+        (torch.float8_e5m2, torch.float8_e5m2),
+    ],
+)
+@pytest.mark.parametrize("recipe", [(1, 128, 128), (1, 1, 128)])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.half])
+@pytest.mark.parametrize("backend", ["auto"])
+@pytest.mark.parametrize("use_graph", [False, True])
+@pytest.mark.parametrize(
+    "trans_a,trans_b",
+    [(False, True), (False, False), (True, False), (True, True)],
+)
+def test_bmm_fp8_groupwise_recipes(
+    batch,
+    m,
+    n,
+    k,
+    a_fp8_type,
+    b_fp8_type,
+    recipe,
+    out_dtype,
+    backend,
+    use_graph,
+    trans_a,
+    trans_b,
+):
+    scale_major = "MN" if trans_a or not trans_b else "K"
+    fp8_a, scale_a, fp8_b, scale_b = _make_groupwise_bmm_inputs(
+        batch, m, n, k, recipe, a_fp8_type, b_fp8_type, scale_major
+    )
+
+    a_arg = fp8_a.transpose(-2, -1).contiguous() if trans_a else fp8_a
+    b_arg = fp8_b if trans_b else fp8_b.transpose(-2, -1).contiguous()
+
+    d = torch.empty((batch, m, n), device="musa", dtype=out_dtype)
+    if use_graph:
+        g = torch.musa.MUSAGraph()
+        with torch.musa.graph(g):
+            mate.gemm.bmm(
+                a_arg,
+                b_arg,
+                d,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                recipe_a=(recipe[0], recipe[2]),
+                recipe_b=(recipe[1], recipe[2]),
+                backend=backend,
+            )
+
+        new_fp8_a, new_scale_a, new_fp8_b, new_scale_b = _make_groupwise_bmm_inputs(
+            batch, m, n, k, recipe, a_fp8_type, b_fp8_type, scale_major
+        )
+        new_a_arg = new_fp8_a.transpose(-2, -1).contiguous() if trans_a else new_fp8_a
+        new_b_arg = new_fp8_b if trans_b else new_fp8_b.transpose(-2, -1).contiguous()
+        a_arg.copy_(new_a_arg)
+        b_arg.copy_(new_b_arg)
+        scale_a.copy_(new_scale_a)
+        scale_b.copy_(new_scale_b)
+        fp8_a, scale_a = new_fp8_a, new_scale_a
+        fp8_b, scale_b = new_fp8_b, new_scale_b
+        g.replay()
+    else:
+        mate.gemm.bmm(
+            a_arg,
+            b_arg,
+            d,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            recipe_a=(recipe[0], recipe[2]),
+            recipe_b=(recipe[1], recipe[2]),
+            backend=backend,
+        )
+
+    ref_d = torch.bmm(
+        group_dequantize_fp8(fp8_a, scale_a, scale_major),
+        group_dequantize_fp8(fp8_b, scale_b, scale_major).transpose(-2, -1),
+    )
+
+    torch.testing.assert_close(d.float(), ref_d, rtol=5e-3, atol=5e-3)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize(
+    "trans_a,trans_b",
+    [(False, True), (False, False), (True, False), (True, True)],
+)
+def test_bmm_fp8_mubin_output(trans_a, trans_b):
+    batch, m, n, k = 2, 128, 256, 384
+    recipe = (1, 128, 128)
+    fp8_a, scale_a, fp8_b, scale_b = _make_groupwise_bmm_inputs(batch, m, n, k, recipe)
+
+    a_arg = fp8_a.transpose(-2, -1).contiguous() if trans_a else fp8_a
+    b_arg = fp8_b if trans_b else fp8_b.transpose(-2, -1).contiguous()
+    scale_a_arg = scale_a.transpose(-2, -1).contiguous() if trans_a else scale_a
+    scale_b_arg = scale_b if trans_b else scale_b.transpose(-2, -1).contiguous()
+    scale_out = torch.empty(
+        (batch, m, ceil_div(n, 128)), device="musa", dtype=torch.float32
+    )
+
+    ref_d = torch.bmm(
+        group_dequantize_fp8(fp8_a, scale_a, "K"),
+        group_dequantize_fp8(fp8_b, scale_b, "K").transpose(-2, -1),
+    )
+    result = mate.gemm.bmm(
+        a_arg,
+        b_arg,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        scale_a=scale_a_arg,
+        scale_b=scale_b_arg,
+        scale_out=scale_out,
+        recipe_a=(recipe[0], recipe[2]),
+        recipe_b=(recipe[1], recipe[2]),
+        backend="auto",
+    )
+
+    assert result.dtype == torch.float8_e4m3fn
+    dequant_result = (
+        result.float().reshape(batch, m, n // 128, 128) * scale_out.unsqueeze(-1)
+    ).reshape(batch, m, n)
+    similarity = torch.cosine_similarity(
+        dequant_result.flatten(), ref_d.flatten(), dim=0
+    )
+    assert similarity > 0.999
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("batch", [8])
+@pytest.mark.parametrize("m", [128, 2048])
+@pytest.mark.parametrize("n", [128, 2048])
+@pytest.mark.parametrize("k", [128, 2048])
+@pytest.mark.parametrize("a_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("b_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("scale_granularity_mnk", [(1, -1, -1), (-1, -1, -1)])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.half])
+@pytest.mark.parametrize("backend", ["auto", "mudnn"])
+@pytest.mark.parametrize("use_graph", [False, True])
+@pytest.mark.parametrize(
+    "trans_a,trans_b",
+    [(False, True), (False, False), (True, False), (True, True)],
+)
+def test_bmm_fp8_tensorwise_channelwise(
+    batch,
+    m,
+    n,
+    k,
+    a_fp8_type,
+    b_fp8_type,
+    scale_granularity_mnk,
+    out_dtype,
+    backend,
+    use_graph,
+    trans_a,
+    trans_b,
+):
+    a = torch.rand((batch, m, k), device="musa", dtype=torch.float)
+    b = torch.rand((batch, n, k), device="musa", dtype=torch.float)
+    d = torch.empty((batch, m, n), device="musa", dtype=out_dtype)
+
+    scale_granularity_m, _, scale_granularity_k = scale_granularity_mnk
+    scale_granularity_m = m if scale_granularity_m == -1 else scale_granularity_m
+    scale_granularity_k = k if scale_granularity_k == -1 else scale_granularity_k
+    quant_tile_shape_a = (1, scale_granularity_m, scale_granularity_k)
+    scale_a_shape = (batch, m // scale_granularity_m, k // scale_granularity_k)
+    scale_major = "MN" if trans_a or not trans_b else "K"
+    if scale_major == "MN":
+        scale_a_shape = (scale_a_shape[0], scale_a_shape[2], scale_a_shape[1])
+    recipe_a = (scale_granularity_mnk[0], scale_granularity_mnk[2])
+    recipe_b = (scale_granularity_mnk[1], scale_granularity_mnk[2])
+
+    if scale_granularity_mnk[0] == -1 and scale_granularity_mnk[1] == -1:
+        fp8_a, scale_a = tensor_quantize_fp8(a, a_fp8_type)
+    else:
+        fp8_a, scale_a = group_quantize_fp8(
+            a, scale_a_shape, quant_tile_shape_a, a_fp8_type, scale_major
+        )
+    fp8_b, scale_b = tensor_quantize_fp8(b, b_fp8_type)
+
+    a_arg = fp8_a.transpose(-2, -1).contiguous() if trans_a else fp8_a
+    b_arg = fp8_b if trans_b else fp8_b.transpose(-2, -1).contiguous()
+
+    if use_graph:
+        g = torch.musa.MUSAGraph()
+        with torch.musa.graph(g):
+            mate.gemm.bmm(
+                a_arg,
+                b_arg,
+                d,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+                backend=backend,
+            )
+
+        a.uniform_(0, 1)
+        b.uniform_(0, 1)
+        if scale_granularity_mnk[0] == -1 and scale_granularity_mnk[1] == -1:
+            new_fp8_a, new_scale_a = tensor_quantize_fp8(a, a_fp8_type)
+        else:
+            new_fp8_a, new_scale_a = group_quantize_fp8(
+                a, scale_a_shape, quant_tile_shape_a, a_fp8_type, scale_major
+            )
+        new_fp8_b, new_scale_b = tensor_quantize_fp8(b, b_fp8_type)
+        new_a_arg = new_fp8_a.transpose(-2, -1).contiguous() if trans_a else new_fp8_a
+        new_b_arg = new_fp8_b if trans_b else new_fp8_b.transpose(-2, -1).contiguous()
+        a_arg.copy_(new_a_arg)
+        b_arg.copy_(new_b_arg)
+        scale_a.copy_(new_scale_a)
+        scale_b.copy_(new_scale_b)
+        ref_a = group_dequantize_fp8(new_fp8_a, new_scale_a, scale_major)
+        ref_b = group_dequantize_fp8(new_fp8_b, new_scale_b, scale_major)
+        ref_d = torch.bmm(ref_a, ref_b.transpose(-2, -1))
+        g.replay()
+    else:
+        ref_a = group_dequantize_fp8(fp8_a, scale_a, scale_major)
+        ref_b = group_dequantize_fp8(fp8_b, scale_b, scale_major)
+        ref_d = torch.bmm(ref_a, ref_b.transpose(-2, -1))
+        mate.gemm.bmm(
+            a_arg,
+            b_arg,
+            d,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
+            backend=backend,
+        )
+
+    torch.testing.assert_close(d.float(), ref_d, rtol=5e-3, atol=5e-3)
+
+
+@supported_musa_compute_capability([31])
+def test_bmm_fp8_groupwise_fp32_accumulate_with_c():
+    batch, m, n, k = 2, 128, 128, 128
+    recipe = (1, 1, 128)
+    fp8_a, scale_a, fp8_b, scale_b = _make_groupwise_bmm_inputs(batch, m, n, k, recipe)
+    c = torch.rand((batch, m, n), device="musa", dtype=torch.float32)
+    d = torch.empty_like(c)
+
+    ref_d = c.float() + torch.bmm(
+        group_dequantize_fp8(fp8_a, scale_a, "K"),
+        group_dequantize_fp8(fp8_b, scale_b, "K").transpose(-2, -1),
+    )
+
+    mate.gemm.bmm(
+        fp8_a,
+        fp8_b,
+        d,
+        scale_a=scale_a,
+        scale_b=scale_b,
+        recipe_a=(recipe[0], recipe[2]),
+        recipe_b=(recipe[1], recipe[2]),
+        c=c,
+    )
+
+    torch.testing.assert_close(d, ref_d, rtol=5e-3, atol=5e-3)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize("m", [128, 2048])
+@pytest.mark.parametrize("n", [128, 2048])
+@pytest.mark.parametrize("k", [128, 2048])
+@pytest.mark.parametrize("a_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("b_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("scale_granularity_mnk", [(1, -1, -1), (-1, -1, -1)])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.half])
+@pytest.mark.parametrize("backend", ["auto", "mudnn"])
+def test_bmm_fp8_not_contiguous_output(
+    batch,
+    m,
+    n,
+    k,
+    a_fp8_type,
+    b_fp8_type,
+    scale_granularity_mnk,
+    out_dtype,
+    backend,
+):
+    a = torch.rand((batch, m, k), device="musa", dtype=torch.float)
+    b = torch.rand((batch, n, k), device="musa", dtype=torch.float)
+
+    d_factor = 2
+    d_shape = (batch, m, n)
+    d_stride = (m * n * d_factor * d_factor, n * d_factor, 1)
+    d_storage = sum((s - 1) * st for s, st in zip(d_shape, d_stride)) + 1
+    d_storage_tensor = torch.empty(d_storage, dtype=out_dtype, device="musa")
+    d = torch.as_strided(d_storage_tensor, size=d_shape, stride=d_stride)
+
+    scale_granularity_m, scale_granularity_n, scale_granularity_k = (
+        scale_granularity_mnk
+    )
+    scale_granularity_m = m if scale_granularity_m == -1 else scale_granularity_m
+    # scale_granularity_n = n if scale_granularity_n == -1 else scale_granularity_n
+    scale_granularity_k = k if scale_granularity_k == -1 else scale_granularity_k
+
+    quant_tile_shape_a = (1, scale_granularity_m, scale_granularity_k)
+    scale_a_shape = (batch, m // scale_granularity_m, k // scale_granularity_k)
+
+    if scale_granularity_mnk[0] == -1 and scale_granularity_mnk[1] == -1:
+        fp8_a, scale_a = tensor_quantize_fp8(a, a_fp8_type)
+    else:
+        fp8_a, scale_a = group_quantize_fp8(
+            a, scale_a_shape, quant_tile_shape_a, a_fp8_type, "K"
+        )
+    fp8_b, scale_b = tensor_quantize_fp8(b, b_fp8_type)
+
+    ref_a = group_dequantize_fp8(fp8_a, scale_a, "K")
+    ref_b = group_dequantize_fp8(fp8_b, scale_b, "K")
+    ref_d = torch.bmm(ref_a, ref_b.transpose(-2, -1))
+
+    mate.gemm.bmm(
+        fp8_a,
+        fp8_b,
+        d,
+        scale_a=scale_a,
+        scale_b=scale_b,
+        recipe_a=(scale_granularity_mnk[0], scale_granularity_mnk[2]),
+        recipe_b=(scale_granularity_mnk[1], scale_granularity_mnk[2]),
+        backend=backend,
+    )
+
+    torch.testing.assert_close(d.float(), ref_d, rtol=5e-3, atol=5e-3)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize("m", [128, 2048])
+@pytest.mark.parametrize("n", [128, 2048])
+@pytest.mark.parametrize("k", [128, 2048])
+@pytest.mark.parametrize(
+    "input_dtype,out_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float16, torch.float16),
+        (torch.float16, torch.float32),
+    ],
+)
+@pytest.mark.parametrize(
+    "trans_a,trans_b",
+    [
+        (False, True),
+        (False, False),
+        (True, False),
+        (True, True),
+    ],
+)
+def test_bmm_bf16_fp16(batch, m, n, k, input_dtype, out_dtype, trans_a, trans_b):
+    a = torch.rand((batch, m, k), device="musa", dtype=input_dtype)
+    b = torch.rand((batch, n, k), device="musa", dtype=input_dtype)
+    ref_d = torch.bmm(a.float(), b.float().transpose(-2, -1))
+
+    a_arg = a.transpose(-2, -1).contiguous() if trans_a else a
+    b_arg = b if trans_b else b.transpose(-2, -1).contiguous()
+    out = mate.gemm.bmm(
+        a_arg,
+        b_arg,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        out_dtype=out_dtype,
+        backend="mudnn",
+    )
+    assert out.dtype == out_dtype
+    torch.testing.assert_close(out.float(), ref_d, rtol=5e-3, atol=5e-3)

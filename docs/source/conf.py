@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "wrappers" / "FlashInfer"))
 
 # Allow API docs to build on hosts without visible MUSA devices.
 os.environ.setdefault("MATE_MUSA_ARCH_LIST", "3.1")
@@ -83,6 +84,7 @@ extensions = [
     "sphinx.ext.viewcode",
     "myst_parser",
 ]
+viewcode_follow_imported_members = False
 autodoc_mock_imports = [
     "mate.jit",
     "mate.mate_runtime",

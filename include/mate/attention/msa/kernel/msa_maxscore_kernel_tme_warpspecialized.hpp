@@ -27,6 +27,9 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
   static constexpr int      SharedStorageSize          = sizeof(SharedStorage);
   static constexpr int      MaxThreadsPerBlock         = CollectiveMainloop::NumThreads;
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
+  static_assert(sizeof(BarrierStorage) + mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount <=
+                    mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers,
+                "MSA max-score async barrier id exceeds the MP31 hardware limit.");
 
   struct Arguments {
     ProblemSize                            problem_size;
@@ -72,7 +75,8 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
 
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-    mutlass::arch::allocate_async_barriers(sizeof(BarrierStorage));
+    mutlass::arch::allocate_async_barriers(sizeof(BarrierStorage) +
+                                           mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount);
     BarrierStorage* barrier_storage = reinterpret_cast<BarrierStorage*>(0);
 
     CollectiveMainloop                    mainloop;
@@ -92,15 +96,22 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
         if (TileScheduler::ParallelKTiles && q_work_tile.k_partition_idx >= k_tile_count) {
           continue;
         }
+        if (warp_idx_in_warp_squad != CollectiveMainloop::QLoadWarpInProducer &&
+            warp_idx_in_warp_squad != CollectiveMainloop::KLoadWarpInProducer) {
+          continue;
+        }
         if (lane_idx == 0 && warp_idx_in_warp_squad == CollectiveMainloop::QLoadWarpInProducer) {
           mainloop.load_q(params.mainloop, pipeline, shared_storage, q_work_tile);
+        }
+        if (warp_idx_in_warp_squad != CollectiveMainloop::KLoadWarpInProducer) {
+          continue;
         }
         if constexpr (TileScheduler::ParallelKTiles) {
           MUTLASS_PRAGMA_NO_UNROLL
           for (int k_tile_idx = q_work_tile.k_partition_idx; k_tile_idx < k_tile_count;
                k_tile_idx += params.scheduler.k_partitions) {
             auto k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, k_tile_idx);
-            if (lane_idx == 0 && warp_idx_in_warp_squad == CollectiveMainloop::KLoadWarpInProducer) {
+            if (lane_idx == 0) {
               mainloop.load_k(params.mainloop, pipeline, shared_storage, k_work_tile);
               if constexpr (CollectiveMainloop::EnableKPrefetch) {
                 int next_k_tile_idx = k_tile_idx + params.scheduler.k_partitions;
@@ -115,7 +126,7 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
           MUTLASS_PRAGMA_NO_UNROLL
           for (int k_tile_idx = 0; k_tile_idx < k_tile_count; ++k_tile_idx) {
             auto k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, k_tile_idx);
-            if (lane_idx == 0 && warp_idx_in_warp_squad == CollectiveMainloop::KLoadWarpInProducer) {
+            if (lane_idx == 0) {
               mainloop.load_k(params.mainloop, pipeline, shared_storage, k_work_tile);
               if constexpr (CollectiveMainloop::EnableKPrefetch) {
                 int next_k_tile_idx = k_tile_idx + 1;

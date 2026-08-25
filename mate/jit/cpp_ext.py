@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 import tvm_ffi.cpp.extension as tvm_ffi_ext
+from packaging.version import InvalidVersion, Version
 from tvm_ffi.libinfo import (
     find_dlpack_include_path,
     find_include_path,
@@ -17,6 +19,9 @@ from tvm_ffi.libinfo import (
 )
 
 from . import env as jit_env
+
+
+_MCC_VERSION_PATTERN = re.compile(r"^mcc version\s+(\S+)\s*$", re.MULTILINE)
 
 
 def _escape_ninja_path(path: Path) -> str:
@@ -168,6 +173,36 @@ def get_mcc() -> str:
     if mcc:
         return mcc
     return (get_musa_home() / "bin" / "mcc").as_posix()
+
+
+def _parse_mcc_version(output: str) -> Optional[Version]:
+    match = _MCC_VERSION_PATTERN.search(output)
+    if match is None:
+        return None
+    try:
+        return Version(match.group(1))
+    except InvalidVersion:
+        return None
+
+
+@functools.cache
+def _get_mcc_version(mcc: str) -> Optional[Version]:
+    try:
+        completed = subprocess.run(
+            [mcc, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return _parse_mcc_version(f"{completed.stdout}\n{completed.stderr}")
+
+
+def get_mcc_version() -> Optional[Version]:
+    return _get_mcc_version(get_mcc())
 
 
 def is_musa_source(source: Path) -> bool:

@@ -1,14 +1,14 @@
 # ruff: noqa
 """Shared scheduled sparse decode plumbing.
 
-The MODEL1 and V3.2 scheduled decode kernels intentionally stay in separate
-TileLang factories for now: their kv layouts and producer load/dequant paths are
-different enough that forcing one giant kernel body is hard to maintain and can
-make TileLang compilation fragile.  This module is the first convergence layer:
-shared compile options, host-side ABI helpers, split allocation policy, and
-small wrappers for feature flags.  Future refactors should move only genuinely
-common TileLang macros here and keep layout-specific branches behind
-compile-time constants.
+The MODEL1, V3.2, and FP8 scheduled decode kernels intentionally stay in
+separate TileLang factories for now: their kv layouts and producer load/dequant
+paths are different enough that forcing one giant kernel body is hard to
+maintain and can make TileLang compilation fragile.  This module is the first
+convergence layer: shared compile options, host-side ABI helpers, split
+allocation policy, and small wrappers for feature flags.  Future refactors
+should move only genuinely common TileLang macros here and keep layout-specific
+branches behind compile-time constants.
 """
 
 from dataclasses import dataclass
@@ -17,7 +17,6 @@ from typing import Optional
 import torch
 import tilelang
 from tilelang import language as T
-
 
 SCHEDULED_DECODE_PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: False,
@@ -90,20 +89,33 @@ def make_scheduled_decode_combine(
     max_nums_splits,
     has_attn_sink,
     max_lse_init,
+    launch_by_scheduler=False,
+    lse_layout="BHN",
 ):
     """Build the shared scheduled sparse decode combine macro.
 
-    The split producer stays layout-specific, but V3.2 and MODEL1 combine
-    the scheduled partials with the same LSE reduction and output rescale.
+    ``launch_by_scheduler`` selects the scheduler-partition grid used by the
+    large-batch FP8 path; the default launches one combine partition per batch.
+    ``lse_layout`` controls only the final LSE indexing convention: ``BHN``
+    stores batch/head/sequence, while ``BNH`` stores batch/sequence/head.
     """
+
+    assert lse_layout in ("BHN", "BNH")
 
     block_m = 8
     num_threads = block_m * 32
     elems_per_thread = dim // 32
     num_lse_per_thread = T.ceildiv(max_nums_splits, 32)
+    combine_grid_size = num_mp_parts if launch_by_scheduler else batch
+    lse_shape = (
+        [batch, seq_len, num_heads]
+        if lse_layout == "BNH"
+        else [batch, num_heads, seq_len]
+    )
 
     @T.macro
     def dsa_combine(
+        scheduler_metadata: T.Tensor([num_mp_parts, 8], T.int32),  # type: ignore
         num_splits: T.Tensor([batch + 1], T.int32),  # type: ignore
         glse: T.Tensor([batch + num_mp_parts, seq_len, num_heads], accum_dtype),  # type: ignore
         output_partial: T.Tensor(
@@ -111,12 +123,26 @@ def make_scheduled_decode_combine(
         ),  # type: ignore
         attn_sink: T.Tensor([num_heads], accum_dtype),  # type: ignore
         output: T.Tensor([batch, seq_len, num_heads, dim], dtype),  # type: ignore
-        lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),  # type: ignore
+        lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
     ):
         with T.Kernel(
-            batch, T.ceildiv(seq_len * num_heads, block_m), threads=num_threads
+            combine_grid_size,
+            T.ceildiv(seq_len * num_heads, block_m),
+            threads=num_threads,
         ) as (cb, cm):
+            scheduled_batch_idx = T.alloc_var(T.int32)
+            batch_idx = T.alloc_var(T.int32)
             batch_idx = cb
+            scheduled_batch_idx = cb
+            if launch_by_scheduler:
+                first_split_idx = T.alloc_var(T.int32)
+                scheduled_batch_idx = scheduler_metadata[cb, 0]
+                batch_idx = T.if_then_else(
+                    scheduled_batch_idx < batch,
+                    scheduled_batch_idx,
+                    0,
+                )
+                first_split_idx = scheduler_metadata[cb, 4]
             m_block_idx = cm
             lse_scale_shared = T.alloc_shared(
                 [block_m, max_nums_splits + 1], accum_dtype
@@ -127,7 +153,15 @@ def make_scheduled_decode_combine(
             split_start = num_splits[batch_idx]
             split_end = num_splits[batch_idx + 1]
             my_num_splits = split_end - split_start
-            if my_num_splits > 1:
+            should_combine = T.alloc_var(T.bool)
+            should_combine = my_num_splits > 1
+            if launch_by_scheduler:
+                should_combine = (
+                    should_combine
+                    and scheduled_batch_idx < batch
+                    and first_split_idx == my_num_splits - 1
+                )
+            if should_combine:
                 num_q_seqs = seq_len * num_heads
                 num_cur_valid_q_seqs = T.alloc_var(T.int32)
                 num_cur_valid_q_seqs = T.min(
@@ -192,11 +226,18 @@ def make_scheduled_decode_combine(
 
                     if lane_idx == 0:
                         flat_idx = warp_idx + m_block_idx * block_m
-                        lse[
-                            batch_idx,
-                            flat_idx % num_heads,
-                            flat_idx // num_heads,
-                        ] = global_lse[0] * 0.6931471805599453
+                        if lse_layout == "BNH":
+                            lse[
+                                batch_idx,
+                                flat_idx // num_heads,
+                                flat_idx % num_heads,
+                            ] = global_lse[0] * 0.6931471805599453
+                        else:
+                            lse[
+                                batch_idx,
+                                flat_idx % num_heads,
+                                flat_idx // num_heads,
+                            ] = global_lse[0] * 0.6931471805599453
 
                     for i in T.unroll(num_lse_per_thread):
                         if i * 32 + lane_idx < my_num_splits:
@@ -260,7 +301,7 @@ def make_scheduled_decode_online_softmax(
     block_i,
     out_width,
     accum_dtype,
-    sm_scale,
+    defer_pv1_maintenance=False,
 ):
     """Build the shared QK -> online softmax -> score staging macro."""
 
@@ -279,6 +320,7 @@ def make_scheduled_decode_online_softmax(
         alpha_shared,
         acc_o_l_0,
         acc_o_l_1,
+        sm_scale,
     ):
         T.copy(m_i, m_i_prev)
         T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -289,12 +331,13 @@ def make_scheduled_decode_online_softmax(
         for h_i, bi_i in T.Parallel(h_per_block, block_i):
             acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
 
-        T.reduce_sum(acc_s, sumexp_i, dim=1)
-        for h_i in T.Parallel(h_per_block):
-            sumexp[h_i] = sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
-        for h_i, d_i in T.Parallel(h_per_block, out_width):
-            acc_o_l_0[h_i, d_i] *= alpha_local[h_i]
-            acc_o_l_1[h_i, d_i] *= alpha_local[h_i]
+        if not defer_pv1_maintenance:
+            T.reduce_sum(acc_s, sumexp_i, dim=1)
+            for h_i in T.Parallel(h_per_block):
+                sumexp[h_i] = sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
+            for h_i, d_i in T.Parallel(h_per_block, out_width):
+                acc_o_l_0[h_i, d_i] *= alpha_local[h_i]
+                acc_o_l_1[h_i, d_i] *= alpha_local[h_i]
 
         T.copy(alpha_local, alpha_shared)
         T.copy(acc_s, acc_s_cast)
@@ -340,7 +383,7 @@ def make_scheduled_decode_stage_value_shared(
     return stage_value_shared
 
 
-def make_scheduled_decode_indices_loader(*, block_i):
+def make_scheduled_decode_indices_loader(*, block_i, store_kv_indices=True):
     """Build the shared producer index/mask loader for scheduled decode."""
 
     score_swizzle = block_i // 8
@@ -387,7 +430,8 @@ def make_scheduled_decode_indices_loader(*, block_i):
             for r in T.unroll(4):
                 row = ((r * 16 + ldg_ty) % 8) * score_swizzle + (r * 16 + ldg_ty) // 8
                 is_kv_valid[row] = kperm_mask_local[r]
-                kv_indices[r * 16 + ldg_ty] = kperm_indices_local[r]
+                if store_kv_indices:
+                    kv_indices[r * 16 + ldg_ty] = kperm_indices_local[r]
 
     return load_indices
 
@@ -398,7 +442,6 @@ def make_scheduled_decode_finalize_left(
     out_width,
     num_heads,
     accum_dtype,
-    sm_scale,
     has_attn_sink,
     use_strict_valid,
     add_denominator_epsilon,
@@ -410,8 +453,11 @@ def make_scheduled_decode_finalize_left(
     out_dtype="bfloat16",
     guard_invalid_heads=False,
     support_split=True,
+    lse_layout="BHN",
 ):
     """Build the shared left-half split writeback macro."""
+
+    assert lse_layout in ("BHN", "BNH")
 
     @T.macro
     def finalize_left(
@@ -435,6 +481,7 @@ def make_scheduled_decode_finalize_left(
         num_splits,
         attn_sink,
         bar_final,
+        sm_scale,
     ):
         for h_i in T.Parallel(h_per_block):
             if use_strict_valid:
@@ -540,7 +587,10 @@ def make_scheduled_decode_finalize_left(
                         )
                 for h_i in T.Parallel(h_per_block):
                     if h0 + h_i < num_heads:
-                        lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
+                        if lse_layout == "BNH":
+                            lse[b_i, s_i, h0 + h_i] = sumexp[h_i] * 0.6931471805599453
+                        else:
+                            lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
             else:
                 T.copy(
                     acc_o_l_0,
@@ -551,7 +601,10 @@ def make_scheduled_decode_finalize_left(
                     output[b_i, s_i, h0:h1, l1_start : l1_start + out_width],
                 )
                 for h_i in T.Parallel(h_per_block):
-                    lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
+                    if lse_layout == "BNH":
+                        lse[b_i, s_i, h0 + h_i] = sumexp[h_i] * 0.6931471805599453
+                    else:
+                        lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
         else:
             if support_split:
                 if guard_invalid_heads:

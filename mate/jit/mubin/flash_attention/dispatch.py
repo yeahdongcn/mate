@@ -24,6 +24,7 @@ def get_flash_attention_mubin_id_hash(asm_id: FlashAttentionMubinId) -> str:
 class FlashAttentionMubinDispatcher:
     def __init__(self, kernel_map_path: Path):
         self.kernel_map_path = Path(kernel_map_path)
+        self.module_dir = self.kernel_map_path.parent
         self._kernel_hash_map = {
             entry.dispatch_hash: entry
             for entry in load_kernel_map(self.kernel_map_path)
@@ -55,13 +56,10 @@ class FlashAttentionMubinDispatcher:
             )
         return entry
 
-    def resolve_kernel_path(
-        self, asm_id: FlashAttentionMubinId, mubin_dir: Path
-    ) -> Path:
+    @functools.cache
+    def resolve_kernel_path(self, asm_id: FlashAttentionMubinId) -> Path:
         entry = self.resolve_kernel_entry(asm_id)
-        return ensure_mubin_kernel_artifact(
-            "flash_attention", Path(mubin_dir).parent, entry
-        )
+        return ensure_mubin_kernel_artifact("flash_attention", self.module_dir, entry)
 
 
 @functools.cache

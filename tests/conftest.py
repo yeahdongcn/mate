@@ -273,6 +273,23 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "0 disables progress output."
         ),
     )
+    sparse_mla_group = parser.getgroup("mate-sparse-mla")
+    sparse_mla_group.addoption(
+        "--sparse-mla-full",
+        action="store_true",
+        default=False,
+        help="Run the large sparse MLA correctness cases.",
+    )
+    sparse_mla_group.addoption(
+        "--sparse-mla-stress-iters",
+        action="store",
+        type=int,
+        default=0,
+        help=(
+            "Run the persistent-row sparse MLA stress case for N iterations. "
+            "0 disables it; enabled runs require at least 10000 iterations."
+        ),
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:

@@ -25,40 +25,65 @@ def sparse_fmha(*args, **kwargs):
     return _msa.sparse_msa(*args, **kwargs)
 
 
-def _page_table_to_flat_kv_indices(
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    *,
+def _static_decode_plan(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    total_seqlen_k: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
     page_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if page_table.ndim != 2:
-        raise ValueError(f"page_table must be rank-2, got {tuple(page_table.shape)}")
-    page_table = page_table.to(device=device, dtype=torch.int32, non_blocking=True)
-    page_counts = torch.div(
-        cache_seqlens + int(page_size) - 1,
-        int(page_size),
-        rounding_mode="floor",
+    topk: int,
+    causal: bool,
+    use_fp8_kvcache: bool,
+):
+    sparse = topk > 0
+    return _msa.msa_plan(
+        batch_size=batch_size,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        total_seqlen_k=total_seqlen_k,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        page_size=page_size,
+        sparse_block_size=page_size,
+        num_kv_splits=1,
+        causal=causal,
+        kv_block_num=topk if sparse else -1,
+        sparse_kernel_mode="decode" if sparse else "auto",
+        use_fp8_kvcache=use_fp8_kvcache,
     )
-    if int(page_counts.numel()) != int(page_table.shape[0]):
-        raise ValueError(
-            "page_table batch mismatch: "
-            f"{int(page_table.shape[0])} vs {int(page_counts.numel())}"
-        )
-    max_required_pages = int(page_counts.max().item()) if page_counts.numel() else 0
-    if int(page_table.shape[1]) < max_required_pages:
-        raise ValueError(
-            "page_table does not contain enough columns for cache_seqlens: "
-            f"{int(page_table.shape[1])} < {max_required_pages}"
-        )
-    slices = [
-        page_table[batch_idx, : int(count)]
-        for batch_idx, count in enumerate(page_counts.to("cpu").tolist())
-        if int(count) > 0
-    ]
-    if slices:
-        return torch.cat(slices, dim=0).contiguous()
-    return torch.empty((0,), dtype=torch.int32, device=device)
+
+
+def _decode_runtime_metadata(
+    cache_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    batch_size: int,
+    seqlen_q: int,
+) -> _msa.MsaRuntimeMetadata:
+    device = cache_seqlens.device
+    qo_lens = torch.full((batch_size,), seqlen_q, dtype=torch.int32, device=device)
+    qo_offset = cache_seqlens - seqlen_q
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * seqlen_q,
+        seqlen_q,
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_seqlens_k = torch.zeros((batch_size + 1,), dtype=torch.int32, device=device)
+    if batch_size:
+        torch.cumsum(cache_seqlens, dim=0, out=cu_seqlens_k[1:])
+    return _msa.MsaRuntimeMetadata(
+        qo_lens=qo_lens,
+        kv_lens=cache_seqlens,
+        qo_offset=qo_offset,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+    )
 
 
 def _q2k_to_kv_block_indexes(
@@ -137,18 +162,25 @@ def sparse_decode_atten_func(
         raise ValueError(
             f"page_table batch mismatch: {int(page_table.shape[0])} vs {batch_size}"
         )
-    qo_lens = torch.full(
-        (batch_size,),
-        int(seqlen_q),
-        dtype=torch.int32,
-        device=q.device,
-    )
-    cache_seqlens = seqused_k.to(device=q.device, dtype=torch.int32, non_blocking=True)
+    if seqused_k.device != q.device or seqused_k.dtype != torch.int32:
+        raise ValueError("seqused_k must be an int32 tensor on the same device as q")
+    if not seqused_k.is_contiguous():
+        raise ValueError("seqused_k must be contiguous")
+    cache_seqlens = seqused_k
     if int(cache_seqlens.numel()) != batch_size:
         raise ValueError(
             f"seqused_k batch mismatch: {int(cache_seqlens.numel())} vs {batch_size}"
         )
-    kv_lens = cache_seqlens
+    if page_table.device != q.device or page_table.dtype != torch.int32:
+        raise ValueError("page_table must be an int32 tensor on the same device as q")
+    if not page_table.is_contiguous():
+        raise ValueError("page_table must be contiguous")
+    page_capacity = int(page_table.shape[1]) * int(blk_kv)
+    if int(max_seqlen_k) <= 0 or int(max_seqlen_k) > page_capacity:
+        raise ValueError(
+            "max_seqlen_k must fit inside page_table capacity, got "
+            f"{max_seqlen_k} vs {page_capacity}"
+        )
     kv_block_indexes = _q2k_to_kv_block_indexes(
         q2k_indices,
         total_q=int(q.shape[0]),
@@ -157,58 +189,49 @@ def sparse_decode_atten_func(
     topk = int(kv_block_indexes.shape[-1]) if kv_block_indexes is not None else 0
     if kv_block_indexes is not None and topk != 16:
         raise ValueError(f"MSA forward requires topK=16, got {topk}")
+    use_fp8_kvcache = hasattr(torch, "float8_e4m3fn") and k.dtype == torch.float8_e4m3fn
+    plan = _static_decode_plan(
+        batch_size,
+        int(seqlen_q),
+        page_capacity,
+        int(k.shape[0]) * int(blk_kv),
+        int(q.shape[1]),
+        num_kv_heads,
+        int(blk_kv),
+        topk,
+        bool(causal),
+        use_fp8_kvcache,
+    )
+    runtime_metadata = _decode_runtime_metadata(
+        cache_seqlens,
+        page_table,
+        batch_size=batch_size,
+        seqlen_q=int(seqlen_q),
+    )
     if kv_block_indexes is None:
-        kv_indices = _page_table_to_flat_kv_indices(
-            page_table,
-            cache_seqlens,
-            page_size=int(blk_kv),
-            device=q.device,
-        )
         if return_softmax_lse:
             raise NotImplementedError(
                 "fmha_sm100 sparse_decode_atten_func dense all-KV fallback "
                 "does not implement return_softmax_lse yet"
             )
-        plan = _msa._msa_plan_from_lengths(
-            qo_lens,
-            kv_lens,
-            num_qo_heads=int(q.shape[1]),
-            num_kv_heads=num_kv_heads,
-            page_size=int(blk_kv),
-            num_kv_splits=1,
-            causal=bool(causal),
-            split_prefill_decode=False,
-        )
         out, _ = _msa.msa(
             q,
             k,
             v,
             plan,
-            kv_indices=kv_indices,
             sm_scale=softmax_scale,
+            runtime_metadata=runtime_metadata,
         )
         return out
-    plan = _msa._msa_plan_from_lengths(
-        qo_lens,
-        kv_lens,
-        num_qo_heads=int(q.shape[1]),
-        num_kv_heads=num_kv_heads,
-        page_size=int(blk_kv),
-        num_kv_splits=1,
-        causal=bool(causal),
-        kv_block_num=topk,
-        sparse_kernel_mode="decode",
-        split_prefill_decode=False,
-    )
     result = _msa.sparse_decode_atten_func(
         q,
         k,
         v,
         plan,
-        page_table=page_table,
         kv_block_indexes=kv_block_indexes,
         sm_scale=softmax_scale,
         return_softmax_lse=return_softmax_lse,
+        runtime_metadata=runtime_metadata,
     )
     if not return_softmax_lse:
         return result

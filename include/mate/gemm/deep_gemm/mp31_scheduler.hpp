@@ -71,7 +71,7 @@ class Mp31PersistentTileScheduler {
   }
 
   MUTLASS_DEVICE WorkTileInfo initial_work_tile_info() {
-    current_iter_      = 0;
+    current_iter_      = uint64_t(blockIdx.x);
     current_group_idx_ = 0;
     current_m_cumsum_  = 0;
 
@@ -100,7 +100,7 @@ class Mp31PersistentTileScheduler {
   }
 
   MUTLASS_DEVICE void advance_to_next_work(uint32_t advance_count = 1) {
-    current_iter_ += uint64_t(advance_count);
+    current_iter_ += uint64_t(advance_count) * uint64_t(gridDim.x);
   }
 
  private:
@@ -174,7 +174,7 @@ class Mp31PersistentTileScheduler {
   }
 
   MUTLASS_DEVICE bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-    const uint64_t next_block_idx = current_iter_ * uint64_t(gridDim.x) + uint64_t(blockIdx.x);
+    const uint64_t next_block_idx = current_iter_;
 
     if constexpr (kGemmType == GemmType::MGroupedMasked) {
       while (true) {
@@ -241,7 +241,7 @@ class Mp31PersistentTileScheduler {
   }
 
   MUTLASS_DEVICE WorkTileInfo get_psum_work() {
-    const uint64_t next_block_idx = current_iter_ * uint64_t(gridDim.x) + uint64_t(blockIdx.x);
+    const uint64_t next_block_idx = current_iter_;
 
     while (true) {
       if (current_group_idx_ >= num_groups_) return WorkTileInfo::invalid_work_tile();

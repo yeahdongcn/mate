@@ -17,7 +17,7 @@ high-level inference frameworks and MUSA-native execution backends.
    <pre class="mermaid">
    flowchart TB
        frameworks["1. Framework Integration Layer<br/>vLLM, SGLang"]
-       compat["2. CUDA Ecosystem Compatibility Layer<br/>FlashAttention-3, SageAttention, FlashMLA, FlashKDA, DeepGEMM"]
+       compat["2. CUDA Ecosystem Compatibility Layer<br/>FlashAttention-3, SageAttention, FlashMLA, MSA, FlashKDA, FlashInfer, DeepGEMM"]
        core["3. MATE Core<br/>mha_interface.py, flashmla.py, gemm.py, deep_gemm.py"]
        kernels["4. Native MUSA Kernels and Execution Artifacts<br/>MUBIN, TileLang, JIT, AOT, MUTLASS"]
 

@@ -16,10 +16,11 @@ enum class KdaNamedBarrier : uint32_t {
   OperandsConsumed = 6,
   PReady           = 7,
   DtBiasLoaded     = 8,
-  InverseSmemReady = 9,
-  VUpdatedConsumed = 10,
-  StateConsumed    = 11,
-  NumNamedBarriers = 12,
+  BetaLoaded       = 9,
+  InverseSmemReady = 10,
+  VUpdatedConsumed = 11,
+  StateConsumed    = 12,
+  NumNamedBarriers = 13,
 };
 
 MUTLASS_DEVICE

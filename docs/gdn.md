@@ -55,7 +55,8 @@ Current MATE decode support is intentionally narrow:
 On the currently supported MATE path:
 
 - `q / k / v`: `float16` or `bfloat16`
-- `A_log / dt_bias`: `float32`
+- `A_log`: `float32`
+- `dt_bias`: `float32` or `bfloat16`
 - `a / b`: same dtype as `q`
 - `state`: `float32` for single-token decode; `float32` or `bfloat16` for MTP
 - `intermediate_states_buffer`: same dtype as `state`
@@ -68,7 +69,7 @@ On the currently supported MATE path:
 | Area | Status | Notes |
 | --- | --- | --- |
 | Backend | ✅ Supported | FlashInfer-aligned native MP31 prefill path on MUSA via `mate.gdn_prefill.chunk_gated_delta_rule` |
-| Sequence Mode | ✅ Supported | Varlen prefill with `cu_seqlens` |
+| Sequence Mode | ✅ Supported | Dense prefill without `cu_seqlens` and varlen prefill with `cu_seqlens` |
 | Head Layout | ✅ Supported | `GQA` and `GVA` |
 | Dtype (Q/K/V) | ✅ Supported | `fp16`, `bf16` |
 | Gate Inputs | ✅ Supported | `g` and `beta` are float32 tensors; defaults to all-ones when omitted |
@@ -81,16 +82,83 @@ On the currently supported MATE path:
 
 ### Prefill Shape Rules
 
-| Item | Requirement |
-| --- | --- |
-| `q`, `k`, `v` rank | 3D tensors: `[total_tokens, heads, dim]` |
-| Token count | `q.size(0) == k.size(0) == v.size(0)` |
-| Q/K dim | `q.size(2) == k.size(2)` |
-| Head layout | `GQA`: `num_v_heads == num_k_heads` and `num_q_heads % num_k_heads == 0`; `GVA`: `num_q_heads == num_k_heads` and `num_v_heads % num_q_heads == 0` |
-| `cu_seqlens` | Required by public wrapper for varlen prefill |
-| `chunk_size` | Must be exactly `64` on the current native path |
-| Strides | `q`, `k`, and `v` may be non-contiguous split views, but each must satisfy `stride(-1) == 1` |
-| QK L2 norm | If `use_qk_l2norm_in_kernel=True`, Q and K are modified in place before the KKT solve and fused prefill launch |
+`H_qk` is the number of Q/K heads, `H_v` is the number of value/output heads,
+and `D` is the current Q/K/V head dimension.
+
+| Input or output | Dense | Varlen |
+| --- | --- | --- |
+| `q`, `k` | `[B, T, H_qk, D]` | `[S, H_qk, D]` or `[1, S, H_qk, D]` |
+| `v` | `[B, T, H_v, D]` | `[S, H_v, D]` or `[1, S, H_v, D]` |
+| `g`, `beta` | `[B, T, H_v]` | `[S, H_v]` or `[1, S, H_v]` |
+| `cu_seqlens` | `None` | Cumulative sequence lengths with shape `[B + 1]` |
+| Output | `[B, T, H_v, D]` | `[S, H_v, D]` or `[1, S, H_v, D]`, matching the input rank |
+
+For both modes:
+
+- Q, K, and V must have the same token count and Q and K must have the same
+  head dimension.
+- `GQA` requires `num_v_heads == num_k_heads` and
+  `num_q_heads % num_k_heads == 0`. `GVA` requires
+  `num_q_heads == num_k_heads` and `num_v_heads % num_q_heads == 0`.
+- `chunk_size` must be exactly `64` on the current native path.
+- Q, K, and V may be non-contiguous split views, but each must satisfy
+  `stride(-1) == 1`.
+- If `use_qk_l2norm_in_kernel=True`, Q and K are modified in place before the
+  KKT solve and fused prefill launch.
+
+### Minimal Dense Prefill Example
+
+Dense prefill uses 4D Q/K/V tensors and does not provide `cu_seqlens`:
+
+```python
+import torch
+import mate
+
+batch_size, num_tokens = 2, 128
+num_qk_heads, num_v_heads, head_dim = 2, 2, 128
+
+q = torch.randn(
+    batch_size,
+    num_tokens,
+    num_qk_heads,
+    head_dim,
+    device="musa",
+    dtype=torch.float16,
+)
+k = torch.randn_like(q)
+v = torch.randn(
+    batch_size,
+    num_tokens,
+    num_v_heads,
+    head_dim,
+    device="musa",
+    dtype=torch.float16,
+)
+
+# g is log(alpha) because is_log_space defaults to True.
+g = torch.zeros(
+    batch_size, num_tokens, num_v_heads, device="musa", dtype=torch.float32
+)
+beta = torch.ones_like(g)
+
+output, final_state = mate.gdn_prefill.chunk_gated_delta_rule(
+    q=q,
+    k=k,
+    v=v,
+    g=g,
+    beta=beta,
+    cu_seqlens=None,
+    output_final_state=True,
+)
+
+assert output.shape == (batch_size, num_tokens, num_v_heads, head_dim)
+assert final_state.shape == (
+    batch_size,
+    num_v_heads,
+    head_dim,
+    head_dim,
+)
+```
 
 ### Current Kernel Constraints
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import wraps, lru_cache
 from typing import Any, Callable
 
@@ -20,6 +20,23 @@ class MateDryRunComplete(RuntimeError):
 @lru_cache()
 def is_dry_run_enabled() -> bool:
     return os.environ.get(MATE_DRY_RUN_ENV, "0") == "1"
+
+
+@contextmanager
+def dry_run_context():
+    """Enable MATE dry-run behavior and fake tensors for one execution scope."""
+    previous = os.environ.get(MATE_DRY_RUN_ENV)
+    os.environ[MATE_DRY_RUN_ENV] = "1"
+    is_dry_run_enabled.cache_clear()
+    try:
+        with FakeTensorMode():
+            yield
+    finally:
+        if previous is None:
+            os.environ.pop(MATE_DRY_RUN_ENV, None)
+        else:
+            os.environ[MATE_DRY_RUN_ENV] = previous
+        is_dry_run_enabled.cache_clear()
 
 
 def maybe_fake_tensor_mode(fake: bool = True):

@@ -298,7 +298,7 @@ def _get_mtp_fp32_vk_smem_kernel(
                 dt_bias_reg[0] = T.cast(dt_bias[hid], accum_dtype)
 
                 if state_slot >= 0:
-                    T.copy(
+                    T.tma_copy(
                         initial_state[state_slot, hid, global_v_base, 0],
                         state_smem[0, :, :],
                         barrier=state_load_mbars[0],
@@ -388,7 +388,7 @@ def _get_mtp_fp32_vk_smem_kernel(
                                 T.sync_threads()
 
                             global_next_load_row = global_v_base + next_row_idx
-                            T.copy(
+                            T.tma_copy(
                                 initial_state[state_slot, hid, global_next_load_row, 0],
                                 state_smem[next_stage, :, :],
                                 barrier=state_load_mbars[next_stage],
@@ -525,7 +525,7 @@ def _get_mtp_fp32_vk_smem_kernel(
                             # all consumers finish the current tile.
                             T.sync_threads()
                             global_next_load_row = global_v_base + next_row_idx
-                            T.copy(
+                            T.tma_copy(
                                 initial_state[state_slot, hid, global_next_load_row, 0],
                                 state_smem[stage, :, :],
                                 barrier=state_load_mbars[stage],

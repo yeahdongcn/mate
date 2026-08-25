@@ -28,6 +28,11 @@ __global__ void __launch_bounds__(32, 1) get_mla_metadata_kernel(const GetDecodi
     int cur_s_k = 0;
     if (params.topk_length_ptr != nullptr) {
       cur_s_k = max(__ldg(params.topk_length_ptr + i), 0);
+      if (params.topk != -1) {
+        // The FlashInfer adapter reuses this pointer for raw sequence lengths;
+        // cap scheduled work to the sparse index capacity.
+        cur_s_k = min(cur_s_k, params.topk);
+      }
       if (cur_s_k == 0) {
         cur_s_k = 1;
       }

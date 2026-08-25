@@ -24,6 +24,7 @@ def get_flash_mla_mubin_id_hash(asm_id: FlashMLAMubinId) -> str:
 class FlashMLAMubinDispatcher:
     def __init__(self, kernel_map_path: Path):
         self.kernel_map_path = Path(kernel_map_path)
+        self.module_dir = self.kernel_map_path.parent
         self._kernel_hash_map = {
             entry.dispatch_hash: entry
             for entry in load_kernel_map(self.kernel_map_path)
@@ -46,9 +47,10 @@ class FlashMLAMubinDispatcher:
             raise ValueError(f"No FlashMLA mubin kernel found for hash {asm_id_hash}")
         return entry
 
-    def resolve_kernel_path(self, asm_id: FlashMLAMubinId, mubin_dir: Path) -> Path:
+    @functools.cache
+    def resolve_kernel_path(self, asm_id: FlashMLAMubinId) -> Path:
         entry = self.resolve_kernel_entry(asm_id)
-        return ensure_mubin_kernel_artifact("flash_mla", Path(mubin_dir).parent, entry)
+        return ensure_mubin_kernel_artifact("flash_mla", self.module_dir, entry)
 
 
 @functools.cache

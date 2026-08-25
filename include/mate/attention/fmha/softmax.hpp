@@ -77,8 +77,10 @@ struct Softmax {
         row_max(i) = max(row_max_prev(i), row_max(i));
       }
 
+      bool const is_all_masked = row_max(i) == (-std::numeric_limits<Element>::infinity());
+      Element    max_scaled    = row_max(i);
       if constexpr (CheckInf) {
-        row_max(i) = row_max(i) == (-std::numeric_limits<Element>::infinity()) ? Element{0} : row_max(i);
+        max_scaled = is_all_masked ? Element{0} : row_max(i);
       }
 
       // if (i == 0 && threadIdx.x == 128) {
@@ -87,7 +89,7 @@ struct Softmax {
       // }
 
       // Exp
-      Element scale_max = row_max(i) * sm_scale_log2;
+      Element scale_max = max_scaled * sm_scale_log2;
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
         acc_qk_mn(i, j + 0) = acc_qk_mn(i, j + 0) * sm_scale_log2 - scale_max + MaxOffset;
@@ -98,7 +100,14 @@ struct Softmax {
         float4 v4f32_src =
             make_float4(acc_qk_mn(i, j + 0), acc_qk_mn(i, j + 1), acc_qk_mn(i, j + 2), acc_qk_mn(i, j + 3));
 
+#if defined(MATE_FMHA_USE_SCALAR_EXP2)
+        v4f32_src.x = exp2f(v4f32_src.x);
+        v4f32_src.y = exp2f(v4f32_src.y);
+        v4f32_src.z = exp2f(v4f32_src.z);
+        v4f32_src.w = exp2f(v4f32_src.w);
+#else
         mute::fast_exp2(v4f32_src, v4f32_src);
+#endif
 
         acc_qk_mn(i, j + 0) = v4f32_src.x;
         acc_qk_mn(i, j + 1) = v4f32_src.y;
@@ -108,7 +117,7 @@ struct Softmax {
 
       // RowSum
       if constexpr (!IsFirst) {
-        correction_scales(i) = exp2f((row_max_prev(i) - row_max(i)) * sm_scale_log2);
+        correction_scales(i) = is_all_masked ? Element{1.f} : exp2f((row_max_prev(i) - row_max(i)) * sm_scale_log2);
         row_sum(i)           = correction_scales(i) * row_sum(i);
       }
 

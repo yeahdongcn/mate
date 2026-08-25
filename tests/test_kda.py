@@ -7,6 +7,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mate.testing import repeat_check
+
 CHUNK_SIZE = 32
 HEAD_SIZE = 128
 
@@ -743,6 +745,7 @@ CHUNKED_KDA_CASES = [
     ),
     DENSE_KDA_CASES,
 )
+@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_matches_reference(
     dtype_name: str,
     use_qk_l2norm_in_kernel: bool,
@@ -787,6 +790,7 @@ def test_kda_fused_matches_reference(
     ),
     VARLEN_KDA_CASES,
 )
+@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_varlen_matches_reference(
     dtype_name: str,
     use_qk_l2norm_in_kernel: bool,
@@ -813,6 +817,7 @@ def test_kda_fused_varlen_matches_reference(
     )
 
 
+@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_varlen_int32_cu_seqlens_matches_reference() -> None:
     _test_kda_kernel(
         dtype_name="bfloat16",
@@ -829,6 +834,7 @@ def test_kda_fused_varlen_int32_cu_seqlens_matches_reference() -> None:
     )
 
 
+@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_single_chunk_zero_v_with_initial_state_matches_reference() -> None:
     _test_kda_kernel(
         dtype_name="bfloat16",
@@ -847,6 +853,7 @@ def test_kda_fused_single_chunk_zero_v_with_initial_state_matches_reference() ->
     )
 
 
+@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_varlen_single_sequence_four_chunks_matches_reference() -> None:
     _test_kda_kernel(
         dtype_name="bfloat16",
@@ -860,6 +867,89 @@ def test_kda_fused_varlen_single_sequence_four_chunks_matches_reference() -> Non
         seed=_resolve_seed(106),
         lower_bound=-5.0,
         use_qk_l2norm_in_kernel=True,
+    )
+
+
+@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
+def test_kda_fused_varlen_single_sequence_2048_matches_reference() -> None:
+    _test_kda_kernel(
+        dtype_name="bfloat16",
+        seq_lens=[2048],
+        num_qk_heads=1,
+        num_v_heads=1,
+        use_initial_state=True,
+        state_dtype_name="float32",
+        varlen=True,
+        cu_seqlens_dtype=torch.int32,
+        seed=_resolve_seed(109),
+        lower_bound=-5.0,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+
+def test_kda_single_token_state_residual_v_layout() -> None:
+    device = _get_runtime_device()
+    dtype = torch.bfloat16
+    state_dtype = torch.float32
+    k_index = 18
+
+    q_ref = torch.zeros((1, 1, HEAD_SIZE), dtype=dtype)
+    k_ref = torch.zeros_like(q_ref)
+    k_ref[0, 0, k_index] = 1
+    v_ref = torch.zeros_like(q_ref)
+    g_ref = torch.zeros_like(q_ref)
+    beta_ref = torch.zeros((1, 1), dtype=dtype)
+    initial_state = torch.zeros((1, 1, HEAD_SIZE, HEAD_SIZE), dtype=state_dtype)
+    # Encoding V in one K column makes any residual V-row permutation directly observable.
+    initial_state[0, 0, :, k_index] = torch.arange(HEAD_SIZE, dtype=state_dtype)
+    A_log = torch.zeros((1,), device=device, dtype=torch.float32)
+    dt_bias = torch.zeros((1, HEAD_SIZE), device=device, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 1], device=device, dtype=torch.int32)
+
+    actual_o, actual_state = _run_fused_kda(
+        q_ref.to(device),
+        k_ref.to(device),
+        v_ref.to(device),
+        g_ref.to(device),
+        beta_ref.to(device),
+        scale=1.0,
+        initial_state=initial_state.to(device),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=0.0,
+        use_qk_l2norm_in_kernel=True,
+    )
+    _synchronize(device)
+
+    expected_o, expected_state = blockwise_kda_reference(
+        q_ref,
+        k_ref,
+        v_ref,
+        g_ref,
+        beta_ref,
+        scale=1.0,
+        initial_state=initial_state,
+        A_log=A_log.cpu(),
+        dt_bias=dt_bias.cpu(),
+        lower_bound=0.0,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int64),
+    )
+    _assert_close(
+        actual_o,
+        expected_o,
+        value_dtype=dtype,
+        state_dtype=state_dtype,
+        is_output=True,
+    )
+    _assert_close(
+        actual_state,
+        expected_state,
+        value_dtype=dtype,
+        state_dtype=state_dtype,
+        is_output=False,
     )
 
 
