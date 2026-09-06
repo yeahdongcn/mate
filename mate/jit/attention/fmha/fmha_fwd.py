@@ -1,4 +1,5 @@
 import functools
+import os
 from pathlib import Path
 import torch
 from typing import Optional, Dict, Any, Mapping, Sequence
@@ -973,6 +974,11 @@ def _fmha_fwd(
         consumers_qk = 1
         consumers_pv = 1
         enable_packgqa = False
+        # S5000 tuning hook. Keep the default MATE 2-stage pipeline, while
+        # allowing a leased benchmark to compare the lower-register 1-stage
+        # variant without changing dense callers.
+        if os.environ.get("FASTVIDEO_MUSA_VSA_STAGES") == "1":
+            stages_k = stages_v = 1
     # print(
     #     f"{tile_m=}, {tile_n=}, {stages_k=}, {stages_v=}, {headdim_rounded=}, {headdim_v_rounded=}, {consumers_qk=}, {consumers_pv=}, {enable_packgqa=}"
     # )
