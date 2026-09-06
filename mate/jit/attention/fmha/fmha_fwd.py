@@ -963,6 +963,16 @@ def _fmha_fwd(
         q_v is not None,
         q.dtype in [torch.float8_e4m3fn, torch.float8_e5m2],
     )
+    if block_sparse_idx is not None:
+        # H3 metadata is indexed per independent 64-token query tile. Dense
+        # heuristics may choose TileM=128/256 and would merge routes, changing
+        # the attention function. Keep the native sparse specialization's
+        # complete 64x64 pipeline explicit.
+        tile_m = 64
+        tile_n = 64
+        consumers_qk = 1
+        consumers_pv = 1
+        enable_packgqa = False
     # print(
     #     f"{tile_m=}, {tile_n=}, {stages_k=}, {stages_v=}, {headdim_rounded=}, {headdim_v_rounded=}, {consumers_qk=}, {consumers_pv=}, {enable_packgqa=}"
     # )
