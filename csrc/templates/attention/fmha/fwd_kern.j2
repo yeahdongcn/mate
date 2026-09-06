@@ -51,6 +51,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
   int const num_splits,
   ffi::Optional<ffi::TensorView> metadata,
   ffi::Optional<ffi::TensorView> learnable_sink,
+  ffi::Optional<ffi::TensorView> block_sparse_idx,
   ffi::TensorView out,
   ffi::TensorView lse,
   // CP params — non-CP callers pass cp_world_size=1, cp_rank=0, cp_tot_seqused_k=None
@@ -96,6 +97,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
   constexpr bool HasMetadata = {{ 'true' if has_metadata else 'false' }};
   constexpr bool EnableCP = {{ 'true' if enable_cp else 'false' }};
   constexpr bool HasAttentionChunk = {{ 'true' if has_attention_chunk else 'false' }};
+  constexpr bool IsBlockSparse = {{ 'true' if block_sparse else 'false' }};
 
   // If no metadata, fallback to SingleTileScheduler without split.
   constexpr bool IsSplit = HasMetadata;
@@ -147,7 +149,8 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                          HasSeqlensRotary,
                                                          EnableCP,
                                                          HasAttentionChunk,
-                                                         NumPVConsumers>;
+                                                         NumPVConsumers,
+                                                         IsBlockSparse>;
   using CollectiveEpilogue =
     mate::attention::fmha::CollectiveEpilogueFwd<ElementOut,
                                                  CollectiveMainloop::TileShapePDV,
@@ -433,6 +436,14 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .cp_tot_seqused_k = cp_tot_seqused_k.has_value()
                         ? static_cast<uint32_t const*>(cp_tot_seqused_k.value().data_ptr())
                         : nullptr,
+
+    .ptr_block_sparse_idx = IsBlockSparse
+        ? static_cast<int32_t const*>(block_sparse_idx.value().data_ptr())
+        : nullptr,
+    .topk_bs = IsBlockSparse ? static_cast<int>(block_sparse_idx.value().size(-1)) : 0,
+    .stride_bsi_b = IsBlockSparse ? block_sparse_idx.value().stride(0) : 0,
+    .stride_bsi_h = IsBlockSparse ? block_sparse_idx.value().stride(1) : 0,
+    .stride_bsi_m = IsBlockSparse ? block_sparse_idx.value().stride(2) : 0,
   };
 
   typename CollectiveEpilogue::Arguments epilogue_args {

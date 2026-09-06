@@ -556,6 +556,7 @@ def _fmha_fwd(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
+    block_sparse_idx: Optional[torch.Tensor] = None,
     kv_batch_idx: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
     rotary_cos: Optional[torch.Tensor] = None,
@@ -592,8 +593,19 @@ def _fmha_fwd(
     # Canonicalize tensor layout before deriving runtime metadata.
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     q_v = maybe_contiguous(q_v)
+    block_sparse_idx = maybe_contiguous(block_sparse_idx)
     if k_new is not None:
         k_new, v_new = [maybe_contiguous(t) for t in (k_new, v_new)]
+
+    if block_sparse_idx is not None:
+        assert block_sparse_idx.dtype == torch.int32, "block_sparse_idx must be int32"
+        assert block_sparse_idx.dim() == 4, "block_sparse_idx must be (batch, head_kv, q_tile, topk)"
+        assert page_table is None, "block_sparse_idx does not support paged KV"
+        assert not is_causal
+        assert (window_size_left is None or window_size_left < 0) and (
+            window_size_right is None or window_size_right < 0
+        )
+        assert q_v is None, "block_sparse_idx does not support q_v"
 
     # Infer runtime shape metadata.
     num_head, head_dim = q.shape[-2:]
@@ -638,6 +650,7 @@ def _fmha_fwd(
             seqused_q,
             seqused_k,
             page_table,
+            block_sparse_idx,
             learnable_sink,
             k_new,
             v_new,
@@ -954,6 +967,7 @@ def _fmha_fwd(
         "has_k_descale": k_descale is not None,
         "has_v_descale": v_descale is not None,
         "paged_kv": page_table is not None,
+        "block_sparse": block_sparse_idx is not None,
         "has_softcap": softcap != 0.0,
         "is_append_kv": k_new is not None,
         "has_learnable_sink": learnable_sink is not None,
@@ -1004,6 +1018,7 @@ def _fmha_fwd(
         max_seqlen_q,
         max_seqlen_k,
         page_table,
+        block_sparse_idx,
         kv_batch_idx,
         leftpad_k,
         rotary_cos,

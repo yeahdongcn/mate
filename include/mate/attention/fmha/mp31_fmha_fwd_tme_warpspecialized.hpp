@@ -62,7 +62,8 @@ template <class Element_,
           bool HasSeqlensRotary_,
           bool EnableCP_,
           bool HasAttentionChunk_,
-          int  NumPVConsumers_ = NumQKConsumers_>
+          int  NumPVConsumers_ = NumQKConsumers_,
+          bool IsBlockSparse_ = false>
 struct Mp31FmhaFwdTmeWarpSpecialized {
   using Element            = Element_;
   using ElementAccumulator = ElementAccumulator_;
@@ -110,6 +111,10 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr bool IsCausal  = IsCausal_;
   static constexpr bool IsLocal   = IsLocal_;
   static constexpr bool Split     = Split_;
+  static constexpr bool IsBlockSparse = IsBlockSparse_;
+
+  static_assert(!IsBlockSparse || (!IsPagedKV && !IsCausal && !IsLocal && !HasQv),
+                "Block-sparse FMHA requires contiguous non-causal MHA");
 
   static constexpr bool HasLearnableSink = HasLearnableSink_;
   static constexpr bool HasSoftcap       = HasSoftcap_;
@@ -559,6 +564,12 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     int             cp_world_size    = 1;
     int             cp_rank          = 0;
     uint32_t const* cp_tot_seqused_k = nullptr;
+
+    int32_t const* ptr_block_sparse_idx = nullptr;
+    int             topk_bs = 0;
+    int64_t         stride_bsi_b = 0;
+    int64_t         stride_bsi_h = 0;
+    int64_t         stride_bsi_m = 0;
   };
 
   struct Params {
@@ -666,6 +677,12 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     int             cp_world_size    = 1;
     int             cp_rank          = 0;
     uint32_t const* cp_tot_seqused_k = nullptr;
+
+    int32_t const* ptr_block_sparse_idx = nullptr;
+    int             topk_bs = 0;
+    int64_t         stride_bsi_b = 0;
+    int64_t         stride_bsi_h = 0;
+    int64_t         stride_bsi_m = 0;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -897,6 +914,11 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         .cp_world_size    = args.cp_world_size,
         .cp_rank          = args.cp_rank,
         .cp_tot_seqused_k = args.cp_tot_seqused_k,
+        .ptr_block_sparse_idx = args.ptr_block_sparse_idx,
+        .topk_bs          = args.topk_bs,
+        .stride_bsi_b     = args.stride_bsi_b,
+        .stride_bsi_h     = args.stride_bsi_h,
+        .stride_bsi_m     = args.stride_bsi_m,
     };
   }
 
@@ -1109,7 +1131,17 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     bool should_load_K = UseLSULoadK || SingleProducerWarp || warp_idx_in_warp_squad == 0;
     bool should_load_V = UseLSULoadV || SingleProducerWarp || warp_idx_in_warp_squad == 0;
 
+    int64_t sparse_base = 0;
+    if constexpr (IsBlockSparse) {
+      sparse_base = bidb * params.stride_bsi_b + bidh_kv * params.stride_bsi_h + m_block * params.stride_bsi_m;
+    }
     int n_block = n_block_max - 1;
+    if constexpr (IsBlockSparse) {
+      if (params.topk_bs <= 0) {
+        return;
+      }
+      n_block = params.ptr_block_sparse_idx[sparse_base];
+    }
 
     if constexpr (UseTMELoadQ) {
       // (Non-)PackGQA TME load Q
@@ -1184,8 +1216,24 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     }
 
     int n_block_prev = n_block;
-    --n_block;
-    for (; n_block >= n_block_min; --n_block) {
+    if constexpr (IsBlockSparse) {
+      for (int t = 1; t < params.topk_bs; ++t) {
+        n_block = params.ptr_block_sparse_idx[sparse_base + t];
+        if (should_load_K) {
+          load_K(n_block, smem_pipe_write_k);
+        }
+        if (should_load_V) {
+          if constexpr (IntraWarpSquadOverlap) {
+            load_V(n_block_prev, smem_pipe_write_v);
+          } else {
+            load_V(n_block, smem_pipe_write_v);
+          }
+        }
+        n_block_prev = n_block;
+      }
+    } else {
+      --n_block;
+      for (; n_block >= n_block_min; --n_block) {
       if constexpr (IsPagedKV) {
         // NOTE: using same load method (LSU or TME) for both K and V if IsPagedKV
         if (should_load_K) {
@@ -1209,7 +1257,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
           load_V(n_block, smem_pipe_write_v);
         }
       }
-      n_block_prev = n_block;
+        n_block_prev = n_block;
+      }
     }
 
     if constexpr (IntraWarpSquadOverlap) {
@@ -1534,7 +1583,18 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
              params.sink_token_length,
              params.attention_chunk_divmod);
 
+    int64_t sparse_base = 0;
+    if constexpr (IsBlockSparse) {
+      sparse_base = bidb * params.stride_bsi_b + bidh_kv * params.stride_bsi_h + m_block * params.stride_bsi_m;
+      if (params.topk_bs <= 0) {
+        auto lse = make_tensor<float>(Shape<Int<Rows>>{});
+        return mute::make_tuple(false, mute::make_tuple(acc_pv, lse));
+      }
+    }
     int n_block = n_block_max - 1;
+    if constexpr (IsBlockSparse) {
+      n_block = params.ptr_block_sparse_idx[sparse_base];
+    }
 
     if constexpr (IntraWarpSquadOverlap) {
       Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQKD{}));
@@ -1628,6 +1688,17 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         }
       };
 
+      if constexpr (IsBlockSparse) {
+        auto sparse_mask_fn = [&](auto& tSrS, int sparse_n_block) {
+          mask.template apply</* SeqlenMask */ true>(tSrS, m_block, sparse_n_block);
+        };
+        for (int t = 1; t < params.topk_bs; ++t) {
+          fwd_step(params.ptr_block_sparse_idx[sparse_base + t],
+                   sparse_mask_fn,
+                   /* CheckInf */ mute::true_type{});
+        }
+      }
+
       // Causal/Local Masking
       if constexpr (IsCausal || IsLocal) {
         auto mask_fn = [&](auto& tSrS, int n_block) {
@@ -1644,12 +1715,14 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       int const n_block_min_before_local_mask = BlockInfo::get_n_block_min_before_local_mask(
           seqlen_info, m_block, n_block_min, params.window_size_left, params.attention_chunk_divmod);
       auto no_mask_fn = [](auto& tSrS, int n_block) {};
-      for (; n_block >= n_block_min_before_local_mask; --n_block) {
-        fwd_step(n_block, no_mask_fn, /* CheckInf */ mute::false_type{});
+      if constexpr (!IsBlockSparse) {
+        for (; n_block >= n_block_min_before_local_mask; --n_block) {
+          fwd_step(n_block, no_mask_fn, /* CheckInf */ mute::false_type{});
+        }
       }
 
       // Local mask iterations
-      if constexpr (IsLocal) {
+      if constexpr (!IsBlockSparse && IsLocal) {
         auto local_mask_fn = [&](auto& tSrS, int n_block) {
           mask.template apply</*SeqlenKMask*/ false>(tSrS, m_block, n_block);
         };
