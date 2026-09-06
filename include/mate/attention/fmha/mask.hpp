@@ -115,9 +115,7 @@ struct Mask {
 
     int seqlen_k_limit;
     if constexpr (IsSeqlenKMask) {
-      seqlen_k_limit = variable_tile_size >= 0
-          ? variable_tile_size
-          : seqlen_k_limit_base - n_blk_idx * TileN;
+      seqlen_k_limit = seqlen_k_limit_base - n_blk_idx * TileN;
     }
 
     if constexpr (IsSeqlenKMask && !IsCausal && !IsLocal) {
@@ -127,13 +125,16 @@ struct Mask {
       for (int n = 0; n < size<1>(tSrS_mn); ++n) {
         int const col_idx = static_cast<int>(get<1>(tS0cS_mn(_0{}, n)));
         bool      masked;
+        int const tile_limit = variable_tile_size >= 0
+            ? variable_tile_size - thread_col_offset
+            : seqlen_k_limit;
         if constexpr (EnableCP) {
           int const abs_k_local  = col_idx + thread_col_offset + n_blk_idx * TileN;
           int const abs_k_global = abs_k_local * cp_world_size + cp_rank;
           // mask if beyond actual local seqlen_k boundary OR beyond global tot_seqlen_k
-          masked = (col_idx >= seqlen_k_limit) || (abs_k_global >= tot_seqlen_k);
+          masked = (col_idx >= tile_limit) || (abs_k_global >= tot_seqlen_k);
         } else {
-          masked = (col_idx >= seqlen_k_limit);
+          masked = (col_idx >= tile_limit);
         }
         if (masked) {
           MUTE_UNROLL
