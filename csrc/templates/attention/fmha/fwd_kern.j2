@@ -32,6 +32,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
   ffi::Optional<int> max_seqlen_q,
   ffi::Optional<int> max_seqlen_kv,
   ffi::Optional<ffi::TensorView> page_table,
+  ffi::Optional<ffi::TensorView> block_sparse_idx,
   ffi::Optional<ffi::TensorView> kv_batch_idx,
   ffi::Optional<ffi::TensorView> leftpad_k,
   ffi::Optional<ffi::TensorView> rotary_cos,
@@ -51,7 +52,6 @@ ffi::Array<ffi::Any> {{ func_name }} (
   int const num_splits,
   ffi::Optional<ffi::TensorView> metadata,
   ffi::Optional<ffi::TensorView> learnable_sink,
-  ffi::Optional<ffi::TensorView> block_sparse_idx,
   ffi::TensorView out,
   ffi::TensorView lse,
   // CP params — non-CP callers pass cp_world_size=1, cp_rank=0, cp_tot_seqused_k=None
