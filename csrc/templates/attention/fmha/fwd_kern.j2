@@ -33,6 +33,8 @@ ffi::Array<ffi::Any> {{ func_name }} (
   ffi::Optional<int> max_seqlen_kv,
   ffi::Optional<ffi::TensorView> page_table,
   ffi::Optional<ffi::TensorView> block_sparse_idx,
+  ffi::Optional<ffi::TensorView> block_sparse_num,
+  ffi::Optional<ffi::TensorView> block_sparse_vbs,
   ffi::Optional<ffi::TensorView> kv_batch_idx,
   ffi::Optional<ffi::TensorView> leftpad_k,
   ffi::Optional<ffi::TensorView> rotary_cos,
@@ -440,10 +442,20 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .ptr_block_sparse_idx = IsBlockSparse
         ? static_cast<int32_t const*>(block_sparse_idx.value().data_ptr())
         : nullptr,
+    .ptr_block_sparse_num = IsBlockSparse
+        ? static_cast<int32_t const*>(block_sparse_num.value().data_ptr())
+        : nullptr,
+    .ptr_block_sparse_vbs = IsBlockSparse
+        ? static_cast<int32_t const*>(block_sparse_vbs.value().data_ptr())
+        : nullptr,
     .topk_bs = IsBlockSparse ? static_cast<int>(block_sparse_idx.value().size(-1)) : 0,
     .stride_bsi_b = IsBlockSparse ? block_sparse_idx.value().stride(0) : 0,
     .stride_bsi_h = IsBlockSparse ? block_sparse_idx.value().stride(1) : 0,
     .stride_bsi_m = IsBlockSparse ? block_sparse_idx.value().stride(2) : 0,
+    .stride_bsn_b = IsBlockSparse ? block_sparse_num.value().stride(0) : 0,
+    .stride_bsn_h = IsBlockSparse ? block_sparse_num.value().stride(1) : 0,
+    .stride_bsn_m = IsBlockSparse ? block_sparse_num.value().stride(2) : 0,
+    .stride_bs_v = IsBlockSparse ? block_sparse_vbs.value().stride(0) : 0,
   };
 
   typename CollectiveEpilogue::Arguments epilogue_args {

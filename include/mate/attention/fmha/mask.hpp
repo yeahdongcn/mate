@@ -103,7 +103,11 @@ struct Mask {
   }
 
   template <bool IsSeqlenKMask, class SEngine, class SLayout>
-  MUTLASS_DEVICE void apply(Tensor<SEngine, SLayout>& tSrS, int const m_blk_idx, int const n_blk_idx) {
+  MUTLASS_DEVICE void apply(
+      Tensor<SEngine, SLayout>& tSrS,
+      int const m_blk_idx,
+      int const n_blk_idx,
+      int const variable_tile_size = -1) {
     auto   thr_mma_qk0 = TiledMmaQK{}.get_thread_slice(_0{});
     Tensor tS0cS_mn    = detail::make_identity_tensor_acc_qk(TileMN{}, thr_mma_qk0);
 
@@ -111,7 +115,9 @@ struct Mask {
 
     int seqlen_k_limit;
     if constexpr (IsSeqlenKMask) {
-      seqlen_k_limit = seqlen_k_limit_base - n_blk_idx * TileN;
+      seqlen_k_limit = variable_tile_size >= 0
+          ? variable_tile_size
+          : seqlen_k_limit_base - n_blk_idx * TileN;
     }
 
     if constexpr (IsSeqlenKMask && !IsCausal && !IsLocal) {

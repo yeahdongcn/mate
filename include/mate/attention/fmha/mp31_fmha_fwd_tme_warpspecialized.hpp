@@ -566,10 +566,16 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     uint32_t const* cp_tot_seqused_k = nullptr;
 
     int32_t const* ptr_block_sparse_idx = nullptr;
+    int32_t const* ptr_block_sparse_num = nullptr;
+    int32_t const* ptr_block_sparse_vbs = nullptr;
     int             topk_bs = 0;
     int64_t         stride_bsi_b = 0;
     int64_t         stride_bsi_h = 0;
     int64_t         stride_bsi_m = 0;
+    int64_t         stride_bsn_b = 0;
+    int64_t         stride_bsn_h = 0;
+    int64_t         stride_bsn_m = 0;
+    int64_t         stride_bs_v = 0;
   };
 
   struct Params {
@@ -679,10 +685,16 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     uint32_t const* cp_tot_seqused_k = nullptr;
 
     int32_t const* ptr_block_sparse_idx = nullptr;
+    int32_t const* ptr_block_sparse_num = nullptr;
+    int32_t const* ptr_block_sparse_vbs = nullptr;
     int             topk_bs = 0;
     int64_t         stride_bsi_b = 0;
     int64_t         stride_bsi_h = 0;
     int64_t         stride_bsi_m = 0;
+    int64_t         stride_bsn_b = 0;
+    int64_t         stride_bsn_h = 0;
+    int64_t         stride_bsn_m = 0;
+    int64_t         stride_bs_v = 0;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -915,10 +927,16 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         .cp_rank          = args.cp_rank,
         .cp_tot_seqused_k = args.cp_tot_seqused_k,
         .ptr_block_sparse_idx = args.ptr_block_sparse_idx,
+        .ptr_block_sparse_num = args.ptr_block_sparse_num,
+        .ptr_block_sparse_vbs = args.ptr_block_sparse_vbs,
         .topk_bs          = args.topk_bs,
         .stride_bsi_b     = args.stride_bsi_b,
         .stride_bsi_h     = args.stride_bsi_h,
         .stride_bsi_m     = args.stride_bsi_m,
+        .stride_bsn_b     = args.stride_bsn_b,
+        .stride_bsn_h     = args.stride_bsn_h,
+        .stride_bsn_m     = args.stride_bsn_m,
+        .stride_bs_v      = args.stride_bs_v,
     };
   }
 
@@ -1136,8 +1154,13 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       sparse_base = bidb * params.stride_bsi_b + bidh_kv * params.stride_bsi_h + m_block * params.stride_bsi_m;
     }
     int n_block = n_block_max - 1;
+    int sparse_count = params.topk_bs;
     if constexpr (IsBlockSparse) {
-      if (params.topk_bs <= 0) {
+      if (params.ptr_block_sparse_num != nullptr) {
+        sparse_count = params.ptr_block_sparse_num[
+            bidb * params.stride_bsn_b + bidh_kv * params.stride_bsn_h + m_block * params.stride_bsn_m];
+      }
+      if (sparse_count <= 0) {
         return;
       }
       n_block = params.ptr_block_sparse_idx[sparse_base];
@@ -1217,7 +1240,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     int n_block_prev = n_block;
     if constexpr (IsBlockSparse) {
-      for (int t = 1; t < params.topk_bs; ++t) {
+      for (int t = 1; t < sparse_count; ++t) {
         n_block = params.ptr_block_sparse_idx[sparse_base + t];
         if (should_load_K) {
           load_K(n_block, smem_pipe_write_k);
@@ -1584,9 +1607,14 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
              params.attention_chunk_divmod);
 
     int64_t sparse_base = 0;
+    int sparse_count = params.topk_bs;
     if constexpr (IsBlockSparse) {
       sparse_base = bidb * params.stride_bsi_b + bidh_kv * params.stride_bsi_h + m_block * params.stride_bsi_m;
-      if (params.topk_bs <= 0) {
+      if (params.ptr_block_sparse_num != nullptr) {
+        sparse_count = params.ptr_block_sparse_num[
+            bidb * params.stride_bsn_b + bidh_kv * params.stride_bsn_h + m_block * params.stride_bsn_m];
+      }
+      if (sparse_count <= 0) {
         auto lse = make_tensor<float>(Shape<Int<Rows>>{});
         return mute::make_tuple(false, mute::make_tuple(acc_pv, lse));
       }
@@ -1619,7 +1647,13 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       apply_softcap(acc_qk);
 
       // Mask Mode
-      mask.template apply</*SeqlenMask*/ true>(acc_qk, m_block, n_block);
+      mask.template apply</*SeqlenMask*/ true>(
+          acc_qk,
+          m_block,
+          n_block,
+          IsBlockSparse && params.ptr_block_sparse_vbs != nullptr
+              ? params.ptr_block_sparse_vbs[n_block * params.stride_bs_v]
+              : -1);
 
       // Softmax
       Tensor correction_scales = softmax.template online_softmax<true, true>(acc_qk, tiled_mma_qk);
@@ -1690,9 +1724,13 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
       if constexpr (IsBlockSparse) {
         auto sparse_mask_fn = [&](auto& tSrS, int sparse_n_block) {
-          mask.template apply</* SeqlenMask */ true>(tSrS, m_block, sparse_n_block);
+          mask.template apply</* SeqlenMask */ true>(
+              tSrS,
+              m_block,
+              sparse_n_block,
+              params.ptr_block_sparse_vbs[sparse_n_block * params.stride_bs_v]);
         };
-        for (int t = 1; t < params.topk_bs; ++t) {
+        for (int t = 1; t < sparse_count; ++t) {
           fwd_step(params.ptr_block_sparse_idx[sparse_base + t],
                    sparse_mask_fn,
                    /* CheckInf */ mute::true_type{});
@@ -1792,14 +1830,31 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         release_pv();
       };
 
-      auto first_iter_mask_fn = [&](auto& tSrS, int n_block) {
-        mask.template apply</*seqlenk mask*/ true>(tSrS, m_block, n_block);
-      };
-      fwd_step(n_block, first_iter_mask_fn, /*IsFirstIter*/ mute::true_type{}, /*CheckInf*/ mute::true_type{});
-      --n_block;
+      if constexpr (IsBlockSparse) {
+        auto sparse_mask_fn = [&](auto& tSrS, int sparse_n_block) {
+          mask.template apply</*seqlenk mask*/ true>(
+              tSrS,
+              m_block,
+              sparse_n_block,
+              params.ptr_block_sparse_vbs[sparse_n_block * params.stride_bs_v]);
+        };
+        fwd_step(n_block, sparse_mask_fn, /*IsFirstIter*/ mute::true_type{}, /*CheckInf*/ mute::true_type{});
+        for (int t = 1; t < sparse_count; ++t) {
+          fwd_step(params.ptr_block_sparse_idx[sparse_base + t],
+                   sparse_mask_fn,
+                   /*IsFirstIter*/ mute::false_type{},
+                   /*CheckInf*/ mute::true_type{});
+        }
+      } else {
+        auto first_iter_mask_fn = [&](auto& tSrS, int dense_n_block) {
+          mask.template apply</*seqlenk mask*/ true>(tSrS, m_block, dense_n_block);
+        };
+        fwd_step(n_block, first_iter_mask_fn, /*IsFirstIter*/ mute::true_type{}, /*CheckInf*/ mute::true_type{});
+        --n_block;
+      }
 
       // Causal/Local Masking
-      if constexpr (IsCausal || IsLocal) {
+      if constexpr (!IsBlockSparse && (IsCausal || IsLocal)) {
         auto mask_fn = [&](auto& tSrS, int n_block) {
           mask.template apply</*seqlenk mask*/ false>(tSrS, m_block, n_block);
         };
@@ -1816,12 +1871,14 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       int const n_block_min_before_local_mask = BlockInfo::get_n_block_min_before_local_mask(
           seqlen_info, m_block, n_block_min, params.window_size_left, params.attention_chunk_divmod);
       auto no_mask_fn = [](auto& tSrS, int n_block) {};
-      for (; n_block >= n_block_min_before_local_mask; --n_block) {
-        fwd_step(n_block, no_mask_fn, /* IsFirstIter */ mute::false_type{}, /* CheckInf */ mute::false_type{});
+      if constexpr (!IsBlockSparse) {
+        for (; n_block >= n_block_min_before_local_mask; --n_block) {
+          fwd_step(n_block, no_mask_fn, /* IsFirstIter */ mute::false_type{}, /* CheckInf */ mute::false_type{});
+        }
       }
 
       // Local mask iterations
-      if constexpr (IsLocal) {
+      if constexpr (!IsBlockSparse && IsLocal) {
         auto local_mask_fn = [&](auto& tSrS, int n_block) {
           mask.template apply</*SeqlenKMask*/ false>(tSrS, m_block, n_block);
         };

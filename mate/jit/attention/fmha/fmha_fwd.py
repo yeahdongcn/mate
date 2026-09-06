@@ -584,6 +584,8 @@ def _fmha_fwd(
     cp_world_size: int = 1,
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
+    block_sparse_num: Optional[torch.Tensor] = None,
+    block_sparse_vbs: Optional[torch.Tensor] = None,
 ):
     # Feature gates.
     assert not ((k_new is None) ^ (v_new is None)), (
@@ -594,6 +596,8 @@ def _fmha_fwd(
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     q_v = maybe_contiguous(q_v)
     block_sparse_idx = maybe_contiguous(block_sparse_idx)
+    block_sparse_num = maybe_contiguous(block_sparse_num)
+    block_sparse_vbs = maybe_contiguous(block_sparse_vbs)
     if k_new is not None:
         k_new, v_new = [maybe_contiguous(t) for t in (k_new, v_new)]
 
@@ -606,6 +610,21 @@ def _fmha_fwd(
             window_size_right is None or window_size_right < 0
         )
         assert q_v is None, "block_sparse_idx does not support q_v"
+        assert block_sparse_num is not None and block_sparse_vbs is not None, (
+            "H3 block-sparse execution requires per-query counts and variable tile sizes"
+        )
+        assert block_sparse_num.dtype == torch.int32 and block_sparse_num.dim() == 3
+        assert block_sparse_vbs.dtype == torch.int32 and block_sparse_vbs.dim() == 1
+        assert block_sparse_num.shape[:2] == block_sparse_idx.shape[:2]
+        assert block_sparse_num.shape[2] == block_sparse_idx.shape[2]
+        assert block_sparse_vbs.numel() == k.shape[-3] // 64
+        # The current TME prototype cannot safely early-exit an empty row
+        # after entering the warp-specialized pipeline. Keep this explicit
+        # until the native empty-row path is implemented.
+        if not bool(torch.all(block_sparse_num > 0)):
+            raise ValueError("native block-sparse prototype requires non-empty query routes")
+        if not bool(torch.all((block_sparse_vbs >= 1) & (block_sparse_vbs <= 64))):
+            raise ValueError("block_sparse_vbs entries must be in [1, 64]")
 
     # Infer runtime shape metadata.
     num_head, head_dim = q.shape[-2:]
@@ -1019,6 +1038,8 @@ def _fmha_fwd(
         max_seqlen_k,
         page_table,
         block_sparse_idx,
+        block_sparse_num,
+        block_sparse_vbs,
         kv_batch_idx,
         leftpad_k,
         rotary_cos,
