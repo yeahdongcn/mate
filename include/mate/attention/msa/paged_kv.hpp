@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <mute/tensor.hpp>
 
+#include "mate/attention/msa/msa_options.hpp"
+
 namespace mate::attention::msa {
 
 using namespace mute;
@@ -17,10 +19,16 @@ using namespace mute;
 //   1. recover logical seqlen_k for one batch,
 //   2. tell us how many columns are valid in one page/block,
 //   3. map logical page/block index -> physical page index.
-template <bool IsPagedKV_, int BlockSize_>
+template <bool          IsPagedKV_,
+          int           BlockSize_,
+          PageTableKind PageTableKind_ = IsPagedKV_ ? PageTableKind::Batched2D : PageTableKind::Dense>
 struct KVManager {
-  static constexpr bool IsPagedKV = IsPagedKV_;
-  static constexpr int  BlockSize = BlockSize_;
+  static constexpr bool          IsPagedKV     = IsPagedKV_;
+  static constexpr int           BlockSize     = BlockSize_;
+  static constexpr PageTableKind PageTableMode = PageTableKind_;
+
+  static_assert(IsPagedKV == (PageTableMode != PageTableKind::Dense),
+                "Dense page-table mode is for contiguous KV; paged KV requires Batched2D or Flat.");
 
   int32_t const* ptr_page_indices        = nullptr;
   int32_t const* ptr_kv_page_indptr      = nullptr;
@@ -63,13 +71,14 @@ struct KVManager {
   }
 
   MUTLASS_DEVICE int physical_page_index(int batch_idx, int logical_page_idx) const {
-    if constexpr (IsPagedKV) {
-      int64_t page_begin =
-          ptr_kv_page_indptr != nullptr ? ptr_kv_page_indptr[batch_idx] : int64_t(batch_idx) * page_table_batch_stride;
-      return ptr_page_indices[page_begin + logical_page_idx];
-    } else {
+    if constexpr (PageTableMode == PageTableKind::Dense) {
       static_cast<void>(batch_idx);
       return logical_page_idx;
+    } else if constexpr (PageTableMode == PageTableKind::Batched2D) {
+      return ptr_page_indices[int64_t(batch_idx) * page_table_batch_stride + logical_page_idx];
+    } else {
+      static_assert(PageTableMode == PageTableKind::Flat);
+      return ptr_page_indices[int64_t(ptr_kv_page_indptr[batch_idx]) + logical_page_idx];
     }
   }
 
@@ -87,7 +96,7 @@ struct KVManager {
   }
 };
 
-template <int BlockSize>
-using PagedKVManager = KVManager<true, BlockSize>;
+template <int BlockSize, PageTableKind PageTableMode = PageTableKind::Batched2D>
+using PagedKVManager = KVManager<true, BlockSize, PageTableMode>;
 
 }  // namespace mate::attention::msa

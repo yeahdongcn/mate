@@ -30,6 +30,10 @@ MUTLASS_DEVICE float4 splat4(float x) {
   return make_float4(x, x, x, x);
 }
 
+MUTLASS_DEVICE float4 vrcp(float4 const& x) {
+  return make_float4(1.0f / x.x, 1.0f / x.y, 1.0f / x.z, 1.0f / x.w);
+}
+
 MUTLASS_DEVICE void vadd(float4& c, float4 const& a, float b) {
 #if defined(MATE_FLAT_SIMD_MATH_ENABLED)
   c = ::add(b, a);

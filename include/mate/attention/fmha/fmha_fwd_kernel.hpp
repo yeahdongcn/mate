@@ -48,24 +48,27 @@ struct FmhaFwdKernelWarpSpecialized {
   static constexpr bool UseLSULoadK = CollectiveMainloop::UseLSULoadK;
   static constexpr bool UseLSULoadV = CollectiveMainloop::UseLSULoadV;
 
-  using MainloopPipelineQ           = typename CollectiveMainloop::MainloopPipelineQ;
-  using MainloopPipelineQv          = typename CollectiveMainloop::MainloopPipelineQv;
-  using MainloopPipelineK           = typename CollectiveMainloop::MainloopPipelineK;
-  using MainloopPipelineV           = typename CollectiveMainloop::MainloopPipelineV;
-  using MainloopPipelineVt          = typename CollectiveMainloop::MainloopPipelineVt;
-  using MainloopPipelineKVNew       = typename CollectiveMainloop::MainloopPipelineKVNew;
-  using MainloopPipelineQState      = typename CollectiveMainloop::PipelineQState;
-  using MainloopPipelineQvState     = typename CollectiveMainloop::PipelineQvState;
-  using MainloopPipelineKState      = typename CollectiveMainloop::PipelineKState;
-  using MainloopPipelineVState      = typename CollectiveMainloop::PipelineVState;
-  using MainloopPipelineVtState     = typename CollectiveMainloop::PipelineVtState;
-  using MainloopPipelineKVNewState  = typename CollectiveMainloop::PipelineKVNewState;
-  using MainloopPipelineQParams     = typename MainloopPipelineQ::Params;
-  using MainloopPipelineQvParams    = typename MainloopPipelineQv::Params;
-  using MainloopPipelineKParams     = typename MainloopPipelineK::Params;
-  using MainloopPipelineVParams     = typename MainloopPipelineV::Params;
-  using MainloopPipelineVtParams    = typename MainloopPipelineVt::Params;
-  using MainloopPipelineKVNewParams = typename MainloopPipelineKVNew::Params;
+  using MainloopPipelineQ          = typename CollectiveMainloop::MainloopPipelineQ;
+  using MainloopPipelineQv         = typename CollectiveMainloop::MainloopPipelineQv;
+  using MainloopPipelineK          = typename CollectiveMainloop::MainloopPipelineK;
+  using MainloopPipelineV          = typename CollectiveMainloop::MainloopPipelineV;
+  using MainloopPipelineVt         = typename CollectiveMainloop::MainloopPipelineVt;
+  using MainloopPipelineKNew       = typename CollectiveMainloop::MainloopPipelineKNew;
+  using MainloopPipelineVNew       = typename CollectiveMainloop::MainloopPipelineVNew;
+  using MainloopPipelineQState     = typename CollectiveMainloop::PipelineQState;
+  using MainloopPipelineQvState    = typename CollectiveMainloop::PipelineQvState;
+  using MainloopPipelineKState     = typename CollectiveMainloop::PipelineKState;
+  using MainloopPipelineVState     = typename CollectiveMainloop::PipelineVState;
+  using MainloopPipelineVtState    = typename CollectiveMainloop::PipelineVtState;
+  using MainloopPipelineKNewState  = typename CollectiveMainloop::PipelineKNewState;
+  using MainloopPipelineVNewState  = typename CollectiveMainloop::PipelineVNewState;
+  using MainloopPipelineQParams    = typename MainloopPipelineQ::Params;
+  using MainloopPipelineQvParams   = typename MainloopPipelineQv::Params;
+  using MainloopPipelineKParams    = typename MainloopPipelineK::Params;
+  using MainloopPipelineVParams    = typename MainloopPipelineV::Params;
+  using MainloopPipelineVtParams   = typename MainloopPipelineVt::Params;
+  using MainloopPipelineKNewParams = typename MainloopPipelineKNew::Params;
+  using MainloopPipelineVNewParams = typename MainloopPipelineVNew::Params;
 
   static constexpr int StagesQ  = CollectiveMainloop::StagesQ;
   static constexpr int StagesK  = CollectiveMainloop::StagesK;
@@ -82,10 +85,10 @@ struct FmhaFwdKernelWarpSpecialized {
     uint8_t PipelineQ[MainloopPipelineQ::NumBarriers];
     uint8_t PipelineQv[MainloopPipelineQv::NumBarriers];
     uint8_t PipelineK[MainloopPipelineK::NumBarriers];
-    uint8_t PipelineV[MainloopPipelineV::NumBarriers];
-    uint8_t PipelineVt[MainloopPipelineVt::NumBarriers];
-    uint8_t PipelineKNew[MainloopPipelineKVNew::NumBarriers];
-    uint8_t PipelineVNew[MainloopPipelineKVNew::NumBarriers];
+    uint8_t PipelineV[(CollectiveMainloop::IsHeadDimTiled && !HasQv) ? 0 : MainloopPipelineV::NumBarriers];
+    uint8_t PipelineVt[InKernelTranspose ? MainloopPipelineVt::NumBarriers : 0];
+    uint8_t PipelineKNew[MainloopPipelineKNew::NumBarriers];
+    uint8_t PipelineVNew[MainloopPipelineVNew::NumBarriers];
   };
   static_assert(sizeof(BarrierStorage) + mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount <=
                     mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers,
@@ -184,49 +187,86 @@ struct FmhaFwdKernelWarpSpecialized {
       pipeline_params_k.num_consumers     = NumQKMmaWarps;
     }
     MainloopPipelineK      pipeline_k(pipeline_params_k, reinterpret_cast<uint64_t>(&barrier_storage->PipelineK));
-    MainloopPipelineKState mainloop_pipe_k_producer_state =
-        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineK>();
+    MainloopPipelineKState mainloop_pipe_k_producer_state = [&] {
+      if constexpr (CollectiveMainloop::ReuseKPStorage && !CollectiveMainloop::UseLSULoadK) {
+        return mutlass::make_producer_start_state<MainloopPipelineK>();
+      } else {
+        return mutlass::make_producer_start_state_warpspecialized<MainloopPipelineK>();
+      }
+    }();
     MainloopPipelineKState mainloop_pipe_k_consumer_state;
 
-    MainloopPipelineVParams pipeline_params_v;
-    if constexpr (UseLSULoadV) {
-      pipeline_params_v.producer_arv_count = CollectiveMainloop::NumProducerThreads / mutlass::NumThreadsPerWarp;
-      pipeline_params_v.consumer_arv_count = InKernelTranspose ? NumQKMmaWarps + NumTransWarps : NumPVMmaWarps;
-    } else {
-      pipeline_params_v.transaction_bytes = CollectiveMainloop::TmeTransactionBytesV;
-      pipeline_params_v.num_consumers     = InKernelTranspose ? NumQKMmaWarps + NumTransWarps : NumPVMmaWarps;
-    }
-    MainloopPipelineV      pipeline_v(pipeline_params_v, reinterpret_cast<uint64_t>(&barrier_storage->PipelineV));
-    MainloopPipelineVState mainloop_pipe_v_producer_state =
+    auto pipeline_v = [&]() {
+      if constexpr (CollectiveMainloop::IsHeadDimTiled && !HasQv) {
+        return pipeline_k;
+      } else {
+        MainloopPipelineVParams pipeline_params;
+        if constexpr (UseLSULoadV) {
+          pipeline_params.producer_arv_count = CollectiveMainloop::NumProducerThreads / mutlass::NumThreadsPerWarp;
+          pipeline_params.consumer_arv_count = InKernelTranspose ? NumQKMmaWarps + NumTransWarps : NumPVMmaWarps;
+        } else {
+          pipeline_params.transaction_bytes = CollectiveMainloop::TmeTransactionBytesV;
+          pipeline_params.num_consumers     = InKernelTranspose ? NumQKMmaWarps + NumTransWarps : NumPVMmaWarps;
+        }
+        return MainloopPipelineV(pipeline_params, reinterpret_cast<uint64_t>(&barrier_storage->PipelineV));
+      }
+    }();
+    MainloopPipelineVState pipeline_v_producer_state =
         mutlass::make_producer_start_state_warpspecialized<MainloopPipelineV>();
-    MainloopPipelineVState mainloop_pipe_v_consumer_state;
+    MainloopPipelineVState pipeline_v_consumer_state;
+    auto&                  mainloop_pipe_v_producer_state =
+        conditional_return(bool_constant<(CollectiveMainloop::IsHeadDimTiled && !HasQv)>{},
+                           mainloop_pipe_k_producer_state,
+                           pipeline_v_producer_state);
+    auto& mainloop_pipe_v_consumer_state =
+        conditional_return(bool_constant<(CollectiveMainloop::IsHeadDimTiled && !HasQv)>{},
+                           mainloop_pipe_k_consumer_state,
+                           pipeline_v_consumer_state);
 
-    MainloopPipelineVtParams pipeline_params_vt;
-    pipeline_params_vt.producer_arv_count = NumTransWarps;
-    pipeline_params_vt.consumer_arv_count = NumPVMmaWarps;
-    auto pipeline_vt                      = conditional_return<InKernelTranspose>(
-        MainloopPipelineVt(pipeline_params_vt, reinterpret_cast<uint64_t>(&barrier_storage->PipelineVt)), nullptr);
-    MainloopPipelineVtState mainloop_pipe_vt_producer_state =
+    auto pipeline_vt = [&]() {
+      if constexpr (InKernelTranspose) {
+        MainloopPipelineVtParams pipeline_params;
+        pipeline_params.producer_arv_count = NumTransWarps;
+        pipeline_params.consumer_arv_count = NumPVMmaWarps;
+        return MainloopPipelineVt(pipeline_params, reinterpret_cast<uint64_t>(&barrier_storage->PipelineVt));
+      } else {
+        return pipeline_v;
+      }
+    }();
+    MainloopPipelineVtState pipeline_vt_producer_state =
         mutlass::make_producer_start_state_warpspecialized<MainloopPipelineVt>();
-    MainloopPipelineVtState mainloop_pipe_vt_consumer_state;
+    MainloopPipelineVtState pipeline_vt_consumer_state;
+    auto&                   mainloop_pipe_vt_producer_state = conditional_return(
+        bool_constant<InKernelTranspose>{}, pipeline_vt_producer_state, mainloop_pipe_v_producer_state);
+    auto& mainloop_pipe_vt_consumer_state = conditional_return(
+        bool_constant<InKernelTranspose>{}, pipeline_vt_consumer_state, mainloop_pipe_v_consumer_state);
 
-    MainloopPipelineKVNewParams pipeline_params_k_new;
-    pipeline_params_k_new.transaction_bytes = CollectiveMainloop::TmeTransactionBytesK;
+    MainloopPipelineKNewParams pipeline_params_k_new;
+    pipeline_params_k_new.transaction_bytes = CollectiveMainloop::TmeTransactionBytesKNew;
     pipeline_params_k_new.num_consumers     = NumQKMmaWarps;
     uint64_t pipeline_k_new_storage         = reinterpret_cast<uint64_t>(&barrier_storage->PipelineKNew);
     auto     pipeline_k_new =
-        conditional_return<IsAppendKV>(MainloopPipelineKVNew(pipeline_params_k_new, pipeline_k_new_storage), nullptr);
-    MainloopPipelineKVNewState mainloop_pipe_kv_new_producer_state =
-        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineKVNew>();
-    MainloopPipelineKVNewState mainloop_pipe_kv_new_consumer_state;
+        conditional_return<IsAppendKV>(MainloopPipelineKNew(pipeline_params_k_new, pipeline_k_new_storage), nullptr);
+    MainloopPipelineKNewState mainloop_pipe_k_new_producer_state =
+        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineKNew>();
+    MainloopPipelineKNewState mainloop_pipe_k_new_consumer_state;
 
-    MainloopPipelineKVNewParams pipeline_params_v_new;
+    MainloopPipelineVNewParams pipeline_params_v_new;
     pipeline_params_v_new.transaction_bytes = CollectiveMainloop::TmeTransactionBytesV;
     pipeline_params_v_new.num_consumers     = NumPVMmaWarps;
     uint64_t pipeline_v_new_storage         = reinterpret_cast<uint64_t>(&barrier_storage->PipelineVNew);
     auto     pipeline_v_new =
-        conditional_return<IsAppendKV>(MainloopPipelineKVNew(pipeline_params_v_new, pipeline_v_new_storage), nullptr);
+        conditional_return<IsAppendKV>(MainloopPipelineVNew(pipeline_params_v_new, pipeline_v_new_storage), nullptr);
+    MainloopPipelineVNewState mainloop_pipe_v_new_producer_state =
+        mutlass::make_producer_start_state_warpspecialized<MainloopPipelineVNew>();
+    MainloopPipelineVNewState mainloop_pipe_v_new_consumer_state;
 
+    NamedBarrier pipeline_wrap_phase_0(reinterpret_cast<uint64_t>(
+        &barrier_storage->NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::PipelineWrapPhase0)]));
+    NamedBarrier pipeline_wrap_phase_1(reinterpret_cast<uint64_t>(
+        &barrier_storage->NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::PipelineWrapPhase1)]));
+    NamedBarrier reuse_p(
+        reinterpret_cast<uint64_t>(&barrier_storage->NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::ReuseP)]));
     NamedBarrier barrier_kv(
         reinterpret_cast<uint64_t>(&barrier_storage->NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::BarrierKV)]));
     NamedBarrier appendkv(
@@ -234,6 +274,13 @@ struct FmhaFwdKernelWarpSpecialized {
     NamedBarrier rotary_q(
         reinterpret_cast<uint64_t>(&barrier_storage->NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::RotaryQ)]));
     if (warp_idx == 0) {
+      if constexpr (CollectiveMainloop::IsHeadDimTiled) {
+        pipeline_wrap_phase_0.init(NumQKMmaWarps);
+        pipeline_wrap_phase_1.init(NumQKMmaWarps);
+      }
+      if constexpr (CollectiveMainloop::ReuseKPStorage) {
+        reuse_p.init(NumQKMmaWarps);
+      }
       if constexpr (IsAppendKV) {
         barrier_kv.init(NumLoadWarps + NumQKMmaWarps);
       } else {
@@ -313,7 +360,8 @@ struct FmhaFwdKernelWarpSpecialized {
           bool is_valid_new = mainloop.load_kv_new(params.mainloop,
                                                    pipeline_k_new,
                                                    pipeline_v_new,
-                                                   mainloop_pipe_kv_new_producer_state,
+                                                   mainloop_pipe_k_new_producer_state,
+                                                   mainloop_pipe_v_new_producer_state,
                                                    shared_storage,
                                                    seqlen_info,
                                                    block_coord,
@@ -452,7 +500,8 @@ struct FmhaFwdKernelWarpSpecialized {
           bool is_valid_new = mainloop.store_kv_new(params.mainloop,
                                                     pipeline_k_new,
                                                     pipeline_v_new,
-                                                    mainloop_pipe_kv_new_consumer_state,
+                                                    mainloop_pipe_k_new_consumer_state,
+                                                    mainloop_pipe_v_new_consumer_state,
                                                     threadIdx.x - MmaThreadOffset,
                                                     shared_storage,
                                                     seqlen_info,
@@ -463,6 +512,8 @@ struct FmhaFwdKernelWarpSpecialized {
             named_barrier_arrive(static_cast<uint32_t>(FwdNamedBarriers::AppendKV));
           }
         }
+
+        auto acc_pv_storage = typename CollectiveMainloop::AccPvStorage{};
 
         auto results = mainloop.mma(params.mainloop,
                                     pipeline_q,
@@ -475,6 +526,7 @@ struct FmhaFwdKernelWarpSpecialized {
                                     mainloop_pipe_k_consumer_state,
                                     mainloop_pipe_v_consumer_state,
                                     mainloop_pipe_vt_consumer_state,
+                                    acc_pv_storage,
                                     shared_storage,
                                     barrier_storage,
                                     seqlen_info,

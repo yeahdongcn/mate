@@ -1,0 +1,265 @@
+#include <musa_runtime.h>
+#include <mutlass/device_kernel.h>
+#include <mutlass/half.h>
+
+#include <optional>
+
+#include "mate/flat/kda/chunk_kda_recurrence.hpp"
+#include "op_utils.hpp"
+
+{# Dedicated K2 recurrent entry.  This file is intentionally separate from
+   the chunk prepare template. #}
+namespace {
+
+namespace kda = mate::flat::kda;
+
+using Element = {{ element }};
+using StateElement = {{ state_element }};
+using CuSeqlensElement = {{ cu_seqlens_element }};
+using HasStateInOption =
+    mate::flat::Option<mate::flat::Tag::HasStateIn, std::bool_constant<{{ has_state_in }}>>;
+using HasStateOutOption =
+    mate::flat::Option<mate::flat::Tag::HasStateOut, std::bool_constant<{{ has_state_out }}>>;
+using IsVarlenOption =
+    mate::flat::Option<mate::flat::Tag::IsVarlen, std::bool_constant<{{ is_varlen }}>>;
+using LogicalShape = kda::ChunkKdaLogicalShape<{{ chunk_size }}, {{ head_dim }}, {{ head_dim }}>;
+using TileShape = mute::Shape<mute::Int<{{ chunk_size }}>, mute::Int<{{ chunk_size }}>, mute::Int<{{ head_dim }}>>;
+using StrideV = kda::ChunkKdaVoStride;
+using StrideO = StrideV;
+using Kernel = typename kda::Mp31ChunkKdaRecurrenceBuilder<Element,
+                                                        StateElement,
+                                                        CuSeqlensElement,
+                                                        LogicalShape,
+                                                        TileShape,
+                                                        StrideV,
+                                                        StrideO,
+                                                        HasStateInOption,
+                                                        HasStateOutOption,
+                                                        IsVarlenOption>::Kernel;
+using Components = typename Kernel::Components;
+using Workspace = typename Components::Workspace;
+
+static constexpr int kHeadDim = Kernel::CollectiveRecurrence::kHeadDim;
+static_assert(Kernel::MaxThreadsPerBlock == 512,
+              "KDA K2 requires 1 producer, 2 state, and 1 output warp squad");
+static_assert(Kernel::CollectiveRecurrence::TmeStages == 2,
+              "KDA K2 requires a two-stage pipeline");
+
+void launch_chunk_kda_mutlass(Element const* v,
+                              void const*    initial_state,
+                              Element*       out,
+                              void*          final_state,
+
+                              Element const* workspace_decayed,
+                              Element const* workspace_k_restored,
+                              Element const* workspace_inverse,
+                              Element const* workspace_p,
+                              float const*   workspace_total,
+                              int32_t const* state_indices,
+
+                              CuSeqlensElement const* cu_seqlens,
+                              StrideV            v_stride,
+                              StrideO            out_stride,
+                              int               B,
+                              int               T,
+                              int               Hqk,
+                              int               Hv,
+                              int               N,
+                              musaStream_t      stream) {
+  typename Kernel::Arguments arguments{
+      typename Kernel::ProblemSize{
+          B,
+          T,
+          Hv,
+          Hqk,
+          N,
+          {% if is_varlen == "true" %}cu_seqlens{% else %}nullptr{% endif %},
+          mutlass::ceil_div(T, Components::kChunk),
+      },
+      typename Kernel::CollectiveRecurrence::Arguments{
+          v,
+          initial_state,
+          out,
+          final_state,
+          state_indices,
+          v_stride,
+          out_stride,
+          typename Workspace::ConstPointers{
+              workspace_decayed,
+              workspace_k_restored,
+              workspace_inverse,
+              workspace_p,
+              workspace_total,
+          },
+      },
+  };
+
+  typename Kernel::Params params = Kernel::to_underlying_arguments(arguments);
+  auto                    kernel = mutlass::device_kernel<Kernel>;
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(
+      kernel, musaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Kernel::SharedStorageSize)));
+  kernel<<<Kernel::TileScheduler::get_grid_shape(params.scheduler), Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
+}
+
+inline StrideV stride_v(ffi::TensorView x) {
+  return mute::make_stride(mute::_1{}, x.stride(1), mute::make_stride(x.stride(2), x.stride(0)));
+}
+
+inline StrideO stride_o(ffi::TensorView x) {
+  return mute::make_stride(mute::_1{}, x.stride(1), mute::make_stride(x.stride(2), x.stride(0)));
+}
+
+inline void check_last_dim_contiguous(ffi::TensorView x, const char* name) {
+  TVM_FFI_ICHECK_EQ(x.stride(x.ndim() - 1), 1) << name << " last dimension must be contiguous";
+}
+
+inline void check_kda_tensor_4d(ffi::TensorView x, const char* name) {
+  CHECK_MUSA(x);
+  CHECK_DIM(4, x);
+  CHECK_INPUT_TYPE(x, {{ element_dtype }});
+  TVM_FFI_ICHECK_EQ(x.size(3), kHeadDim) << name << " last dimension must be " << kHeadDim;
+  check_last_dim_contiguous(x, name);
+}
+
+}  // namespace
+
+void {{ func_name }}(ffi::TensorView                v,
+                     ffi::TensorView                out,
+
+                     ffi::TensorView                workspace_decayed,
+                     ffi::TensorView                workspace_k_restored,
+                     ffi::TensorView                workspace_inverse,
+                     ffi::TensorView                workspace_p,
+                     ffi::TensorView                workspace_total,
+                     ffi::TensorView                state_indices,
+
+                     std::optional<ffi::TensorView> initial_state,
+                     std::optional<ffi::TensorView> final_state,
+                     std::optional<ffi::TensorView> cu_seqlens) {
+  check_mp31(v.device(), "{{ func_name }}");
+  check_kda_tensor_4d(v, "v");
+  check_kda_tensor_4d(out, "out");
+  CHECK_DEVICE(v, out);
+  CHECK_SHAPE(out, v);
+
+
+  auto check_workspace = [&](ffi::TensorView x, DLDataType dtype, const char* name) {
+    CHECK_MUSA(x);
+    CHECK_CONTIGUOUS(x);
+    CHECK_INPUT_TYPE(x, dtype);
+    CHECK_DEVICE(v, x);
+    TVM_FFI_ICHECK_GT(x.numel(), 0) << name << " must not be empty";
+  };
+  check_workspace(workspace_decayed, {{ element_dtype }}, "workspace_decayed");
+  check_workspace(workspace_k_restored, {{ element_dtype }}, "workspace_k_restored");
+  check_workspace(workspace_inverse, {{ element_dtype }}, "workspace_inverse");
+  check_workspace(workspace_p, {{ element_dtype }}, "workspace_p");
+  check_workspace(workspace_total, dl_float32, "workspace_total");
+  CHECK_MUSA(state_indices);
+  CHECK_DIM(1, state_indices);
+  CHECK_CONTIGUOUS(state_indices);
+  CHECK_INPUT_TYPE(state_indices, dl_int32);
+  CHECK_DEVICE(v, state_indices);
+
+
+  int B = static_cast<int>(v.size(0));
+  int T = static_cast<int>(v.size(1));
+  int Hv = static_cast<int>(v.size(2));
+  TVM_FFI_ICHECK_GT(Hv, 0);
+  int Hqk = Hv;
+
+  bool           is_varlen = cu_seqlens.has_value();
+  TVM_FFI_ICHECK_EQ(is_varlen, {{ is_varlen }}) << "rendered KDA kernel varlen mode does not match inputs";
+  int                    N      = B;
+  CuSeqlensElement const* cu_ptr = nullptr;
+  if (is_varlen) {
+    auto cu = cu_seqlens.value();
+    CHECK_MUSA(cu);
+    CHECK_CONTIGUOUS(cu);
+    CHECK_DIM(1, cu);
+    CHECK_INPUT_TYPE(cu, {{ cu_seqlens_dtype }});
+    CHECK_DEVICE(v, cu);
+    TVM_FFI_ICHECK_EQ(B, 1) << "B must be 1 when cu_seqlens is provided";
+    N = static_cast<int>(cu.size(0) - 1);
+    TVM_FFI_ICHECK_GT(N, 0);
+    cu_ptr = static_cast<CuSeqlensElement const*>(cu.data_ptr());
+  }
+  TVM_FFI_ICHECK_EQ(state_indices.size(0), N)
+      << "state_indices must have shape [N]";
+
+  bool        has_state_in      = initial_state.has_value();
+  bool        has_state_out     = final_state.has_value();
+  void const* initial_state_ptr = nullptr;
+  void*       final_state_ptr   = nullptr;
+
+  auto check_state = [&](ffi::TensorView s, const char* name) {
+    CHECK_MUSA(s);
+    CHECK_DIM(4, s);
+    CHECK_CONTIGUOUS(s);
+    CHECK_DEVICE(v, s);
+    TVM_FFI_ICHECK_GT(s.size(0), 0) << name << " must have at least one state row";
+    TVM_FFI_ICHECK_EQ(s.size(1), Hv) << name << " must have shape [N_or_pool, Hv, " << kHeadDim << ", " << kHeadDim << "]";
+    TVM_FFI_ICHECK_EQ(s.size(2), kHeadDim) << name << " must have shape [N_or_pool, Hv, " << kHeadDim << ", " << kHeadDim << "]";
+    TVM_FFI_ICHECK_EQ(s.size(3), kHeadDim) << name << " must have shape [N_or_pool, Hv, " << kHeadDim << ", " << kHeadDim << "]";
+  };
+
+  if (has_state_in) {
+    auto s = initial_state.value();
+    check_state(s, "initial_state");
+    initial_state_ptr = s.data_ptr();
+  }
+  if (has_state_out) {
+    auto s = final_state.value();
+    check_state(s, "final_state");
+    if (has_state_in) {
+      TVM_FFI_ICHECK_EQ(s.dtype(), initial_state.value().dtype())
+          << "initial_state and final_state must have the same dtype";
+      TVM_FFI_ICHECK_EQ(s.size(0), initial_state.value().size(0))
+          << "initial_state and final_state must have the same number of rows";
+    }
+    final_state_ptr = s.data_ptr();
+  }
+  TVM_FFI_ICHECK_EQ(has_state_in, {{ has_state_in }})
+      << "rendered KDA kernel initial-state mode does not match inputs";
+  TVM_FFI_ICHECK_EQ(has_state_out, {{ has_state_out }})
+      << "rendered KDA kernel final-state mode does not match inputs";
+  ffi::MUSADeviceGuard device_guard(v.device().device_id);
+  musaStream_t         stream   = get_stream(v.device());
+  auto*                v_ptr    = static_cast<Element const*>(v.data_ptr());
+  auto*                out_ptr  = static_cast<Element*>(out.data_ptr());
+
+  auto* workspace_decayed_ptr = static_cast<Element const*>(workspace_decayed.data_ptr());
+  auto* workspace_k_restored_ptr = static_cast<Element const*>(workspace_k_restored.data_ptr());
+  auto* workspace_inverse_ptr = static_cast<Element const*>(workspace_inverse.data_ptr());
+  auto* workspace_p_ptr = static_cast<Element const*>(workspace_p.data_ptr());
+  auto* workspace_total_ptr = static_cast<float const*>(workspace_total.data_ptr());
+
+
+  StrideV             v_stride             = stride_v(v);
+  StrideO             out_stride           = stride_o(out);
+
+  launch_chunk_kda_mutlass(v_ptr,
+                           initial_state_ptr,
+                           out_ptr,
+                           final_state_ptr,
+
+                           workspace_decayed_ptr,
+                           workspace_k_restored_ptr,
+                           workspace_inverse_ptr,
+                           workspace_p_ptr,
+                           workspace_total_ptr,
+                           static_cast<int32_t const*>(state_indices.data_ptr()),
+                           cu_ptr,
+                           v_stride,
+                           out_stride,
+                           B,
+                           T,
+                           Hqk,
+                           Hv,
+                           N,
+                           stream);
+
+  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});

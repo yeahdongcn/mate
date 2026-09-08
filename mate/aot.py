@@ -109,8 +109,8 @@ def gen_all_modules(config: dict[str, object] | None = None):
         specs.extend(gen_mqa_logits_aot())
         specs.extend(gen_paged_mqa_logits_aot())
         specs.extend(gen_hyperconnection_aot())
-        specs.extend(gen_masked_moe_gemm_mixed_dtype_aot())
     if add_moe:
+        specs.extend(gen_masked_moe_gemm_mixed_dtype_aot())
         specs.extend(gen_moe_fused_gate_aot())
         specs.append(gen_mega_moe_runtime_utils_spec())
 
@@ -195,7 +195,8 @@ def main() -> None:
         "--add-moe",
         type=parse_bool,
         default=True,
-        help="Whether to include the MOE family in the AOT build.",
+        help="Whether to include the MOE family in the AOT build "
+        "(mixed-dtype masked MoE GEMM, fused gate, and MegaMoE runtime).",
     )
 
     args = parser.parse_args()

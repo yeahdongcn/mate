@@ -12,12 +12,14 @@ from typing import Any, Literal, Optional, Tuple, Union, cast, overload
 
 import torch
 from mate.jit.utils import maybe_contiguous
+from mate.mha_interface import flash_attn_varlen_func as mate_flash_attn_varlen_func
 from mate.sage_attention_interface import sage_attn_quantized
 from mate.testing import quantize_sage_attention_tensor
 
 
 QuantRecipe = Tuple[int, int, int, int]
 _DEFAULT_THREAD_RECIPE: QuantRecipe = (128, 16, -1, 1)
+_DEFAULT_BLOCK_RECIPE: QuantRecipe = (128, 128, -1, 1)
 _DEFAULT_QK_QUANT_DTYPE = "int8"
 _SUPPORTED_DENSE_RECIPES = {
     (-1, -1, -1, -1),
@@ -363,6 +365,124 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     )
 
 
+def sageattn_qk_int8_pv_fp8_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    qk_quant_gran: str = "per_thread",
+    sm_scale: Optional[float] = None,
+    pv_accum_dtype: str = "fp32+fp16",
+    smooth_k: bool = True,
+    smooth_v: bool = False,
+    return_lse: bool = False,
+    **kwargs: Any,
+) -> Union[
+    torch.Tensor, SageAttentionOutput, SageAttentionFp8Output, SageAttentionFp8LseOutput
+]:
+    r"""SageAttention FP8-PV compatibility entrypoint for MUSA.
+
+    The public parameters follow the upstream CUDA API. Execution is routed to
+    MATE's supported dense SageAttention kernel. The current kernel has a fixed
+    PV accumulation implementation, so ``pv_accum_dtype`` is accepted for API
+    compatibility. ``smooth_v`` follows the upstream default paths where it is
+    ignored; the combination ``pv_accum_dtype='fp32', smooth_v=True`` is not
+    implemented by MATE.
+    """
+    return sageattn_qk_int8_pv_fp8_cuda_sm90(
+        q=q,
+        k=k,
+        v=v,
+        tensor_layout=tensor_layout,
+        is_causal=is_causal,
+        qk_quant_gran=qk_quant_gran,
+        sm_scale=sm_scale,
+        pv_accum_dtype=pv_accum_dtype,
+        smooth_k=smooth_k,
+        return_lse=return_lse,
+        **kwargs,
+    )
+
+
+def sageattn_qk_int8_pv_fp16_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    qk_quant_gran: str = "per_thread",
+    sm_scale: Optional[float] = None,
+    pv_accum_dtype: str = "fp32",
+    smooth_k: bool = True,
+    smooth_v: bool = False,
+    return_lse: bool = False,
+    **kwargs: Any,
+) -> Union[
+    torch.Tensor, SageAttentionOutput, SageAttentionFp8Output, SageAttentionFp8LseOutput
+]:
+    r"""SageAttention FP16-PV API compatibility entrypoint for MUSA.
+
+    MATE does not currently provide a native FP16-PV SageAttention kernel. This
+    compatibility entrypoint therefore routes to the supported FP8-PV dense
+    kernel while preserving the upstream call signature and output dtype.
+    """
+    return sageattn_qk_int8_pv_fp8_cuda_sm90(
+        q=q,
+        k=k,
+        v=v,
+        tensor_layout=tensor_layout,
+        is_causal=is_causal,
+        qk_quant_gran=qk_quant_gran,
+        sm_scale=sm_scale,
+        pv_accum_dtype=pv_accum_dtype,
+        smooth_k=smooth_k,
+        return_lse=return_lse,
+        **kwargs,
+    )
+
+
+def sageattn_qk_int8_pv_fp16_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    quantization_backend: str = "triton",
+    is_causal: bool = False,
+    attn_mask: Optional[torch.Tensor] = None,
+    sm_scale: Optional[float] = None,
+    smooth_k: bool = True,
+    return_lse: bool = False,
+    **kwargs: Any,
+) -> Union[
+    torch.Tensor, SageAttentionOutput, SageAttentionFp8Output, SageAttentionFp8LseOutput
+]:
+    r"""SageAttention Triton-style API compatibility entrypoint for MUSA.
+
+    MATE uses its native dense kernel with upstream-equivalent per-block QK
+    quantization. Arbitrary attention masks are not supported by that kernel.
+    """
+    if attn_mask is not None:
+        raise NotImplementedError(
+            "attn_mask is not supported by the MATE SageAttention dense kernel."
+        )
+
+    quant_recipe = kwargs.pop("quant_recipe", _DEFAULT_BLOCK_RECIPE)
+    return sageattn_qk_int8_pv_fp8_cuda_sm90(
+        q=q,
+        k=k,
+        v=v,
+        tensor_layout=tensor_layout,
+        is_causal=is_causal,
+        qk_quant_gran="per_thread",
+        sm_scale=sm_scale,
+        smooth_k=smooth_k,
+        return_lse=return_lse,
+        quant_recipe=quant_recipe,
+        **kwargs,
+    )
+
+
 @overload
 def sageattn(
     q: torch.Tensor,
@@ -464,4 +584,66 @@ def sageattn(
     )
 
 
-__all__ = ["sageattn", "sageattn_qk_int8_pv_fp8_cuda_sm90"]
+def _prepare_fa3_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    *,
+    name: str,
+    max_seqlen: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() == 0:
+        raise ValueError(f"{name} must be a non-empty 1D tensor.")
+    if cu_seqlens.dtype not in {torch.int32, torch.int64}:
+        raise TypeError(f"{name} must have dtype torch.int32 or torch.int64.")
+    if cu_seqlens.device != device:
+        raise ValueError(f"{name} must be on the same device as q, k, and v.")
+    if max_seqlen < 0:
+        raise ValueError(f"max_seqlen for {name} must be non-negative.")
+    return cu_seqlens.to(dtype=torch.int32).contiguous()
+
+
+def sageattn_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool = False,
+    sm_scale: Optional[float] = None,
+    smooth_k: bool = True,
+    **kwargs: Any,
+) -> torch.Tensor:
+    r"""Run packed varlen SageAttention through MATE FlashAttention 3.
+
+    The packed inputs are passed to the native FA3 varlen path in one call.
+    ``smooth_k`` is a SageAttention quantization accuracy option and does not
+    change the full-precision FA3 softmax output, so it is accepted for API
+    compatibility but otherwise ignored.
+    """
+    backend = kwargs.pop("backend", "auto")
+    del smooth_k, kwargs
+    return mate_flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=sm_scale,
+        causal=is_causal,
+        return_softmax_lse=False,
+        backend=backend,
+    )
+
+
+__all__ = [
+    "sageattn",
+    "sageattn_varlen",
+    "sageattn_qk_int8_pv_fp16_cuda",
+    "sageattn_qk_int8_pv_fp16_triton",
+    "sageattn_qk_int8_pv_fp8_cuda",
+    "sageattn_qk_int8_pv_fp8_cuda_sm90",
+]

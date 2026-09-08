@@ -10,14 +10,21 @@ import pytest
 import torch
 from pathlib import Path
 
-from mate.execution_context import MateDryRunComplete
+from mate.execution_context import (
+    MATE_DRY_RUN_ENV,
+    MateDryRunComplete,
+    dry_run_context,
+    is_dry_run_enabled,
+)
 from mate.testing.arch import MUSA_ARCH_CHECKER_ATTR, MUSA_ARCH_REQUIREMENT_ATTR
+from mate.testing.operators import MATE_BITWISE_CHECKS_ENV
 
 
 _ENV_ENABLE = "MATE_PYTEST_GUARD_ALLOC"
 _ENV_MODE = "MATE_PYTEST_GUARD_MODE"
 _ENV_LOG_ALLOCATIONS = "MATE_PYTEST_GUARD_LOG_ALLOCATIONS"
 _SKIP_REASON = "guard allocator debug mode does not support MUSA graph capture"
+_DRY_RUN_SKIP_REASON = "test is not adapted to MATE dry-run"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,10 +51,15 @@ def disable_mudnn_tf32():
 
 @pytest.fixture
 def enable_musa_tf32():
-    musa_matmul = torch.backends.musa.matmul
-    mudnn = torch.backends.mudnn
-    original_musa_allow_tf32 = musa_matmul.allow_tf32
-    original_mudnn_allow_tf32 = mudnn.allow_tf32
+    try:
+        musa_matmul = torch.backends.musa.matmul
+        mudnn = torch.backends.mudnn
+        original_musa_allow_tf32 = musa_matmul.allow_tf32
+        original_mudnn_allow_tf32 = mudnn.allow_tf32
+    except AttributeError:
+        yield
+        return
+
     try:
         musa_matmul.allow_tf32 = True
         mudnn.allow_tf32 = True
@@ -191,6 +203,26 @@ def _is_musa_oom(excinfo) -> bool:
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
+    dry_run_group = parser.getgroup("mate-dry-run")
+    dry_run_group.addoption(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help=(
+            "Compile selected MATE kernels without launching them. "
+            f"Equivalent to setting {MATE_DRY_RUN_ENV}=1."
+        ),
+    )
+    parser.addoption(
+        "--bitwise-checks",
+        action="store",
+        type=int,
+        default=None,
+        help=(
+            "Repeat each Operator call N additional times and require exact outputs. "
+            f"Overrides {MATE_BITWISE_CHECKS_ENV}."
+        ),
+    )
     group = parser.getgroup("mate-guard")
     group.addoption(
         "--guard-alloc",
@@ -293,6 +325,27 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    bitwise_checks = config.getoption("bitwise_checks")
+    if bitwise_checks is None:
+        value = os.environ.get(MATE_BITWISE_CHECKS_ENV)
+        if value is not None:
+            try:
+                bitwise_checks = int(value)
+            except ValueError as error:
+                raise pytest.UsageError(
+                    f"{MATE_BITWISE_CHECKS_ENV} must be an integer, got {value!r}"
+                ) from error
+    if bitwise_checks is not None:
+        if bitwise_checks < 1:
+            raise pytest.UsageError(
+                f"--bitwise-checks and {MATE_BITWISE_CHECKS_ENV} must be at least 1"
+            )
+        os.environ[MATE_BITWISE_CHECKS_ENV] = str(bitwise_checks)
+
+    if config.getoption("dry_run"):
+        os.environ[MATE_DRY_RUN_ENV] = "1"
+        is_dry_run_enabled.cache_clear()
+
     config.addinivalue_line(
         "markers",
         "guard_incompatible: skip this test when pytest guard allocator mode is active",
@@ -350,16 +403,33 @@ def pytest_collection_modifyitems(
             item.add_marker(skip_graph)
 
 
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
+    """Keep the complete dry-run lifecycle inside fake tensor mode."""
+    if not is_dry_run_enabled():
+        return (yield)
+
+    with dry_run_context(allow_non_fake_inputs=False):
+        return (yield)
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
-    """
-    Treat selected runtime exceptions as non-failures for the test call phase.
-    """
+    """Normalize dry-run and MUSA OOM outcomes for the test call phase."""
     report = yield
 
-    if call.when == "call" and _is_dry_run_complete(call.excinfo):
-        report.outcome = "passed"
-        report.longrepr = None
+    if call.when == "call" and is_dry_run_enabled():
+        if _is_dry_run_complete(call.excinfo):
+            report.outcome = "passed"
+            report.longrepr = None
+        elif report.outcome != "skipped":
+            warnings.warn(
+                f"{item.nodeid}: {_DRY_RUN_SKIP_REASON}",
+                pytest.PytestWarning,
+                stacklevel=1,
+            )
+            report.outcome = "skipped"
+            report.longrepr = ("", 0, f"Skipped: {_DRY_RUN_SKIP_REASON}")
     elif call.when == "call" and _is_musa_oom(call.excinfo):
         warnings.warn(
             # f"MUSA out of memory; skipping test: {call.excinfo.value}",

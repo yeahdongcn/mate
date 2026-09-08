@@ -1,8 +1,10 @@
 # ruff: noqa
 # type: ignore
 import torch
+from packaging.version import Version
 
-from ...execution_context import raise_complete_if_dry_run
+from ...execution_context import skip_kernel_launch_if_dry_run
+from ...jit.cpp_ext import get_mcc_version
 from ._flash_attention_bwd_common import (
     _check_attention_strides,
     _contiguous_cosize_bytes,
@@ -40,14 +42,23 @@ _UNSPLIT_DKDV_BLOCK_N = 128
 _UNSPLIT_DQ_BLOCK_M = 128
 _UNSPLIT_DQ_BLOCK_N = 64
 _LOG2E = 1.44269504
+_MCC_BWD_D128_GQA_WORKAROUND_CUTOFF = Version("5.2.0")
 
 
 def _select_bwd_plan(dim, deterministic, heads_q_eq_heads_kv=True):
     if dim == 256:
         return "split_separate" if deterministic else "split"
     if dim == 128:
-        if deterministic or not heads_q_eq_heads_kv:
+        if deterministic:
             return "unsplit_separate"
+        if not heads_q_eq_heads_kv:
+            mcc_version = get_mcc_version()
+            # MTCC <= 5.2.0 can crash when compiling the monolithic D128 GQA kernel.
+            if (
+                mcc_version is not None
+                and mcc_version <= _MCC_BWD_D128_GQA_WORKAROUND_CUTOFF
+            ):
+                return "unsplit_separate"
         return "unsplit"
     raise NotImplementedError(
         f"TileLang FlashAttention backward currently supports dim 128 or 256, got {dim}"
@@ -773,8 +784,8 @@ def flashattn_varlen_bwd_interface(
             dtype=kernel_dtype,
         )
 
-    # All kernels needed by this backward path have been compiled at this point.
-    raise_complete_if_dry_run()
+    if skip_kernel_launch_if_dry_run():
+        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
     if compute_delta_kernel is not None:
         compute_delta_kernel(

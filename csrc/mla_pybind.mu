@@ -782,7 +782,8 @@ MetadataResult get_mla_decoding_metadata_impl(ffi::Optional<ffi::TensorView> seq
   params.topk                      = is_sparse_attn ? static_cast<int>(topk.value()) : -1;
   params.extra_topk                = extra_topk.has_value() ? static_cast<int>(extra_topk.value()) : -1;
   run_get_mla_metadata_kernel(params,
-                              get_stream(seqlens_k.has_value() ? seqlens_k.value().device() : q.value().device()));
+                              get_stream(seqlens_k.has_value() ? seqlens_k.value().device() : q.value().device()),
+                              dprops.sharedMemPerBlockOptin);
 
   return {tile_scheduler_metadata_storage, num_splits_storage, tile_scheduler_metadata, num_splits};
 }

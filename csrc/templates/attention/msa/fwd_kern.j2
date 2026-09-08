@@ -9,7 +9,8 @@
 
 namespace {
 
-using Element = {{ element }};
+using Element       = {{ element }};
+using ElementOutput = {{ element_output }};
 
 static constexpr bool kIsCausal = {{ "true" if causal else "false" }};
 // Both local GQA ratios use physical M16 SQMMA. Ratio-8 prefill dispatches
@@ -29,12 +30,14 @@ struct KernelTag {
 template <int HeadRatio>
 using Builder = msa::MsaFwdBuilder<
     Element,
+    ElementOutput,
     HeadRatio,
     msa::IsCausal<std::integral_constant<bool, kIsCausal>>>;
 using KernelRatio8  = typename Builder<8>::Kernel;
 using KernelRatio16 = typename Builder<16>::Kernel;
 using KernelRatio8PairUnion = typename msa::MsaFwdPairUnionBuilder<
     Element,
+    ElementOutput,
     msa::IsCausal<std::integral_constant<bool, kIsCausal>>>::Kernel;
 
 }  // namespace
@@ -86,7 +89,7 @@ void {{ func_name }}(
   CHECK_INPUT_TYPE(seqused_k, dl_int32);
   CHECK_INPUT_TYPE(qo_offset, dl_int32);
   CHECK_INPUT_TYPE(page_table, dl_int32);
-  CHECK_INPUT_TYPE(out, {{ element_dtype }});
+  CHECK_INPUT_TYPE(out, {{ element_output_dtype }});
   CHECK_INPUT_TYPE(lse, dl_float32);
 
   CHECK_CONTIGUOUS(q);
@@ -195,7 +198,7 @@ void {{ func_name }}(
             static_cast<float>(v_scale),
         },
         {
-            static_cast<Element*>(out.data_ptr()),
+            static_cast<ElementOutput*>(out.data_ptr()),
             static_cast<float*>(lse.data_ptr()),
         },
         {

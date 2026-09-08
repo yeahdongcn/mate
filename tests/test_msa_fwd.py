@@ -22,8 +22,9 @@ if _FP8 is not None:
 
 @pytest.mark.parametrize("dtype,element", _DTYPES)
 def test_msa_fwd_config_uses_the_fixed_sqmma_tile_shape(dtype, element):
-    config = make_msa_fwd_config(causal=True, dtype=dtype)
+    config = make_msa_fwd_config(causal=True, dtype=dtype, output_dtype=dtype)
     assert config["element"] == element
+    assert config["element_output"] == element
     assert config["head_ratio"] == 16
     assert config["head_dim"] == 128
     assert config["tile_kv"] == 128
@@ -39,9 +40,30 @@ def test_msa_aot_specs_cover_all_forward_dtypes_and_causal_modes():
         for causal in (False, True)
         if dtype_name != "fp8e4m3" or _FP8 is not None
     }
+    if _FP8 is not None:
+        expected.update(
+            {
+                f"msa_fwd_fp8e4m3_out_bf16_causal_{int(causal)}"
+                for causal in (False, True)
+            }
+        )
     assert expected.issubset(names)
     assert "msa_sparse_topk_select" in names
     assert len(names) == len(expected) + 1
+
+
+@pytest.mark.skipif(_FP8 is None, reason="float8_e4m3fn is unavailable")
+def test_msa_fwd_config_supports_fp8_input_bf16_output():
+    config = make_msa_fwd_config(
+        causal=True,
+        dtype=_FP8,
+        output_dtype=torch.bfloat16,
+    )
+    assert config["element"] == "mutlass::float_e4m3_t"
+    assert config["element_dtype"] == "dl_float8_e4m3fn"
+    assert config["element_output"] == "mutlass::bfloat16_t"
+    assert config["element_output_dtype"] == "dl_bfloat16"
+    assert config["func_name"] == "msa_fwd_fp8e4m3_out_bf16_causal_1"
 
 
 def test_msa_fwd_rejects_unsupported_sqmma_head_ratio():
@@ -70,6 +92,34 @@ def test_msa_fwd_rejects_unsupported_sqmma_head_ratio():
         )
 
 
+def test_msa_fwd_rejects_unsupported_output_dtype():
+    q = torch.empty((1, 8, 128), dtype=torch.float16, device="cpu")
+    k = torch.empty((1, 128, 1, 128), dtype=torch.float16, device="cpu")
+    v = torch.empty_like(k)
+    blocks = torch.zeros((1, 1, 16), dtype=torch.int32, device="cpu")
+    cu_q = torch.tensor([0, 1], dtype=torch.int32, device="cpu")
+    kv_len = torch.tensor([128], dtype=torch.int32, device="cpu")
+    qo_offset = torch.tensor([127], dtype=torch.int32, device="cpu")
+    page_table = torch.tensor([[0]], dtype=torch.int32, device="cpu")
+    out = torch.empty(q.shape, dtype=torch.float32, device="cpu")
+
+    with pytest.raises(TypeError, match="unsupported MSA forward output dtype"):
+        _msa_fwd(
+            q,
+            k,
+            v,
+            blocks,
+            cu_q,
+            kv_len,
+            qo_offset,
+            page_table,
+            max_seqlen_q=1,
+            max_seqlen_k=128,
+            causal=True,
+            out=out,
+        )
+
+
 def _online_same_dtype_p_reference(
     q: torch.Tensor,
     k_pages: torch.Tensor,
@@ -81,6 +131,7 @@ def _online_same_dtype_p_reference(
     kv_len: int,
     softmax_scale: float,
     dtype: torch.dtype,
+    output_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q_f = q.float().cpu()
     k_f = k_pages.float().cpu()
@@ -93,7 +144,7 @@ def _online_same_dtype_p_reference(
     lse = torch.full(
         (total_q, num_heads), -torch.inf, dtype=torch.float32, device="cpu"
     )
-    p_scale = 256.0
+    p_scale = 256.0 if dtype == _FP8 else 1.0
 
     for q_idx in range(total_q):
         for head in range(num_heads):
@@ -138,7 +189,7 @@ def _online_same_dtype_p_reference(
                     torch.tensor(row_sum / p_scale, dtype=torch.float32, device="cpu")
                 )
 
-    return out.to(dtype), lse
+    return out.to(dtype if output_dtype is None else output_dtype), lse
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -230,9 +281,9 @@ def test_msa_fwd_uses_each_querys_own_topk(
     max_abs = diff.abs().max().item()
     mean_abs = diff.abs().mean().item()
     rms = diff.square().mean().sqrt().item()
-    min_cosine = 0.98 if dtype == _FP8 else 0.995
+    min_cosine = 0.998 if dtype == _FP8 else 0.995
     max_abs_limit = (
-        0.5 if dtype == _FP8 else (0.03 if dtype == torch.bfloat16 else 0.01)
+        0.002 if dtype == _FP8 else (0.03 if dtype == torch.bfloat16 else 0.01)
     )
     assert out.dtype == dtype
     assert cosine > min_cosine, (
@@ -247,6 +298,123 @@ def test_msa_fwd_uses_each_querys_own_topk(
     lse_diff = lse.float().cpu() - expected_lse
     lse_limit = 0.1 if dtype == _FP8 else 0.02
     assert lse_diff.abs().max().item() < lse_limit
+
+
+@pytest.mark.parametrize("output_dtype", [_FP8, torch.bfloat16])
+@pytest.mark.skipif(
+    not _HAS_MUSA or _FP8 is None,
+    reason="MUSA FP8 support is required for the probability-layout test",
+)
+def test_msa_fwd_fp8_probability_swizzle_preserves_one_hot_rows(output_dtype):
+    device = torch.device("musa")
+    num_heads = 8
+    head_dim = 128
+
+    q_float = torch.zeros((1, num_heads, head_dim), device=device)
+    k_float = torch.zeros((1, 128, 1, head_dim), device=device)
+    v_float = torch.zeros_like(k_float)
+    expected = torch.zeros((1, num_heads, head_dim), dtype=torch.float32)
+    target_columns = []
+    for head in range(num_heads):
+        feature_begin = head * 16
+        feature_end = feature_begin + 16
+        target_column = (head * 17) % head_dim
+        q_float[0, head, feature_begin:feature_end] = 4.0
+        k_float[0, head, 0, feature_begin:feature_end] = 4.0
+        v_float[0, head, 0, target_column] = 1.0
+        expected[0, head, target_column] = 1.0
+        target_columns.append(target_column)
+
+    q = q_float.to(_FP8)
+    k = k_float.to(_FP8)
+    v = v_float.to(_FP8)
+    block_indexes = torch.full((1, 1, 16), -1, dtype=torch.int32, device=device)
+    block_indexes[..., 0] = 0
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    seqused_k = torch.tensor([128], dtype=torch.int32, device=device)
+    qo_offset = torch.zeros((1,), dtype=torch.int32, device=device)
+    page_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    out = torch.empty(q.shape, dtype=output_dtype, device=device)
+
+    actual, _ = _msa_fwd(
+        q,
+        k,
+        v,
+        block_indexes,
+        cu_seqlens_q,
+        seqused_k,
+        qo_offset,
+        page_table,
+        max_seqlen_q=1,
+        max_seqlen_k=128,
+        causal=False,
+        out=out,
+    )
+    actual_float = actual.float().cpu()
+
+    assert actual_float.argmax(dim=-1).flatten().tolist() == target_columns
+    torch.testing.assert_close(actual_float, expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("q_len,num_q_heads", [(1, 16), (4, 8)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.skipif(
+    not _HAS_MUSA or _FP8 is None,
+    reason="MUSA FP8 support is required for mixed-output MSA forward",
+)
+def test_msa_fwd_fp8_input_bf16_output(causal: bool, q_len: int, num_q_heads: int):
+    device = torch.device("musa")
+    torch.manual_seed(20260826)
+    q = (torch.randn((q_len, num_q_heads, 128), device=device) * 0.25).to(_FP8)
+    k = (torch.randn((1, 128, 1, 128), device=device) * 0.25).to(_FP8)
+    v = (torch.randn((1, 128, 1, 128), device=device) * 0.25).to(_FP8)
+    block_indexes_cpu = torch.full((q_len, 1, 16), -1, dtype=torch.int32, device="cpu")
+    block_indexes_cpu[:, :, 0] = 0
+    block_indexes = block_indexes_cpu.to(device)
+    cu_seqlens_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+    seqused_k = torch.tensor([128], dtype=torch.int32, device=device)
+    q_offset = 128 - q_len if causal else 0
+    qo_offset = torch.tensor([q_offset], dtype=torch.int32, device=device)
+    page_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=device)
+
+    actual, lse = _msa_fwd(
+        q,
+        k,
+        v,
+        block_indexes,
+        cu_seqlens_q,
+        seqused_k,
+        qo_offset,
+        page_table,
+        max_seqlen_q=q_len,
+        max_seqlen_k=128,
+        causal=causal,
+        out=out,
+    )
+    expected, expected_lse = _online_same_dtype_p_reference(
+        q,
+        k,
+        v,
+        block_indexes_cpu,
+        causal=causal,
+        qo_offset=q_offset,
+        kv_len=128,
+        softmax_scale=128**-0.5,
+        dtype=_FP8,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert actual is out
+    assert actual.dtype == torch.bfloat16
+    actual_cpu = actual.float().cpu()
+    expected_cpu = expected.float()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual_cpu.reshape(-1), expected_cpu.reshape(-1), dim=0
+    ).item()
+    assert cosine > 0.98
+    assert (actual_cpu - expected_cpu).abs().max().item() < 0.1
+    assert (lse.float().cpu() - expected_lse).abs().max().item() < 0.1
 
 
 @pytest.mark.skipif(

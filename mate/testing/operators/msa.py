@@ -8,9 +8,16 @@ from enum import Enum
 from typing import Sequence
 
 import torch
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 
 from mate import msa_interface as msa
-from mate.testing.operator import Operator
+from .operator import (
+    Operator,
+    OperatorInputs,
+    OperatorOutputs,
+    OperatorReference,
+    OperatorWorkload,
+)
 
 _FP8_E4M3_DTYPE = getattr(torch, "float8_e4m3fn", None)
 _DTYPE_NAMES = {
@@ -46,7 +53,7 @@ class UnsupportedMsaWorkload(ValueError):
 
 
 @dataclass(frozen=True, kw_only=True)
-class MsaWorkload:
+class MsaWorkload(OperatorWorkload):
     api: MsaApi
     num_q_heads: int
     num_kv_heads: int
@@ -189,7 +196,7 @@ class MsaWorkload:
 
 
 @dataclass(kw_only=True)
-class MsaInputs:
+class MsaInputs(OperatorInputs):
     workload: MsaWorkload | None = None
 
     q: torch.Tensor | None = None
@@ -208,7 +215,7 @@ class MsaInputs:
 
 
 @dataclass(frozen=True, kw_only=True)
-class MsaOutputs:
+class MsaOutputs(OperatorOutputs):
     out: torch.Tensor | None = None
     lse: torch.Tensor | None = None
     max_score: torch.Tensor | None = None
@@ -216,17 +223,17 @@ class MsaOutputs:
 
 
 @dataclass(frozen=True, kw_only=True)
-class MsaReference:
+class MsaReference(OperatorReference):
     out: torch.Tensor | None = None
     out_fp32: torch.Tensor | None = None
     max_score: torch.Tensor | None = None
     selected_blocks: torch.Tensor | None = None
 
 
-class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
+class MsaOperator(Operator):
     """Generate, invoke, reference, and verify MSA workloads."""
 
-    def generate(self, workload: MsaWorkload) -> MsaInputs:
+    def generate(self, workload):
         self._seed(workload.seed, workload.device)
         if workload.api is MsaApi.MAXSCORE:
             return self._generate_maxscore(workload)
@@ -234,7 +241,7 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
             return self._generate_sparse_topk(workload)
         return self._generate_sparse_fwd(workload)
 
-    def call(self, inputs: MsaInputs) -> MsaOutputs:
+    def call(self, inputs):
         workload = inputs.workload
         if workload is None:
             raise ValueError("operator inputs must carry their workload")
@@ -244,7 +251,7 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
             return self._call_sparse_topk(inputs)
         return self._call_sparse_fwd(inputs)
 
-    def reference(self, inputs: MsaInputs) -> MsaReference:
+    def reference(self, inputs):
         workload = inputs.workload
         if workload is None:
             raise ValueError("operator inputs must carry their workload")
@@ -256,9 +263,9 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
 
     def verify(
         self,
-        inputs: MsaInputs,
-        outputs: MsaOutputs,
-        reference: MsaReference,
+        inputs,
+        outputs,
+        reference,
     ) -> None:
         workload = inputs.workload
         if workload is None:
@@ -320,7 +327,10 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
         kv_indices = None
         if workload.kv_layout is MsaKvLayout.PAGED:
             page_table, kv_indices = self._make_page_table_and_kv_indices(
-                kv_lens, page_size=workload.page_size, mode=workload.page_mode
+                workload.kv_lengths,
+                device=device,
+                page_size=workload.page_size,
+                mode=workload.page_mode,
             )
             k = self._small_randn(
                 (
@@ -351,9 +361,9 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
             if workload.preallocated_max_score
             else None
         )
-        plan_info = msa._msa_plan_from_lengths(
-            q_lens.cpu(),
-            kv_lens.cpu(),
+        plan_info = self._plan_from_lengths(
+            workload.q_lengths,
+            workload.kv_lengths,
             workload.num_q_heads,
             num_kv_heads=workload.num_kv_heads,
             page_size=workload.page_size
@@ -427,7 +437,10 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
         q_lens = torch.tensor(workload.q_lengths, dtype=torch.int32, device=device)
         kv_lens = torch.tensor(workload.kv_lengths, dtype=torch.int32, device=device)
         page_table, kv_indices = self._make_page_table_and_kv_indices(
-            kv_lens, page_size=workload.page_size, mode=workload.page_mode
+            workload.kv_lengths,
+            device=device,
+            page_size=workload.page_size,
+            mode=workload.page_mode,
         )
         total_q = sum(workload.q_lengths)
         total_pages = int(kv_indices.numel())
@@ -447,17 +460,17 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
             dtype=workload.dtype,
         )
         kv_block_indexes = self._make_kv_block_indexes(
-            q_lens,
-            kv_lens,
+            workload.q_lengths,
+            workload.kv_lengths,
             num_kv_heads=workload.num_kv_heads,
             topk=workload.topk,
             sparse_block_size=workload.sparse_block_size,
             pattern=workload.pattern,
             device=device,
         )
-        plan_info = msa._msa_plan_from_lengths(
-            q_lens.cpu(),
-            kv_lens.cpu(),
+        plan_info = self._plan_from_lengths(
+            workload.q_lengths,
+            workload.kv_lengths,
             workload.num_q_heads,
             num_kv_heads=workload.num_kv_heads,
             page_size=workload.page_size,
@@ -716,18 +729,35 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
         return ((kv_tiles + 127) // 128) * 128
 
     @staticmethod
-    def _page_counts_from_lens(kv_lens: torch.Tensor, page_size: int) -> list[int]:
-        return [int((int(length) + page_size - 1) // page_size) for length in kv_lens]
+    def _plan_from_lengths(
+        q_lengths: Sequence[int],
+        kv_lengths: Sequence[int],
+        *args,
+        **kwargs,
+    ):
+        with unset_fake_temporarily():
+            return msa._msa_plan_from_lengths(
+                torch.tensor(tuple(q_lengths), dtype=torch.int32),
+                torch.tensor(tuple(kv_lengths), dtype=torch.int32),
+                *args,
+                **kwargs,
+            )
+
+    @staticmethod
+    def _page_counts_from_lens(kv_lengths: Sequence[int], page_size: int) -> list[int]:
+        return [
+            int((int(length) + page_size - 1) // page_size) for length in kv_lengths
+        ]
 
     @staticmethod
     def _make_page_table_and_kv_indices(
-        kv_lens: torch.Tensor,
+        kv_lengths: Sequence[int],
         *,
+        device: str | torch.device,
         page_size: int,
         mode: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        output_device = kv_lens.device
-        page_counts = MsaOperator._page_counts_from_lens(kv_lens.cpu(), page_size)
+        page_counts = MsaOperator._page_counts_from_lens(kv_lengths, page_size)
         max_pages = max(page_counts, default=0)
         total_pages = sum(page_counts)
         if mode == "identity":
@@ -738,7 +768,7 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
             raise ValueError(f"unsupported page table mode: {mode}")
 
         page_table = torch.zeros(
-            (len(page_counts), max_pages), dtype=torch.int32, device=output_device
+            (len(page_counts), max_pages), dtype=torch.int32, device=device
         )
         flat_indices = []
         cursor = 0
@@ -746,13 +776,11 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
             pages = physical_pages[cursor : cursor + count]
             if pages:
                 page_table[batch_idx, :count] = torch.tensor(
-                    pages, dtype=torch.int32, device=output_device
+                    pages, dtype=torch.int32, device=device
                 )
                 flat_indices.extend(pages)
             cursor += count
-        return page_table, torch.tensor(
-            flat_indices, dtype=torch.int32, device=output_device
-        )
+        return page_table, torch.tensor(flat_indices, dtype=torch.int32, device=device)
 
     @staticmethod
     def _select_sparse_blocks(
@@ -790,8 +818,8 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
 
     @staticmethod
     def _make_kv_block_indexes(
-        q_lens: torch.Tensor,
-        kv_lens: torch.Tensor,
+        q_lengths: Sequence[int],
+        kv_lengths: Sequence[int],
         *,
         num_kv_heads: int,
         topk: int,
@@ -799,9 +827,7 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
         pattern: str,
         device: str | torch.device,
     ) -> torch.Tensor:
-        q_lens_cpu = [int(v) for v in q_lens.cpu().tolist()]
-        kv_lens_cpu = [int(v) for v in kv_lens.cpu().tolist()]
-        total_q = sum(q_lens_cpu)
+        total_q = sum(q_lengths)
         q2k = torch.full(
             (total_q, num_kv_heads, topk),
             -1,
@@ -809,7 +835,7 @@ class MsaOperator(Operator[MsaWorkload, MsaInputs, MsaOutputs, MsaReference]):
             device=device,
         )
         q_abs = 0
-        for q_len, kv_len in zip(q_lens_cpu, kv_lens_cpu):
+        for q_len, kv_len in zip(q_lengths, kv_lengths):
             page_count = (int(kv_len) + sparse_block_size - 1) // sparse_block_size
             for q_local in range(q_len):
                 selected = MsaOperator._select_sparse_blocks(

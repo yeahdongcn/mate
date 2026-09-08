@@ -115,28 +115,23 @@ def _roundup_headdim(headdim: int, headdim_v: int):
 
 
 @lru_cache
-def _check_enable_packgqa(m: int, head_ratio: int):
-    m_hr = m * head_ratio
-
-    if m_hr <= 32 or m_hr <= 64 or m_hr <= 128 or m_hr <= 256:
-        return True
-
-    return False
+def _check_enable_packgqa(m: int):
+    return m <= 256
 
 
 @lru_cache
 def _get_tile_m(m: int, head_ratio: int, enable_packgqa: bool = None):
     enable_packgqa = (
-        _check_enable_packgqa(m, head_ratio)
-        if enable_packgqa is None
-        else enable_packgqa
+        _check_enable_packgqa(m) if enable_packgqa is None else enable_packgqa
     )
 
     assert m is not None
     assert head_ratio is not None
 
     m = m * head_ratio if enable_packgqa else m
-    if m <= 32:
+    if m <= 16:
+        tile_m = 16
+    elif m <= 32:
         tile_m = 32
     elif m <= 64:
         tile_m = 64
@@ -185,82 +180,86 @@ def _get_fwd_kernel_config(
     is_fp8: bool = False,
     is_high_regpressure: bool = False,
 ):
+    packgqa_alignment = 128 // (element_size * 8)
+    if headdim % packgqa_alignment != 0 or headdim_v % packgqa_alignment != 0:
+        enable_packgqa = False
     headdim, headdim_v = _roundup_headdim(headdim, headdim_v)
 
     candidate_tile_m, enable_packgqa = _get_tile_m(m, head_ratio, enable_packgqa)
-    if candidate_tile_m == 192 and headdim % 128 != 0:
-        candidate_tile_m = 128
+    if headdim % 128 != 0:
+        candidate_tile_m = max(candidate_tile_m, 64 if is_fp8 else 32)
+    if is_fp8:
+        candidate_tile_m = max(candidate_tile_m, 32)
+    tile_head_dim = 0
 
-    decode_mode = enable_packgqa
-    if has_qv:
-        tile_m = 32
-        tile_n = 128 if is_fp8 else 64
+    if is_fp8 and has_qv:
+        tile_m = min(candidate_tile_m, 32)
+        tile_n = 128
         stages_k, stages_v = _get_qv_stages_by_smem(
             tile_m, tile_n, headdim, headdim_v, element_size
         )
-    elif headdim == 64 and headdim_v == 64:
-        tile_m = candidate_tile_m
+    elif not is_fp8:
         tile_n = 64
-        stages_k = 2
-        stages_v = 2
-    elif headdim == 64 and headdim_v == 256:
-        tile_m = 192 if not decode_mode else 32
-        tile_n = 64
-        stages_k = 1 if not decode_mode else 2
-        stages_v = 1 if not decode_mode else 2
-    elif headdim == 64 and headdim_v == 512:
-        tile_m = 32
-        tile_n = 64
-        stages_k = 1
-        stages_v = 1
-    elif headdim == 128 and headdim_v == 128:
-        tile_m = candidate_tile_m
-        tile_n = 64
-        stages_k = 2
-        stages_v = 2
-    elif headdim == 192 and headdim_v == 128:
-        tile_m = candidate_tile_m
-        tile_n = 64
-        stages_k = 1
-        stages_v = 1
-    elif headdim == 192 and headdim_v == 192:
-        tile_m = candidate_tile_m
-        tile_n = 64
-        stages_k = 1
-        stages_v = 1
-    elif headdim == 256 and headdim_v == 256:
-        tile_m = 192 if not decode_mode else 32
-        tile_n = 64
-        stages_k = 1 if not decode_mode else 2
-        stages_v = 1 if not decode_mode else 2
-    elif headdim == 384 and headdim_v == 384:
-        tile_m = 64
-        tile_n = 64
-        stages_k = 1
-        stages_v = 1
-    elif headdim == 512 and headdim_v == 512:
-        tile_m = 32
-        tile_n = 64
-        stages_k = 1
-        stages_v = 1
-    else:
-        assert False, f"Add config for headdim {headdim}-{headdim_v}"
+        if has_qv:
+            match (headdim, headdim_v):
+                case (64, 64):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 256), 4, 4
+                case (64, 128):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 256), 1, 1
+                case (64, 256):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 128), 1, 1
+                case (64, 512):
+                    tile_m = min(candidate_tile_m, 128)
+                    stages_k, stages_v, tile_head_dim = (
+                        (4, 4, 64) if tile_m > 32 else (1, 1, 0)
+                    )
+                case (128, 128):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 192), 1, 1
+                case (192, 128):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 128), 1, 1
+                case _:
+                    assert False, f"Add QV config for headdim {headdim}-{headdim_v}"
+        else:
+            match (headdim, headdim_v):
+                case (64, 64):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 256), 2, 2
+                case (64, 256):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 256), 3, 3
+                case (64, 512):
+                    tile_m = min(candidate_tile_m, 128)
+                    stages_k, stages_v, tile_head_dim = (
+                        (4, 4, 64) if tile_m > 32 else (1, 1, 0)
+                    )
+                case (128, 128):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 256), 3, 3
+                case (192, 128) | (192, 192):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 256), 1, 1
+                case (256, 256):
+                    tile_m, stages_k, stages_v = min(candidate_tile_m, 192), 1, 1
+                case (384, 384):
+                    tile_m = min(candidate_tile_m, 128)
+                    stages_k, stages_v, tile_head_dim = (
+                        (4, 4, 128) if tile_m > 32 else (1, 1, 0)
+                    )
+                case (512, 512):
+                    tile_m = min(candidate_tile_m, 128)
+                    stages_k, stages_v, tile_head_dim = (
+                        (3, 3, 128) if tile_m > 32 else (1, 1, 0)
+                    )
+                case _:
+                    assert False, f"Add config for headdim {headdim}-{headdim_v}"
 
     if is_fp8 and not has_qv:
-        match (
-            headdim,
-            headdim_v,
-            is_high_regpressure,
-        ):  # workaround for MusaToolKit 4.3.8
+        match (headdim, headdim_v, is_high_regpressure):
             case (
                 (64, 64, _) | (128, 128, False) | (192, 128, False) | (192, 192, False)
             ):
-                tile_m = 256
+                tile_m = min(candidate_tile_m, 256)
                 tile_n = 128
                 stages_k = 2
                 stages_v = 2
             case (256, 256, False):
-                tile_m = 192
+                tile_m = min(candidate_tile_m, 192)
                 tile_n = 128
                 stages_k = 1
                 stages_v = 1
@@ -271,20 +270,20 @@ def _get_fwd_kernel_config(
                 | (256, 256, True)
                 | (384, 384, _)
             ):
-                tile_m = 128
+                tile_m = min(candidate_tile_m, 128)
                 tile_n = 128
                 stages_k = 1
                 stages_v = 1
             case (512, 512, _):
-                tile_m = 32
+                tile_m = min(candidate_tile_m, 32)
                 tile_n = 128
                 stages_k = 1
                 stages_v = 1
             case _:
-                assert has_qv, f"Add FP8 config for headdim {headdim}-{headdim_v}"
+                assert False, f"Add FP8 config for headdim {headdim}-{headdim_v}"
 
-    consumers_qk = ceil_div(tile_m, 64)
-    consumers_pv = consumers_qk
+    multi_chunk = tile_head_dim > 0
+    consumers_qk = consumers_pv = ceil_div(tile_m, 32 if multi_chunk else 64)
 
     return (
         tile_m,
@@ -295,5 +294,6 @@ def _get_fwd_kernel_config(
         headdim_v,
         consumers_qk,
         consumers_pv,
+        tile_head_dim,
         enable_packgqa,
     )

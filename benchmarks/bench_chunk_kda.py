@@ -113,6 +113,7 @@ def run_case(
     l2_flush_size_mb: int,
     seed: int,
     state_mode: str,
+    state_layout: str,
     varlen: bool,
     cu_seqlens_dtype,
 ) -> None:
@@ -141,6 +142,7 @@ def run_case(
         )
         print(
             f"varlen shape=[{total},{H},{D}] seq_lens={seq_lens} "
+            f"state_layout={state_layout} "
             f"{bench_desc} l2_flush={l2_flush}"
         )
     else:
@@ -150,7 +152,10 @@ def run_case(
             if iters is not None
             else f"dry_run_time_ms={dry_run_time_ms} repeat_time_ms={repeat_time_ms}"
         )
-        print(f"shape=[{total},{H},{D}] {bench_desc} l2_flush={l2_flush}")
+        print(
+            f"shape=[{total},{H},{D}] state_layout={state_layout} "
+            f"{bench_desc} l2_flush={l2_flush}"
+        )
 
     q = F.normalize(
         torch.randn((1, total, H, D), dtype=torch.float32, device=device),
@@ -170,17 +175,30 @@ def run_case(
     output = torch.zeros_like(v)
 
     state_elems = nseq * H * D * D
-    initial_state = (
+    dense_initial_state = (
         torch.arange(state_elems, dtype=torch.float32, device=device)
         .reshape(nseq, H, D, D)
         .to(dtype)
     )
-    final_state = torch.zeros_like(initial_state)
+    dense_final_state = torch.zeros_like(dense_initial_state)
 
-    initial_state_fp32 = initial_state.float()
-    final_state_fp32 = torch.zeros_like(initial_state_fp32)
+    state_indices = None
+    pool_initial_state = None
+    pool_final_state = None
+    if state_layout in ("pool", "both"):
+        pool_rows = max(nseq + 1, 2 * nseq)
+        state_indices = (2 * torch.arange(nseq, device=device, dtype=torch.int32)) + 1
+        pool_initial_state = torch.zeros(
+            (pool_rows, H, D, D), dtype=dtype, device=device
+        )
+        pool_initial_state.index_copy_(
+            0, state_indices.to(torch.long), dense_initial_state
+        )
+        # Pool mode is deliberately in-place: the kernel reads and updates the
+        # selected rows in the same allocation.
+        pool_final_state = pool_initial_state
 
-    def run_fused_kda(state, state_out) -> object:
+    def run_fused_kda(state, state_out, indices=None) -> object:
         return mate_kda.chunk_kda(
             q,
             k,
@@ -197,6 +215,7 @@ def run_case(
             use_qk_l2norm_in_kernel=True,
             output=output,
             final_state=state_out,
+            initial_state_indices=indices,
         )
 
     def bench_one(label: str, fn: Callable[[], object]) -> None:
@@ -220,17 +239,41 @@ def run_case(
     run_no_state = state_mode in ("none", "all")
 
     if run_bf16_state:
-        bench_one(
-            f"fused ({_state_name(dtype)} state)",
-            lambda: run_fused_kda(initial_state, final_state),
-        )
+        if state_layout in ("dense", "both"):
+            bench_one(
+                f"fused ({_state_name(dtype)} state, dense)",
+                lambda: run_fused_kda(dense_initial_state, dense_final_state),
+            )
+        if state_layout in ("pool", "both"):
+            bench_one(
+                f"fused ({_state_name(dtype)} state, pool)",
+                lambda: run_fused_kda(
+                    pool_initial_state, pool_final_state, state_indices
+                ),
+            )
     if run_no_state:
         bench_one("fused (no state)", lambda: run_fused_kda(None, None))
     if run_fp32_state:
-        bench_one(
-            "fused (fp32 state)",
-            lambda: run_fused_kda(initial_state_fp32, final_state_fp32),
-        )
+        dense_initial_state_fp32 = dense_initial_state.float()
+        dense_final_state_fp32 = torch.zeros_like(dense_initial_state_fp32)
+        if state_layout in ("dense", "both"):
+            bench_one(
+                "fused (fp32 state, dense)",
+                lambda: run_fused_kda(dense_initial_state_fp32, dense_final_state_fp32),
+            )
+        if state_layout in ("pool", "both"):
+            pool_initial_state_fp32 = torch.zeros(
+                (pool_rows, H, D, D), dtype=torch.float32, device=device
+            )
+            pool_initial_state_fp32.index_copy_(
+                0, state_indices.to(torch.long), dense_initial_state_fp32
+            )
+            bench_one(
+                "fused (fp32 state, pool)",
+                lambda: run_fused_kda(
+                    pool_initial_state_fp32, pool_initial_state_fp32, state_indices
+                ),
+            )
 
 
 def main() -> None:
@@ -281,6 +324,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--state-mode", choices=["bf16", "fp32", "both", "none", "all"], default="bf16"
+    )
+    parser.add_argument(
+        "--state-layout",
+        choices=["dense", "pool", "both"],
+        default="dense",
+        help="State storage layout: one row per sequence, indexed pool, or both.",
     )
     parser.add_argument(
         "--device",
@@ -353,6 +402,7 @@ def main() -> None:
             args.l2_flush_size_mb,
             args.seed,
             args.state_mode,
+            args.state_layout,
             varlen,
             cu_seqlens_dtype,
         )

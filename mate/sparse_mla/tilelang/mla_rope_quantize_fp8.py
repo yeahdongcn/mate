@@ -2,6 +2,8 @@ import functools
 
 import torch
 
+from ...execution_context import skip_kernel_launch_if_dry_run
+
 
 _NOPE_DIM = 512
 _ROPE_DIM = 64
@@ -188,6 +190,8 @@ def run_mla_rope_quantize_fp8(
         pos_dtype=pos_dtype,
         cos_sin_dtype=cos_sin_dtype,
     )
+    if skip_kernel_launch_if_dry_run():
+        return
     kernel(
         q_rope,
         k_rope,

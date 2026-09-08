@@ -193,20 +193,25 @@ musa::dnn::Tensor make_mudnn_scale_tensor(
 }
 
 void bmm_8bit(const BMMArgs& args) {
-  TVM_FFI_ICHECK(args.scale_a.has_value()) << "bmm_8bit requires scale_a";
-  TVM_FFI_ICHECK(args.scale_b.has_value()) << "bmm_8bit requires scale_b";
-  const ffi::TensorView& scale_a = args.scale_a.value();
-  const ffi::TensorView& scale_b = args.scale_b.value();
+  TVM_FFI_ICHECK_EQ(args.scale_a.has_value(), args.scale_b.has_value())
+      << "scale_a and scale_b must be both present or both absent";
+  const bool             has_scales = args.scale_a.has_value();
+  const ffi::TensorView* scale_a    = has_scales ? &args.scale_a.value() : nullptr;
+  const ffi::TensorView* scale_b    = has_scales ? &args.scale_b.value() : nullptr;
 
   check_mp31(args.a.device(), "bmm");
   CHECK_MUSA(args.a);
   CHECK_MUSA(args.b);
-  CHECK_MUSA(scale_a);
-  CHECK_MUSA(scale_b);
+  if (has_scales) {
+    CHECK_MUSA(args.scale_a.value());
+    CHECK_MUSA(args.scale_b.value());
+  }
   CHECK_MUSA(args.d);
   CHECK_DEVICE(args.a, args.b);
-  CHECK_DEVICE(args.a, scale_a);
-  CHECK_DEVICE(args.a, scale_b);
+  if (has_scales) {
+    CHECK_DEVICE(args.a, args.scale_a.value());
+    CHECK_DEVICE(args.a, args.scale_b.value());
+  }
   CHECK_DEVICE(args.a, args.d);
   CHECK_DIM(3, args.a);
   CHECK_DIM(3, args.b);
@@ -218,8 +223,10 @@ void bmm_8bit(const BMMArgs& args) {
     TVM_FFI_ICHECK_EQ(args.c.value().stride(-1), 1) << "c must be contiguous at the last dimension";
   }
   TVM_FFI_ICHECK_EQ(args.d.stride(-1), 1) << "d must be contiguous at the last dimension";
-  TVM_FFI_ICHECK_EQ(scale_a.dtype(), dl_float32) << "scale_a must be float32";
-  TVM_FFI_ICHECK_EQ(scale_b.dtype(), dl_float32) << "scale_b must be float32";
+  if (has_scales) {
+    TVM_FFI_ICHECK_EQ(scale_a->dtype(), dl_float32) << "scale_a must be float32";
+    TVM_FFI_ICHECK_EQ(scale_b->dtype(), dl_float32) << "scale_b must be float32";
+  }
 
   TVM_FFI_ICHECK(is_fp8_dtype(args.a.dtype())) << "a must be fp8";
   TVM_FFI_ICHECK(is_fp8_dtype(args.b.dtype())) << "b must be fp8";
@@ -228,21 +235,28 @@ void bmm_8bit(const BMMArgs& args) {
     TVM_FFI_ICHECK(dtype_equal(args.c.value().dtype(), args.d.dtype())) << "c must have the same dtype as d";
     TVM_FFI_ICHECK(dtype_equal(args.d.dtype(), dl_float32)) << "FP8 bmm with c only supports fp32 d";
   }
-  const int granularity_m   = static_cast<int>(std::get<0>(args.recipe_a));
-  const int granularity_n   = static_cast<int>(std::get<0>(args.recipe_b));
-  const int granularity_k_a = static_cast<int>(std::get<1>(args.recipe_a));
-  const int granularity_k_b = static_cast<int>(std::get<1>(args.recipe_b));
-  TVM_FFI_ICHECK_EQ(granularity_k_a, granularity_k_b) << "recipe_a and recipe_b must use matching K granularity";
-  const int             granularity_k = granularity_k_a;
-  const TensorQuantMode quant_mode_a  = get_tensor_quant_mode(granularity_m, granularity_k);
-  const TensorQuantMode quant_mode_b  = get_tensor_quant_mode(granularity_n, granularity_k);
-  validate_bmm_quant_mode(quant_mode_a, quant_mode_b, granularity_m, granularity_n, granularity_k);
-  const bool group_or_block_scaled =
-      (quant_mode_a == TensorQuantMode::GROUP || quant_mode_a == TensorQuantMode::BLOCK) &&
-      (quant_mode_b == TensorQuantMode::GROUP || quant_mode_b == TensorQuantMode::BLOCK);
-  TVM_FFI_ICHECK(!(group_or_block_scaled && dtype_equal(args.a.dtype(), dl_float8_e4m3fn) &&
-                   dtype_equal(args.b.dtype(), dl_float8_e5m2)))
-      << "FP8 bmm group/block scaling does not support E4M3 a with E5M2 b";
+  int             granularity_m = 0;
+  int             granularity_n = 0;
+  int             granularity_k = 0;
+  TensorQuantMode quant_mode_a  = TensorQuantMode::TENSOR;
+  TensorQuantMode quant_mode_b  = TensorQuantMode::TENSOR;
+  if (has_scales) {
+    granularity_m             = static_cast<int>(std::get<0>(args.recipe_a));
+    granularity_n             = static_cast<int>(std::get<0>(args.recipe_b));
+    const int granularity_k_a = static_cast<int>(std::get<1>(args.recipe_a));
+    const int granularity_k_b = static_cast<int>(std::get<1>(args.recipe_b));
+    TVM_FFI_ICHECK_EQ(granularity_k_a, granularity_k_b) << "recipe_a and recipe_b must use matching K granularity";
+    granularity_k = granularity_k_a;
+    quant_mode_a  = get_tensor_quant_mode(granularity_m, granularity_k);
+    quant_mode_b  = get_tensor_quant_mode(granularity_n, granularity_k);
+    validate_bmm_quant_mode(quant_mode_a, quant_mode_b, granularity_m, granularity_n, granularity_k);
+    const bool group_or_block_scaled =
+        (quant_mode_a == TensorQuantMode::GROUP || quant_mode_a == TensorQuantMode::BLOCK) &&
+        (quant_mode_b == TensorQuantMode::GROUP || quant_mode_b == TensorQuantMode::BLOCK);
+    TVM_FFI_ICHECK(!(group_or_block_scaled && dtype_equal(args.a.dtype(), dl_float8_e4m3fn) &&
+                     dtype_equal(args.b.dtype(), dl_float8_e5m2)))
+        << "FP8 bmm group/block scaling does not support E4M3 a with E5M2 b";
+  }
 
   const TensorMajor major_a = args.trans_a ? TensorMajor::MN : TensorMajor::K;
   const TensorMajor major_b = args.trans_b ? TensorMajor::K : TensorMajor::MN;
@@ -263,14 +277,18 @@ void bmm_8bit(const BMMArgs& args) {
     TVM_FFI_ICHECK_EQ(args.c.value().size(2), n);
   }
 
-  const bool has_non_scalar_scale = scale_a.ndim() != 0 || scale_b.ndim() != 0;
-  if (has_non_scalar_scale && (args.trans_a || !args.trans_b) && !args.fixed_scale_layout) {
-    TVM_FFI_THROW(ValueError) << "non-NT FP8 bmm scales require fixed_scale_layout=true";
+  ScaleStrides scale_a_strides{};
+  ScaleStrides scale_b_strides{};
+  if (has_scales) {
+    const bool has_non_scalar_scale = scale_a->ndim() != 0 || scale_b->ndim() != 0;
+    if (has_non_scalar_scale && (args.trans_a || !args.trans_b) && !args.fixed_scale_layout) {
+      TVM_FFI_THROW(ValueError) << "non-NT FP8 bmm scales require fixed_scale_layout=true";
+    }
+    scale_a_strides =
+        validate_scale_shape(*scale_a, "scale_a", batch, m, k, granularity_m, granularity_k, args.fixed_scale_layout);
+    scale_b_strides =
+        validate_scale_shape(*scale_b, "scale_b", batch, n, k, granularity_n, granularity_k, args.fixed_scale_layout);
   }
-  const ScaleStrides scale_a_strides =
-      validate_scale_shape(scale_a, "scale_a", batch, m, k, granularity_m, granularity_k, args.fixed_scale_layout);
-  const ScaleStrides scale_b_strides =
-      validate_scale_shape(scale_b, "scale_b", batch, n, k, granularity_n, granularity_k, args.fixed_scale_layout);
 
   if (common::gemm_early_return(batch, m, n, k, args.d, args.c.has_value())) {
     return;
@@ -281,43 +299,49 @@ void bmm_8bit(const BMMArgs& args) {
 
   ffi::MUSADeviceGuard     device_guard(args.a.device().device_id);
   musa::dnn::MatMulLtParam lt_param;
-  if (quant_mode_a == TensorQuantMode::TENSOR && quant_mode_b == TensorQuantMode::TENSOR) {
-    // Apply one scalar scale to each complete operand.
-    TVM_FFI_ICHECK_EQ(scale_a.ndim(), 0) << "scale_a must be a scalar tensor";
-    TVM_FFI_ICHECK_EQ(scale_b.ndim(), 0) << "scale_b must be a scalar tensor";
-    musa::dnn::Tensor mudnn_scale_a = make_mudnn_scalar_tensor(scale_a.data_ptr(), dl_float32);
-    musa::dnn::Tensor mudnn_scale_b = make_mudnn_scalar_tensor(scale_b.data_ptr(), dl_float32);
-    MATE_MUDNN_STATUS_CHECK(lt_param.SetScale(mudnn_scale_a, mudnn_scale_b, musa::dnn::Tensor{}, musa::dnn::Tensor{}));
-  } else if (quant_mode_a == TensorQuantMode::CHANNEL && quant_mode_b == TensorQuantMode::TENSOR) {
-    // Apply one scale per A row and one scalar scale to B.
-    TVM_FFI_ICHECK_EQ(scale_b.ndim(), 0) << "scale_b must be a scalar tensor";
-    musa::dnn::Tensor mudnn_scale_a = make_mudnn_scale_tensor(scale_a, m, 1, scale_a_strides, args.fixed_scale_layout);
-    musa::dnn::Tensor mudnn_scale_b = make_mudnn_scalar_tensor(scale_b.data_ptr(), dl_float32);
-    MATE_MUDNN_STATUS_CHECK(lt_param.SetScale(
-        mudnn_scale_a, mudnn_scale_b, musa::dnn::Tensor{}, musa::dnn::Tensor{}, 0, args.fixed_scale_layout));
-  } else if (quant_mode_a == TensorQuantMode::CHANNEL && quant_mode_b == TensorQuantMode::CHANNEL) {
-    // Apply independent row-wise scales to A and B.
-    musa::dnn::Tensor mudnn_scale_a = make_mudnn_scale_tensor(scale_a, m, 1, scale_a_strides, args.fixed_scale_layout);
-    musa::dnn::Tensor mudnn_scale_b = make_mudnn_scale_tensor(scale_b, n, 1, scale_b_strides, args.fixed_scale_layout);
-    MATE_MUDNN_STATUS_CHECK(lt_param.SetScale(
-        mudnn_scale_a, mudnn_scale_b, musa::dnn::Tensor{}, musa::dnn::Tensor{}, 0, args.fixed_scale_layout));
-  } else {
-    // Apply K-grouped scales; B uses N granularity 1 for GROUP and 128 for BLOCK.
-    const int scale_a_m = mutlass::ceil_div(m, granularity_m);
-    const int scale_a_k = mutlass::ceil_div(k, granularity_k);
-    const int scale_b_n = mutlass::ceil_div(n, granularity_n);
-    const int scale_b_k = mutlass::ceil_div(k, granularity_k);
+  if (has_scales) {
+    if (quant_mode_a == TensorQuantMode::TENSOR && quant_mode_b == TensorQuantMode::TENSOR) {
+      // Apply one scalar scale to each complete operand.
+      TVM_FFI_ICHECK_EQ(scale_a->ndim(), 0) << "scale_a must be a scalar tensor";
+      TVM_FFI_ICHECK_EQ(scale_b->ndim(), 0) << "scale_b must be a scalar tensor";
+      musa::dnn::Tensor mudnn_scale_a = make_mudnn_scalar_tensor(scale_a->data_ptr(), dl_float32);
+      musa::dnn::Tensor mudnn_scale_b = make_mudnn_scalar_tensor(scale_b->data_ptr(), dl_float32);
+      MATE_MUDNN_STATUS_CHECK(
+          lt_param.SetScale(mudnn_scale_a, mudnn_scale_b, musa::dnn::Tensor{}, musa::dnn::Tensor{}));
+    } else if (quant_mode_a == TensorQuantMode::CHANNEL && quant_mode_b == TensorQuantMode::TENSOR) {
+      // Apply one scale per A row and one scalar scale to B.
+      TVM_FFI_ICHECK_EQ(scale_b->ndim(), 0) << "scale_b must be a scalar tensor";
+      musa::dnn::Tensor mudnn_scale_a =
+          make_mudnn_scale_tensor(*scale_a, m, 1, scale_a_strides, args.fixed_scale_layout);
+      musa::dnn::Tensor mudnn_scale_b = make_mudnn_scalar_tensor(scale_b->data_ptr(), dl_float32);
+      MATE_MUDNN_STATUS_CHECK(lt_param.SetScale(
+          mudnn_scale_a, mudnn_scale_b, musa::dnn::Tensor{}, musa::dnn::Tensor{}, 0, args.fixed_scale_layout));
+    } else if (quant_mode_a == TensorQuantMode::CHANNEL && quant_mode_b == TensorQuantMode::CHANNEL) {
+      // Apply independent row-wise scales to A and B.
+      musa::dnn::Tensor mudnn_scale_a =
+          make_mudnn_scale_tensor(*scale_a, m, 1, scale_a_strides, args.fixed_scale_layout);
+      musa::dnn::Tensor mudnn_scale_b =
+          make_mudnn_scale_tensor(*scale_b, n, 1, scale_b_strides, args.fixed_scale_layout);
+      MATE_MUDNN_STATUS_CHECK(lt_param.SetScale(
+          mudnn_scale_a, mudnn_scale_b, musa::dnn::Tensor{}, musa::dnn::Tensor{}, 0, args.fixed_scale_layout));
+    } else {
+      // Apply K-grouped scales; B uses N granularity 1 for GROUP and 128 for BLOCK.
+      const int scale_a_m = mutlass::ceil_div(m, granularity_m);
+      const int scale_a_k = mutlass::ceil_div(k, granularity_k);
+      const int scale_b_n = mutlass::ceil_div(n, granularity_n);
+      const int scale_b_k = mutlass::ceil_div(k, granularity_k);
 
-    musa::dnn::Tensor mudnn_scale_a =
-        make_mudnn_scale_tensor(scale_a, scale_a_m, scale_a_k, scale_a_strides, args.fixed_scale_layout);
-    musa::dnn::Tensor mudnn_scale_b =
-        make_mudnn_scale_tensor(scale_b, scale_b_n, scale_b_k, scale_b_strides, args.fixed_scale_layout);
-    MATE_MUDNN_STATUS_CHECK(lt_param.SetScale(mudnn_scale_a,
-                                              mudnn_scale_b,
-                                              musa::dnn::Tensor{},
-                                              musa::dnn::Tensor{},
-                                              granularity_k,
-                                              args.fixed_scale_layout));
+      musa::dnn::Tensor mudnn_scale_a =
+          make_mudnn_scale_tensor(*scale_a, scale_a_m, scale_a_k, scale_a_strides, args.fixed_scale_layout);
+      musa::dnn::Tensor mudnn_scale_b =
+          make_mudnn_scale_tensor(*scale_b, scale_b_n, scale_b_k, scale_b_strides, args.fixed_scale_layout);
+      MATE_MUDNN_STATUS_CHECK(lt_param.SetScale(mudnn_scale_a,
+                                                mudnn_scale_b,
+                                                musa::dnn::Tensor{},
+                                                musa::dnn::Tensor{},
+                                                granularity_k,
+                                                args.fixed_scale_layout));
+    }
   }
   run_bmm_mudnn(args, major_a, major_b, batch, m, n, k, lt_param);
 }

@@ -81,9 +81,14 @@ def parse_env_flags(env_var_name: str) -> List[str]:
 def _resolve_include_paths(
     extra_include_dirs: Optional[Sequence[Path]],
 ) -> List[str]:
+    musa_include_dir = get_musa_home() / "include"
+    if not musa_include_dir.is_dir():
+        raise RuntimeError(f"MUSA include directory not found: {musa_include_dir}")
+
     include_paths = [
         find_include_path(),
         find_dlpack_include_path(),
+        str(musa_include_dir.resolve()),
     ]
     include_paths.extend(get_mudnn_include_dirs())
     if extra_include_dirs is not None:

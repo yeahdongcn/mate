@@ -388,21 +388,21 @@ def test_fp8_output_with_lse_returns_expected_tuple():
     assert out_scale.shape[-1] == 1
 
 
-#@supported_musa_compute_capability([31])
-#@pytest.mark.parametrize(
+# @supported_musa_compute_capability([31])
+# @pytest.mark.parametrize(
 #    ("operand", "quant_recipe", "quant_dtype", "smooth_k"),
 #    _COMPILE_PARITY_CASES,
 #    ids=[
 #        f"{operand}-{quant_recipe}-{quant_dtype}-{smooth_k}"
 #        for operand, quant_recipe, quant_dtype, smooth_k in _COMPILE_PARITY_CASES
 #    ],
-#)
-#def test_quantize_sage_attention_tensor_compile_matches_eager(
+# )
+# def test_quantize_sage_attention_tensor_compile_matches_eager(
 #    operand: str,
 #    quant_recipe: tuple[int, int, int, int],
 #    quant_dtype: torch.dtype,
 #    smooth_k: bool,
-#):
+# ):
 #    _manual_seed(505)
 #
 #    x = torch.randn(1, 128, 2, 128, dtype=torch.bfloat16, device="musa")

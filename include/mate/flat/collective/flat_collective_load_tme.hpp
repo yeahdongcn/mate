@@ -11,7 +11,6 @@ template <class CopyOperation, class... CopyOpArgs>
 struct Copy_Traits;
 }  // namespace mute
 
-#include <mute/arch/copy_mp31_tme.hpp>
 #include <mute/tensor.hpp>
 
 namespace mate::flat::collective {
@@ -74,13 +73,13 @@ struct CollectiveLoadTme {
         Tensor m_offset = domain_offset(make_coord(work_desc.tme_token(0), _0{}), m_head);
         return local_tile(m_offset, make_shape(seq_tile, head_dim), make_coord(_, _0{}));
       } else if constexpr (kind == LoadKind::kV) {
-        auto   seq_tile = get<1>(tile_shape);
-        auto   head_dim = get<2>(tile_shape);
-        Tensor m_input =
-            tme_load.get_tme_tensor(make_shape(head_dim, problem_size.T, make_shape(problem_size.H, problem_size.B)));
+        auto   seq_tile   = get<1>(tile_shape);
+        auto   value_tile = get<2>(tile_shape);
+        Tensor m_input    = tme_load.get_tme_tensor(
+            make_shape(work_desc.value_head_dim(), problem_size.T, make_shape(problem_size.H, problem_size.B)));
         Tensor m_head   = m_input(_, _, make_coord(work_desc.head_idx, work_desc.tme_batch()));
-        Tensor m_offset = domain_offset(make_coord(_0{}, work_desc.tme_token(0)), m_head);
-        return local_tile(m_offset, make_shape(head_dim, seq_tile), make_coord(_0{}, _));
+        Tensor m_offset = domain_offset(make_coord(work_desc.value_start, work_desc.tme_token(0)), m_head);
+        return local_tile(m_offset, make_shape(value_tile, seq_tile), make_coord(_0{}, _));
       } else {
         static_assert(kind == LoadKind::kG, "unsupported CollectiveLoadTme kind");
         auto   seq_tile = get<0>(tile_shape);

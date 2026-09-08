@@ -4,7 +4,7 @@ import tilelang.language as T
 import torch
 
 
-from ...execution_context import raise_complete_if_dry_run
+from ...execution_context import skip_kernel_launch_if_dry_run
 
 __all__ = ["run_gated_delta_rule_decode_vk_fp32"]
 
@@ -987,28 +987,25 @@ def run_gated_delta_rule_decode_vk_fp32(
         state_v_first=bool(state_v_first),
     )
 
-    # FakeTensor dry runs resolve and compile the selected specialization, but
-    # must stop before TileLang attempts to launch it with null data pointers.
-    raise_complete_if_dry_run()
-
-    kernel_fn(
-        q_arg,
-        k_arg,
-        v_arg,
-        A_log_arg,
-        g_arg,
-        dt_bias_arg,
-        b_arg,
-        cu_seqlens_arg,
-        num_accepted_tokens_arg,
-        T_fixed_arg,
-        float(scale),
-        float(lower_bound),
-        state_indices_arg,
-        state,
-        final_state_arg,
-        output_arg,
-    )
+    if not skip_kernel_launch_if_dry_run():
+        kernel_fn(
+            q_arg,
+            k_arg,
+            v_arg,
+            A_log_arg,
+            g_arg,
+            dt_bias_arg,
+            b_arg,
+            cu_seqlens_arg,
+            num_accepted_tokens_arg,
+            T_fixed_arg,
+            float(scale),
+            float(lower_bound),
+            state_indices_arg,
+            state,
+            final_state_arg,
+            output_arg,
+        )
     if not is_varlen:
         output_arg = output.reshape(B, T_fixed_host, HV, V)
     return output_arg, final_state_result

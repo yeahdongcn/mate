@@ -7,6 +7,8 @@ from mate.api_logging import mate_api
 from mate.jit.mla_ops import get_mla_ops_module
 from mate.jit.mubin.flash_mla import flash_mla_asm_mubin
 from mate.jit.runtime import ffi_to_torch
+from mate.mate_runtime import get_physical_num_mps
+from mate.utils import ceil_div
 from .sparse_mla.flashmla_sparse import (
     flashmla_sparse_decode,
     flashmla_sparse_prefill,
@@ -14,7 +16,7 @@ from .sparse_mla.flashmla_sparse import (
 from .sparse_mla.tilelang.sparse_mla_model1_fwd_pack import (
     sparse_mla_fwd_interface_model1_pack,
 )
-from .execution_context import raise_complete_if_dry_run
+from .execution_context import skip_kernel_launch_if_dry_run
 
 
 @functools.cache
@@ -50,6 +52,32 @@ def _prepare_mla_query_input(
     return x
 
 
+def _allocate_mla_metadata_outputs(
+    cache_seqlens: Optional[torch.Tensor],
+    q: Optional[torch.Tensor],
+    *,
+    bs: Optional[int],
+    num_q_tokens_per_head_k: int,
+    num_heads_k: int,
+    is_sparse_attn: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    tensor = cache_seqlens if cache_seqlens is not None else q
+    if tensor is None:
+        raise ValueError("cache_seqlens or q must be provided")
+    batch_size = bs if bs is not None else tensor.shape[0]
+    tile_m = 64 if is_sparse_attn else 128
+    num_mp_parts = max(
+        get_physical_num_mps(tensor.device)
+        // num_heads_k
+        // ceil_div(num_q_tokens_per_head_k, tile_m),
+        1,
+    )
+    return (
+        torch.empty((num_mp_parts, 8), dtype=torch.int32, device=tensor.device),
+        torch.empty((batch_size + 1,), dtype=torch.int32, device=tensor.device),
+    )
+
+
 def _dispatch_mla_metadata(
     cache_seqlens: Optional[torch.Tensor],
     num_q_tokens_per_head_k: int,
@@ -73,7 +101,17 @@ def _dispatch_mla_metadata(
         )
 
     func = _get_module().get_function("get_mla_decoding_metadata")
-    raise_complete_if_dry_run()
+    if skip_kernel_launch_if_dry_run():
+        if tile_scheduler_metadata is None:
+            return _allocate_mla_metadata_outputs(
+                cache_seqlens,
+                q,
+                bs=bs,
+                num_q_tokens_per_head_k=num_q_tokens_per_head_k,
+                num_heads_k=num_heads_k,
+                is_sparse_attn=topk is not None,
+            )
+        return tile_scheduler_metadata, num_splits
     return ffi_to_torch(
         func(
             cache_seqlens,
@@ -365,40 +403,40 @@ def flash_mla_with_kvcache(
     out, softmax_lse = _allocate_flashmla_outputs(q, head_dim_v)
 
     if should_run_with_asm:
-        raise_complete_if_dry_run()
-        flash_mla_asm_mubin(
-            q_nope,
-            q_pe,
-            k_cache[:, :, :, :head_dim_v],
-            k_cache[:, :, :, head_dim_v:],
-            cache_seqlens,
-            block_table,
-            tile_scheduler_metadata,
-            num_splits,
-            out,
-            softmax_lse,
-            softmax_scale,
-            causal,
-            None,
-            None,
-        )
+        if not skip_kernel_launch_if_dry_run():
+            flash_mla_asm_mubin(
+                q_nope,
+                q_pe,
+                k_cache[:, :, :, :head_dim_v],
+                k_cache[:, :, :, head_dim_v:],
+                cache_seqlens,
+                block_table,
+                tile_scheduler_metadata,
+                num_splits,
+                out,
+                softmax_lse,
+                softmax_scale,
+                causal,
+                None,
+                None,
+            )
     else:
         func = _get_module().get_function("mla_with_kvcache")
-        raise_complete_if_dry_run()
-        func(
-            q_nope,
-            q_pe,
-            k_cache[:, :, :, :head_dim_v],
-            k_cache[:, :, :, head_dim_v:],
-            cache_seqlens,
-            None,
-            None,
-            block_table,
-            tile_scheduler_metadata,
-            num_splits,
-            out,
-            softmax_lse,
-            softmax_scale,
-            causal,
-        )
+        if not skip_kernel_launch_if_dry_run():
+            func(
+                q_nope,
+                q_pe,
+                k_cache[:, :, :, :head_dim_v],
+                k_cache[:, :, :, head_dim_v:],
+                cache_seqlens,
+                None,
+                None,
+                block_table,
+                tile_scheduler_metadata,
+                num_splits,
+                out,
+                softmax_lse,
+                softmax_scale,
+                causal,
+            )
     return out, softmax_lse

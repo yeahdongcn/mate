@@ -156,6 +156,9 @@ JIT/AOT modules that compile MUSA kernels.
 | `MATE_PYTEST_SHARD_INDEX` | `0` | Index of current shard |
 | `MATE_PYTEST_SHARD_MODE` | `file` | Shard dispatch mode. Currently, only `file` mode is supported |
 
+Repository tests can also enable `MATE_DRY_RUN=1` behavior with the equivalent
+`pytest --dry-run` option.
+
 When `MATE_PYTEST_SHARD_TOTAL > 1`, `test_fmha.py` tests will dominate the last shard.
 
 The `MATE_PYTEST_GUARD_*` variables are consumed by MATE's in-repository

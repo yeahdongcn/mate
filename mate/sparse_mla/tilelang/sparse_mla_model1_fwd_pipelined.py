@@ -15,7 +15,6 @@ import torch
 import tilelang
 from tilelang import language as T
 
-from ...utils import cosize
 from ...mate_runtime import resolve_num_mps
 from .sparse_mla_prefill_common import (
     SPARSE_PREFILL_COMPILE_FLAGS,
@@ -24,8 +23,8 @@ from .sparse_mla_prefill_common import (
     validate_prefill_attn_sink,
     validate_token_lengths,
 )
-from .sparse_mla_index_type import jit_for_tensor_addressing
-from ...execution_context import raise_complete_if_dry_run
+from .sparse_mla_index_type import jit_for_tensor_addressing, tensor_byte_span
+from ...execution_context import skip_kernel_launch_if_dry_run
 
 
 # tilelang.disable_cache()
@@ -77,12 +76,9 @@ def sparse_attention_fwd_kernel_model1(
     indices_dtype = "int32"
     dtype = "bfloat16"
     accum_dtype = "float"
-    dtype_bytes = 2
     q_strides = (q_stride_s, q_stride_h, 1)
     kv_strides = (kv_stride_s, kv_stride_g, 1)
     indices_strides = (indices_stride_s, indices_stride_g, 1)
-    q_cosize = cosize(q_shape, q_strides)
-    kv_cosize = cosize(kv_shape, kv_strides)
     q_type: Any = T.StridedTensor(q_shape, q_strides, dtype)
     kv_type: Any = T.StridedTensor(kv_shape, kv_strides, dtype)
     indices_type: Any = T.StridedTensor(indices_shape, indices_strides, indices_dtype)
@@ -169,6 +165,7 @@ def sparse_attention_fwd_kernel_model1(
         lse,
         sm_scale,
         persistent_blocks,
+        kv_span_bytes,
     ):
         launch_blocks = (
             T.min(persistent_blocks, logical_blocks)
@@ -219,13 +216,9 @@ def sparse_attention_fwd_kernel_model1(
             bar_final_free = T.alloc_barrier(arrive_count=consumer1_threads)
             bar_producer_protect = T.alloc_barrier(arrive_count=producer_threads)
 
-            q_robust_desc = T.make_robust_desc(
-                T.address_of(q[0, 0, 0]),
-                q_cosize * dtype_bytes,
-            )
             kv_robust_desc = T.make_robust_desc(
                 T.address_of(kv[0, 0, 0]),
-                kv_cosize * dtype_bytes,
+                kv_span_bytes,
             )
             T.sync_threads()
 
@@ -599,7 +592,7 @@ def sparse_attention_fwd_kernel_model1(
                             alpha_r[h_i] = alpha_shared[h_i]
                         for h_i, d_i in T.Parallel(heads_per_block, dim_qk // 4):
                             acc_o_r_0[h_i, d_i] *= alpha_r[h_i]
-                        T.sched_boundary()
+                        # T.sched_boundary()  # B baseline: intentionally disabled
                         T.barrier_wait(bar_vl0_free, phase_count[0] & 1)
                         T.annotate_layout(
                             {
@@ -622,7 +615,7 @@ def sparse_attention_fwd_kernel_model1(
                                     ] = kv_reg_r[r * 32 + u * 8 + v]
 
                         T.lma_wait()
-                        T.sched_boundary()
+                        # T.sched_boundary()  # B baseline: intentionally disabled
                         T.barrier_arrive(bar_vr0_ready)
                         T.barrier_wait(bar_vr0_ready, phase_count[0] & 1)
 
@@ -635,7 +628,7 @@ def sparse_attention_fwd_kernel_model1(
                         )
                         T.wait_wgmma(0)
                         T.barrier_arrive(bar_vr0_free)
-                        T.sched_boundary()
+                        # T.sched_boundary()  # B baseline: intentionally disabled
                         for h_i, d_i in T.Parallel(heads_per_block, dim_qk // 4):
                             acc_o_r_1[h_i, d_i] *= alpha_r[h_i]
 
@@ -904,6 +897,7 @@ def sparse_attention_fwd_kernel_model1(
             attn_sink: T.Tensor([num_heads], accum_dtype),
             sm_scale: T.float32,
             persistent_blocks: T.int32,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -916,6 +910,7 @@ def sparse_attention_fwd_kernel_model1(
                 lse,
                 sm_scale,
                 persistent_blocks,
+                kv_span_bytes,
             )
 
     elif has_topk_length:
@@ -931,6 +926,7 @@ def sparse_attention_fwd_kernel_model1(
             topk_length: T.Tensor([seq_len], indices_dtype),
             sm_scale: T.float32,
             persistent_blocks: T.int32,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -943,6 +939,7 @@ def sparse_attention_fwd_kernel_model1(
                 lse,
                 sm_scale,
                 persistent_blocks,
+                kv_span_bytes,
             )
 
     elif has_attn_sink:
@@ -958,6 +955,7 @@ def sparse_attention_fwd_kernel_model1(
             attn_sink: T.Tensor([num_heads], accum_dtype),
             sm_scale: T.float32,
             persistent_blocks: T.int32,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -970,6 +968,7 @@ def sparse_attention_fwd_kernel_model1(
                 lse,
                 sm_scale,
                 persistent_blocks,
+                kv_span_bytes,
             )
 
     else:
@@ -984,6 +983,7 @@ def sparse_attention_fwd_kernel_model1(
             lse: T.Tensor(lse_shape, accum_dtype),
             sm_scale: T.float32,
             persistent_blocks: T.int32,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -996,6 +996,7 @@ def sparse_attention_fwd_kernel_model1(
                 lse,
                 sm_scale,
                 persistent_blocks,
+                kv_span_bytes,
             )
 
     return dsa_prefill
@@ -1072,8 +1073,6 @@ def sparse_mla_fwd_interface_model1(
     kernel = kernel_factory(heads, dim, **kernel_kwargs)
     if verbose:
         kernel.show_source()
-    raise_complete_if_dry_run()
-
     args = [q, kv, indices]
     if topk_length is not None:
         args.append(topk_length)
@@ -1081,9 +1080,14 @@ def sparse_mla_fwd_interface_model1(
         args.append(attn_sink)
     args.append(runtime_sm_scale)
     args.append(int(persistent_blocks))
-    out = kernel(*args)
-
-    out_tensor, max_logits, lse_tensor = out
+    args.append(tensor_byte_span(kv))
+    if skip_kernel_launch_if_dry_run():
+        out_tensor = torch.empty((seq_len, heads, dim), dtype=q.dtype, device=q.device)
+        max_logits = torch.empty((seq_len, heads), dtype=torch.float32, device=q.device)
+        lse_tensor = torch.empty_like(max_logits)
+    else:
+        out = kernel(*args)
+        out_tensor, max_logits, lse_tensor = out
     if return_max_logits:
         return out_tensor, max_logits, lse_tensor
     return out_tensor, lse_tensor

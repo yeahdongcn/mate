@@ -499,6 +499,63 @@ def test_m_grouped_fp8_gemm_nt_contiguous(
 
 
 @supported_musa_compute_capability([31])
+@pytest.mark.parametrize("alignment_m", [128, 256])
+@pytest.mark.parametrize("backend", ["auto", "mutlass"])
+def test_m_grouped_fp8_gemm_nn_contiguous(alignment_m, backend):
+    ms_per_group = [333, 444]
+    n, k = 4096, 2048
+    quant_tile = 128
+    recipe = (1, quant_tile, quant_tile)
+
+    num_expert = len(ms_per_group)
+    aligned_ms = [align(m, alignment_m) for m in ms_per_group]
+    m = sum(aligned_ms)
+
+    a = torch.rand((m, k), device="musa", dtype=torch.float)
+    b = torch.rand((num_expert, n, k), device="musa", dtype=torch.float)
+    m_indices = torch.full((m,), -1, device="musa", dtype=torch.int32)
+    d = torch.empty((m, n), device="musa", dtype=torch.bfloat16)
+    ref_d = torch.zeros((m, n), device="musa", dtype=torch.float)
+
+    fp8_a, scale_a = group_quantize_fp8(
+        a,
+        (m, k // quant_tile),
+        (1, quant_tile),
+        torch.float8_e4m3fn,
+        "K",
+    )
+    fp8_b, scale_b = group_quantize_fp8(
+        b,
+        (num_expert, n // quant_tile, k // quant_tile),
+        (1, quant_tile, quant_tile),
+        torch.float8_e4m3fn,
+        "K",
+    )
+
+    dequant_a = group_dequantize_fp8(fp8_a, scale_a, "K")
+    dequant_b = group_dequantize_fp8(fp8_b, scale_b, "K")
+    m_base = 0
+    for group, group_m in enumerate(ms_per_group):
+        rows = slice(m_base, m_base + group_m)
+        m_indices[rows] = group
+        ref_d[rows] = torch.matmul(dequant_a[rows], dequant_b[group].t())
+        m_base += aligned_ms[group]
+
+    mate.deep_gemm.m_grouped_fp8_gemm_nn_contiguous(
+        (fp8_a, scale_a),
+        (fp8_b.transpose(1, 2).contiguous(), scale_b.transpose(1, 2)),
+        d,
+        m_indices,
+        recipe,
+        alignment_m=alignment_m,
+        backend=backend,
+    )
+
+    d = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
+    torch.testing.assert_close(d.float(), ref_d, rtol=5e-3, atol=5e-3)
+
+
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_deepgemm_group_gemm_contig_cases())
 @pytest.mark.parametrize("n", [4096])
 @pytest.mark.parametrize("k", [2048])

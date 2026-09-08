@@ -9,6 +9,7 @@ from mate.deep_gemm import (
     fp8_mqa_logits as mate_fp8_mqa_logits,
     fp8_paged_mqa_logits as mate_fp8_paged_mqa_logits,
     get_paged_mqa_logits_metadata as mate_get_paged_mqa_logits_metadata,
+    m_grouped_fp8_gemm_nn_contiguous as mate_m_grouped_fp8_gemm_nn_contiguous,
     tf32_hc_prenorm_gemm as mate_tf32_hc_prenorm_gemm,
 )
 from mate.gemm import (
@@ -22,13 +23,9 @@ from mate.gemm import (
     ragged_m_moe_gemm_8bit,
     ragged_moe_gemm_mixed_dtype,
 )
+from mate.utils import ceil_div
 from .utils import get_mk_alignment_for_contiguous_layout
 from .utils.w4a8 import _is_packed_fp4, _prepare_m_grouped_w4a8_operands
-
-
-def _reject_unsupported_parameters(parameter: object) -> None:
-    if parameter is not None:
-        raise ValueError("parameter is not supported by Mate; leave it unset")
 
 
 def bf16_gemm_nt(
@@ -85,6 +82,74 @@ def bf16_gemm_tt(a, b, d, c=None, compiled_dims: str = "mn", backend: str = "aut
     )
 
 
+def cublaslt_gemm_nt(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+) -> None:
+    mate_bmm(
+        a.unsqueeze(0),
+        b.unsqueeze(0),
+        d.unsqueeze(0),
+        c=c.unsqueeze(0) if c is not None else None,
+        trans_a=False,
+        trans_b=True,
+        backend="mudnn",
+    )
+
+
+def cublaslt_gemm_nn(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+) -> None:
+    mate_bmm(
+        a.unsqueeze(0),
+        b.unsqueeze(0),
+        d.unsqueeze(0),
+        c=c.unsqueeze(0) if c is not None else None,
+        trans_a=False,
+        trans_b=False,
+        backend="mudnn",
+    )
+
+
+def cublaslt_gemm_tn(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+) -> None:
+    mate_bmm(
+        a.unsqueeze(0),
+        b.unsqueeze(0),
+        d.unsqueeze(0),
+        c=c.unsqueeze(0) if c is not None else None,
+        trans_a=True,
+        trans_b=False,
+        backend="mudnn",
+    )
+
+
+def cublaslt_gemm_tt(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+) -> None:
+    mate_bmm(
+        a.unsqueeze(0),
+        b.unsqueeze(0),
+        d.unsqueeze(0),
+        c=c.unsqueeze(0) if c is not None else None,
+        trans_a=True,
+        trans_b=True,
+        backend="mudnn",
+    )
+
+
 def m_grouped_bf16_gemm_nt_contiguous(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -98,9 +163,9 @@ def m_grouped_bf16_gemm_nt_contiguous(
     backend: str = "auto",
 ):
     _ = compiled_dims
-    _reject_unsupported_parameters(use_psum_layout)
-    _reject_unsupported_parameters(ensure_zero_padding)
-    _reject_unsupported_parameters(expected_m_for_psum_layout)
+    assert use_psum_layout is None
+    assert ensure_zero_padding is None
+    assert expected_m_for_psum_layout is None
     if alignment_m is None:
         alignment_m = get_mk_alignment_for_contiguous_layout()
 
@@ -159,10 +224,10 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(
     backend: str = "auto",
 ):
     _ = compiled_dims
-    _reject_unsupported_parameters(disable_ue8m0_cast)
-    _reject_unsupported_parameters(use_psum_layout)
-    _reject_unsupported_parameters(ensure_zero_padding)
-    _reject_unsupported_parameters(expected_m_for_psum_layout)
+    assert disable_ue8m0_cast is None or disable_ue8m0_cast is True
+    assert use_psum_layout is None
+    assert ensure_zero_padding is None
+    assert expected_m_for_psum_layout is None
 
     a_is_fp4 = _is_packed_fp4(a[0])
     b_is_fp4 = _is_packed_fp4(b[0])
@@ -191,8 +256,8 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(
     if b_is_fp4:
         raise ValueError("Mate W4A8 requires FP8 E4M3 A and packed FP4 B")
 
-    _reject_unsupported_parameters(recipe_a)
-    _reject_unsupported_parameters(recipe_b)
+    assert recipe_a is None
+    assert recipe_b is None
     if not a_is_fp8 or not b_is_fp8:
         raise ValueError(
             "m_grouped_fp8_fp4_gemm_nt_contiguous expects FP8 A and B tensors"
@@ -206,6 +271,32 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(
         grouped_layout,
         d,
         scale_granularity_mnk=recipe,
+        alignment_m=alignment_m,
+        backend=backend,
+    )
+
+
+def m_grouped_fp8_gemm_nn_contiguous(
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    grouped_layout: torch.Tensor,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    compiled_dims: str = "nk",
+    disable_ue8m0_cast: bool = True,
+    alignment_m: Optional[int] = None,
+    backend: str = "auto",
+):
+    if alignment_m is None:
+        alignment_m = get_mk_alignment_for_contiguous_layout()
+    mate_m_grouped_fp8_gemm_nn_contiguous(
+        a,
+        b,
+        d,
+        grouped_layout,
+        recipe=recipe,
+        compiled_dims=compiled_dims,
+        disable_ue8m0_cast=disable_ue8m0_cast,
         alignment_m=alignment_m,
         backend=backend,
     )
@@ -230,7 +321,7 @@ def m_grouped_fp8_fp4_gemm_nt_masked(
     backend: str = "auto",
 ):
     _ = compiled_dims
-    _reject_unsupported_parameters(disable_ue8m0_cast)
+    assert disable_ue8m0_cast is None or disable_ue8m0_cast is True
 
     a_is_fp4 = _is_packed_fp4(a[0])
     b_is_fp4 = _is_packed_fp4(b[0])
@@ -261,8 +352,8 @@ def m_grouped_fp8_fp4_gemm_nt_masked(
     if b_is_fp4:
         raise ValueError("Mate W4A8 requires FP8 E4M3 A and packed FP4 B")
 
-    _reject_unsupported_parameters(recipe_a)
-    _reject_unsupported_parameters(recipe_b)
+    assert recipe_a is None
+    assert recipe_b is None
     if not a_is_fp8 or not b_is_fp8:
         raise ValueError("m_grouped_fp8_fp4_gemm_nt_masked expects FP8 A and B tensors")
 
@@ -293,8 +384,8 @@ def k_grouped_fp8_gemm_tn_contiguous(
     use_psum_layout: Optional[bool] = None,
 ):
     _ = compiled_dims
-    _reject_unsupported_parameters(ks_cpu)
-    _reject_unsupported_parameters(use_psum_layout)
+    assert ks_cpu is None
+    assert use_psum_layout is None
     if a[0].shape[0] != b[0].shape[0]:
         raise ValueError("a.shape[0] and b.shape[0] must be the same")
     if c is not None:
@@ -322,6 +413,99 @@ def k_grouped_fp8_gemm_tn_contiguous(
     return d
 
 
+def k_grouped_fp8_gemm_nt_contiguous(
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    ks_cpu: Optional[list[int]],
+    grouped_layout: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+    recipe: Tuple[int, int, int] = (1, 1, 128),
+    compiled_dims: str = "mn",
+    use_psum_layout: bool = False,
+) -> None:
+    a_fp8, scale_a = a
+    b_fp8, scale_b = b
+    if recipe != (1, 1, 128):
+        raise ValueError("recipe must be (1, 1, 128)")
+    if use_psum_layout:
+        raise ValueError(
+            "k_grouped_fp8_gemm_nt_contiguous does not support PSUM layout"
+        )
+    if not ks_cpu:
+        raise ValueError("ks_cpu must be nonempty")
+
+    num_groups, m, n = d.shape
+    if not grouped_layout.is_contiguous() or grouped_layout.dtype != torch.int32:
+        raise ValueError("grouped_layout must be a contiguous int32 tensor")
+    if grouped_layout.numel() != num_groups or len(ks_cpu) != num_groups:
+        raise ValueError("grouped_layout, ks_cpu and d must have matching group counts")
+
+    sum_k = 0
+    for group_k in ks_cpu:
+        if group_k % 128 != 0:
+            raise ValueError("each K group must be aligned to 128")
+        sum_k += group_k
+
+    if a_fp8.numel() != sum_k * m or b_fp8.numel() != sum_k * n:
+        raise ValueError("FP8 payload sizes must match ks_cpu and d")
+    if not a_fp8.is_contiguous() or not b_fp8.is_contiguous():
+        raise ValueError("FP8 payloads must be contiguous")
+    if not d.is_contiguous():
+        raise ValueError("d must be contiguous")
+    if c is None or not c.is_contiguous():
+        raise ValueError("c must be provided and contiguous")
+
+    a_fp8 = a_fp8.view(-1)
+    b_fp8 = b_fp8.view(-1)
+
+    granularity_m, granularity_n, granularity_k = recipe
+    recipe_a = (granularity_m, granularity_k)
+    recipe_b = (granularity_n, granularity_k)
+
+    a_offset = 0
+    b_offset = 0
+    scale_offset = 0
+
+    for group, group_k in enumerate(ks_cpu):
+        a_size = m * group_k
+        b_size = n * group_k
+        group_scale_k = ceil_div(group_k, granularity_k)
+
+        input_a = a_fp8[a_offset : a_offset + a_size].view(1, m, group_k)
+        input_b = b_fp8[b_offset : b_offset + b_size].view(1, n, group_k)
+        input_scale_a = (
+            scale_a[:, scale_offset : scale_offset + group_scale_k]
+            .unsqueeze(0)
+            .contiguous()
+        )
+        input_scale_b = (
+            scale_b[:, scale_offset : scale_offset + group_scale_k]
+            .unsqueeze(0)
+            .contiguous()
+        )
+        output = d[group : group + 1]
+        input_c = c[group : group + 1] if c is not None else None
+
+        mate_bmm(
+            input_a,
+            input_b,
+            output,
+            scale_a=input_scale_a,
+            scale_b=input_scale_b,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
+            c=input_c,
+            trans_a=False,
+            trans_b=True,
+            backend="mudnn",
+        )
+
+        a_offset += a_size
+        b_offset += b_size
+        scale_offset += group_scale_k
+
+
 def k_grouped_bf16_gemm_tn_contiguous(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -333,8 +517,8 @@ def k_grouped_bf16_gemm_tn_contiguous(
     use_psum_layout: Optional[bool] = None,
 ):
     _ = compiled_dims
-    _reject_unsupported_parameters(ks_cpu)
-    _reject_unsupported_parameters(use_psum_layout)
+    assert ks_cpu is None
+    assert use_psum_layout is None
     if a.shape[0] != b.shape[0]:
         raise ValueError("a.shape[0] and b.shape[0] must be the same")
     if c is not None:
@@ -628,7 +812,7 @@ def get_paged_mqa_logits_metadata(
     Tensor
         Schedule metadata, shape ``(num_mps + 1, 2)``
     """
-    _reject_unsupported_parameters(indices)
+    assert indices is None
     return mate_get_paged_mqa_logits_metadata(context_lens, block_kv, num_mps)
 
 
@@ -683,7 +867,7 @@ def fp8_paged_mqa_logits(
     Tensor
         FP32 logits, shape ``(batch_size * next_n, max_context_len)``
     """
-    _reject_unsupported_parameters(indices)
+    assert indices is None
     return mate_fp8_paged_mqa_logits(
         q,
         kv_cache,

@@ -14,7 +14,7 @@ from .fmha_utils import (
     fmha_extra_include_paths,
     get_fmha_template,
 )
-from ....execution_context import raise_complete_if_dry_run
+from ....execution_context import skip_kernel_launch_if_dry_run
 
 
 def _fmha_fwd_combine_encode(config: Mapping[str, object]) -> str:
@@ -182,9 +182,6 @@ def _fmha_fwd_combine(
     num_split: int = 0,
     metadata: Optional[torch.Tensor] = None,
 ) -> None:
-    # Exit in dry run because combine is AOT.
-    raise_complete_if_dry_run()
-
     if metadata is None and num_split <= 1:
         return
 
@@ -210,6 +207,9 @@ def _fmha_fwd_combine(
 
     dispatch_name, mod = _fmha_fwd_combine_module(constexpr_dict)
     fmha_fwd_combine_impl = mod.get_function(dispatch_name)
+    if skip_kernel_launch_if_dry_run():
+        return
+
     fmha_fwd_combine_impl(
         cu_seqlens_q,
         seqused_q,
@@ -229,8 +229,6 @@ def _flash_attn_combine(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    raise_complete_if_dry_run()
-
     if out_partial.dim() != 5:
         raise ValueError("out_partial must be a 5D tensor")
     if lse_partial.dim() != 4:

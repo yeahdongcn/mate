@@ -133,6 +133,7 @@ struct PagedKVManager {
   MUTLASS_DEVICE void load_page_table_for_tme(int const n_block) {
     if constexpr (IsPagedKV) {
       bidb_kv_idx = mPageTable(n_block);
+      n_block_idx = 0;
     } else {
       n_block_idx = n_block;
     }
@@ -140,6 +141,19 @@ struct PagedKVManager {
       bidb_kv_idx_prev = bidb_kv_idx;
       n_block_idx_prev = n_block_idx;
     }
+  }
+
+  MUTLASS_DEVICE
+  mute::tuple<int, int> load_page_table_indices_for_tme(int const n_block) const {
+    static_assert(IsPagedKV && IsKVSameIter);
+    return {0, mPageTable(n_block)};
+  }
+
+  MUTLASS_DEVICE
+  void set_indices_for_tme(mute::tuple<int, int> const& indices) {
+    static_assert(IsPagedKV && IsKVSameIter);
+    n_block_idx = get<0>(indices);
+    bidb_kv_idx = get<1>(indices);
   }
 
   // K page offsets must use the same lane grouping as the later K pointer broadcast. Rotary store may use
@@ -216,7 +230,7 @@ struct PagedKVManager {
   }
 
   template <class TensorK>
-  MUTLASS_DEVICE void load_K(int const n_block, TensorK&& sK) {
+  MUTLASS_DEVICE void load_K(int const n_block, TensorK&& sK, int const chunk_head_offset = 0) {
     Tensor cK   = make_identity_tensor(Shape<Int<TileN>, Int<HeadDimQK>>{});
     Tensor tKcK = gmem_thr_copy_kv.partition_S(cK);
     Tensor tKsK = gmem_thr_copy_kv.partition_D(sK);  // cpy, cpy_seq, cpy_hd
@@ -231,6 +245,7 @@ struct PagedKVManager {
                               reinterpret_cast<uint64_t>(tPrKPtr(i / GmemThreadsPerRow)),
                               i % GmemThreadsPerRow,
                               GmemThreadsPerRow)));
+      k_ptr += chunk_head_offset;
       Tensor mK_paged_cur      = make_tensor(make_gmem_ptr(k_ptr), Shape<Int<HeadDimQK>>{});
       Tensor mK_paged_cur_copy = mute::tiled_divide(mK_paged_cur, Shape<Int<ElementsPerLoad>>{});
 
@@ -243,14 +258,10 @@ struct PagedKVManager {
   }
 
   template <class TensorV>
-  MUTLASS_DEVICE void load_V(int const n_block, TensorV&& sV) {
+  MUTLASS_DEVICE void load_V(int const n_block, TensorV&& sV, int const chunk_head_offset = 0) {
     Tensor cV   = make_identity_tensor(Shape<Int<TileN>, Int<HeadDimVO>>{});
     Tensor tVcV = gmem_thr_copy_kv.partition_S(cV);
     Tensor tVsV = gmem_thr_copy_kv.partition_D(sV);  // cpy, cpy_seq, cpy_hd
-
-    if constexpr (IsKVSameIter) {
-      compute_V_ptr();
-    }
 
     MUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<1>(tVsV); ++i) {
@@ -260,6 +271,7 @@ struct PagedKVManager {
                               reinterpret_cast<uint64_t>(tPrVPtr(i / GmemThreadsPerRow)),
                               i % GmemThreadsPerRow,
                               GmemThreadsPerRow)));
+      v_ptr += chunk_head_offset;
       Tensor mV_paged_cur      = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<HeadDimVO>>{});
       Tensor mV_paged_cur_copy = mute::tiled_divide(mV_paged_cur, Shape<Int<ElementsPerLoad>>{});
 
@@ -269,9 +281,6 @@ struct PagedKVManager {
         int const j_idx = get<1>(tVcV(_0{}, _0{}, j)) / ElementsPerLoad;
         mute::copy(GmemTiledCopy{}.with(desc_V).with(true), mV_paged_cur_copy(_, j_idx), tVsV(_, i, j));
       }
-    }
-    if constexpr (!IsKVSameIter) {
-      compute_V_ptr();
     }
   }
 
@@ -312,7 +321,7 @@ struct PagedKVManager {
   }
 
   template <class TensorV>
-  MUTLASS_DEVICE void store_V(int const n_block, TensorV&& tVrV) {
+  MUTLASS_DEVICE void store_V(int const n_block, TensorV&& tVrV, int const chunk_head_offset = 0) {
     if constexpr (IsKVSameIter) {
       compute_V_ptr();
     }
@@ -333,6 +342,7 @@ struct PagedKVManager {
                               reinterpret_cast<uint64_t>(tPrVPtr(i / GmemThreadsPerRow)),
                               i % GmemThreadsPerRow,
                               GmemThreadsPerRow)));
+      v_ptr += chunk_head_offset;
       Tensor mV_paged_cur      = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<HeadDimVO>>{});
       Tensor mV_paged_cur_copy = mute::tiled_divide(mV_paged_cur, Shape<Int<ElementsPerLoad>>{});
 

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "name": "flash_attention_bwd_full_regression",
+  "batch": 1,
+  "head_configs": [
+    {
+      "heads": 7,
+      "heads_kv": 7
+    },
+    {
+      "heads": 4,
+      "heads_kv": 1
+    }
+  ],
+  "sequences": [
+    2048,
+    4096,
+    8192,
+    16384,
+    32768
+  ],
+  "dims": [
+    128,
+    256
+  ],
+  "dtypes": [
+    "bf16",
+    "fp16"
+  ],
+  "causal": [
+    false,
+    true
+  ],
+  "deterministic": [
+    false,
+    true
+  ]
+}

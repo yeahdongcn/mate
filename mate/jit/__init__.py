@@ -61,12 +61,10 @@ from .gemm_ops import gen_gemm_ops_spec as gen_gemm_ops_spec
 from .gemm_ops import get_gemm_ops_module as get_gemm_ops_module
 from .guard_allocator import gen_guard_allocator_aot as gen_guard_allocator_aot
 from .guard_allocator import gen_guard_allocator_spec as gen_guard_allocator_spec
-from .kda_ops import (
-    gen_kda_fused_ops_spec as gen_kda_fused_ops_spec,
-)
-from .kda_ops import (
-    get_kda_fused_ops_module as get_kda_fused_ops_module,
-)
+from .kda_ops import gen_kda_prepare_ops_spec as gen_kda_prepare_ops_spec
+from .kda_ops import gen_kda_recurrence_ops_spec as gen_kda_recurrence_ops_spec
+from .kda_ops import get_kda_prepare_ops_module as get_kda_prepare_ops_module
+from .kda_ops import get_kda_recurrence_ops_module as get_kda_recurrence_ops_module
 from .mla_ops import gen_mla_ops_aot as gen_mla_ops_aot
 from .mla_ops import gen_mla_ops_spec as gen_mla_ops_spec
 from .mla_ops import get_mla_ops_module as get_mla_ops_module
@@ -111,8 +109,10 @@ __all__ = [
     "gen_guard_allocator_aot",
     "gen_guard_allocator_spec",
     "get_gemm_ops_module",
-    "gen_kda_fused_ops_spec",
-    "get_kda_fused_ops_module",
+    "gen_kda_prepare_ops_spec",
+    "gen_kda_recurrence_ops_spec",
+    "get_kda_prepare_ops_module",
+    "get_kda_recurrence_ops_module",
     "gen_hyperconnection_aot",
     "gen_hyperconnection_spec",
     "get_hyperconnection_module",
@@ -161,6 +161,7 @@ def prewarm_modules(
     include_flash_attention: bool = False,
     include_gemm: bool = False,
     include_deep_gemm: bool = False,
+    include_mixed_dtype_moe: bool = False,
     include_hyperconnection: bool = False,
     include_mqa_logits: bool = False,
     include_paged_mqa_logits: bool = False,
@@ -196,11 +197,13 @@ def prewarm_modules(
         specs.append(gen_gemm_ops_spec())
     if include_deep_gemm:
         from .gemm.deep_gemm import gen_deep_gemm_gemm_aot
+
+        specs.extend(gen_deep_gemm_gemm_aot())
+    if include_mixed_dtype_moe:
         from .gemm.masked_moe_gemm_mixed_dtype import (
             gen_masked_moe_gemm_mixed_dtype_aot,
         )
 
-        specs.extend(gen_deep_gemm_gemm_aot())
         specs.extend(gen_masked_moe_gemm_mixed_dtype_aot())
     if include_hyperconnection:
         from .gemm.deep_gemm.hyperconnection import gen_hyperconnection_aot
@@ -215,9 +218,9 @@ def prewarm_modules(
 
         specs.extend(gen_paged_mqa_logits_aot())
     if include_kda:
-        from .kda_ops import gen_kda_fused_ops_spec
+        from .kda_ops import gen_kda_prepare_ops_spec, gen_kda_recurrence_ops_spec
 
-        specs.append(gen_kda_fused_ops_spec())
+        specs.extend([gen_kda_prepare_ops_spec(), gen_kda_recurrence_ops_spec()])
     if include_mla:
         from .mla_ops import gen_mla_ops_spec
 

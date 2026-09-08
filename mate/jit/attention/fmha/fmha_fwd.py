@@ -1,7 +1,7 @@
 import functools
 from pathlib import Path
 import torch
-from typing import Optional, Dict, Any, Mapping, Sequence
+from typing import Optional, Dict, Any, Mapping, Sequence, cast
 import math
 
 import hashlib
@@ -29,7 +29,7 @@ from ...utils import (
     EXPORT_FUNC,
 )
 from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
-from ....execution_context import raise_complete_if_dry_run, is_fake_mode
+from ....execution_context import is_fake_mode, skip_kernel_launch_if_dry_run
 
 
 kern_fwd = get_fmha_template("fwd_kern.j2")
@@ -48,13 +48,22 @@ FMHA_FWD_EXTRA_CUDA_CFLAGS = [
 ]
 
 _MCC_FMHA_WORKAROUND_CUTOFF = Version("5.2.0")
+_MCC_FMHA_FP16_CVT_WORKAROUND_CUTOFF = Version("5.3.0")
 
 
-def _get_fmha_fwd_extra_cuda_cflags() -> list[str]:
+def _get_fmha_fwd_extra_cuda_cflags(config: Mapping[str, object]) -> list[str]:
     flags = list(FMHA_FWD_EXTRA_CUDA_CFLAGS)
     mcc_version = get_mcc_version()
     if mcc_version is not None and mcc_version < _MCC_FMHA_WORKAROUND_CUTOFF:
         flags.extend(("-fno-slp-vectorize", "-DMATE_FMHA_USE_SCALAR_EXP2"))
+    if (
+        mcc_version is not None
+        and _MCC_FMHA_WORKAROUND_CUTOFF
+        <= mcc_version
+        < _MCC_FMHA_FP16_CVT_WORKAROUND_CUTOFF
+        and config.get("element") == "mutlass::half_t"
+    ):
+        flags.append("-DMATE_FMHA_USE_SCALAR_FP16_CVT")
     return flags
 
 
@@ -121,13 +130,16 @@ def _dtype_from_config(cfg: Mapping[str, object]) -> torch.dtype:
 
 def _select_lsu_load_kv_for_config(cfg: Mapping[str, object]) -> tuple[bool, bool]:
     dtype = _dtype_from_config(cfg)
-    return _select_lsu_load_kv(
+    use_lsu_load_k, use_lsu_load_v = _select_lsu_load_kv(
         paged_kv=bool(cfg["paged_kv"]),
         page_size=_paged_kv_tme_page_size(dtype),
         has_leftpad_k=bool(cfg["has_leftpad_k"]),
         has_qv=bool(cfg["has_qv"]),
         dtype=dtype,
     )
+    if cast(int, cfg["tile_head_dim"]) > 0 and not cast(bool, cfg["has_qv"]):
+        use_lsu_load_k = use_lsu_load_v = use_lsu_load_k or use_lsu_load_v
+    return use_lsu_load_k, use_lsu_load_v
 
 
 CONFIG_TABLE: Dict[int, Dict[str, Any]] = {
@@ -146,7 +158,15 @@ CONFIG_TABLE: Dict[int, Dict[str, Any]] = {
     },
     2: {
         "dtype": [torch.bfloat16],
-        "headdim": [(128, 128), (192, 128), (256, 256)],
+        "headdim": [
+            (128, 128),
+            (192, 128),
+            (256, 256),
+            (64, 256),
+            (64, 512),
+            (384, 384),
+            (512, 512),
+        ],
         "head_ratio": [1, 4, 5, 8, 12, 16],
         "mode_q": ["ragged"],
         "mode_k": ["normal", "ragged", "padded"],
@@ -223,6 +243,7 @@ mode_k = [
             "paged_kv",
             "has_leftpad_k",
             "has_qv",
+            "tile_head_dim",
         ),
         sweep=False,
     ),
@@ -234,6 +255,7 @@ mode_k = [
             "paged_kv",
             "has_leftpad_k",
             "has_qv",
+            "tile_head_dim",
         ),
         sweep=False,
     ),
@@ -331,8 +353,9 @@ score_mode = [
 specs_attn = [
     ParamSpec(
         name="has_qv",
-        domain=[False],
+        domain=lambda cfg: HEADDIM_TABLE[headdim_selector(cfg)]["has_qv"],
         default=False,
+        depends_on=("headdim",),
     ),
     ParamSpec(
         name="only_qv",
@@ -403,28 +426,60 @@ def headdim_selector(cfg):
         return "192_128"
     elif hd == (256, 256):
         return "256_256"
-    # elif hd == (384, 384):
-    #     return "384_384"
+    elif hd == (64, 256):
+        return "64_256"
+    elif hd == (64, 512):
+        return "64_512"
+    elif hd == (384, 384):
+        return "384_384"
+    elif hd == (512, 512):
+        return "512_512"
     else:
         raise ValueError(f"Unsupported headdim {hd}")
 
 
 HEADDIM_TABLE: Dict[str, Dict[str, Any]] = {
     "128_128": {
-        "tile_mn": [(32, 64), (64, 64), (128, 64), (192, 64), (256, 64)],
-        "stages_kv": [(2, 2)],
+        "tile_mn": [(16, 64), (32, 64), (64, 64), (128, 64), (192, 64), (256, 64)],
+        "stages_kv": [(3, 3)],
+        "has_qv": [False],
+        "tile_head_dim": [0],
     },
     "192_128": {
         "tile_mn": [(32, 64), (64, 64), (128, 64), (192, 64), (256, 64)],
         "stages_kv": [(1, 1)],
+        "has_qv": [False],
+        "tile_head_dim": [0],
     },
     "256_256": {
-        "tile_mn": [(32, 64), (192, 64)],
-        "stages_kv": [(1, 1), (2, 2)],
+        "tile_mn": [(16, 64), (32, 64), (64, 64), (128, 64), (192, 64)],
+        "stages_kv": [(1, 1)],
+        "has_qv": [False],
+        "tile_head_dim": [0],
+    },
+    "64_256": {
+        "tile_mn": [(32, 64), (64, 64), (128, 64)],
+        "stages_kv": [(1, 1)],
+        "has_qv": [True],
+        "tile_head_dim": [0],
+    },
+    "64_512": {
+        "tile_mn": [(64, 64), (128, 64)],
+        "stages_kv": [(4, 4)],
+        "has_qv": [True],
+        "tile_head_dim": [64],
     },
     "384_384": {
-        "tile_mn": [(64, 64)],
-        "stages_kv": [(1, 1)],
+        "tile_mn": [(64, 64), (128, 64)],
+        "stages_kv": [(4, 4)],
+        "has_qv": [False],
+        "tile_head_dim": [128],
+    },
+    "512_512": {
+        "tile_mn": [(64, 64), (128, 64)],
+        "stages_kv": [(3, 3)],
+        "has_qv": [False],
+        "tile_head_dim": [128],
     },
 }
 specs_sel = [
@@ -493,8 +548,10 @@ specs_sel = [
     ),
     ParamSpec(
         name="consumers_qk",
-        compute=lambda cfg: ceil_div(cfg["tile_m"], 64),
-        depends_on=("tile_m",),
+        compute=lambda cfg: ceil_div(
+            cfg["tile_m"], 32 if cfg["tile_head_dim"] > 0 else 64
+        ),
+        depends_on=("tile_m", "tile_head_dim"),
         sweep=False,
     ),
     ParamSpec(
@@ -502,6 +559,12 @@ specs_sel = [
         compute=lambda cfg: cfg["consumers_qk"],
         depends_on=("consumers_qk",),
         sweep=False,
+    ),
+    ParamSpec(
+        name="tile_head_dim",
+        domain=domain_by_case(headdim_selector, HEADDIM_TABLE, "tile_head_dim"),
+        default=0,
+        depends_on=("headdim",),
     ),
 ]
 
@@ -548,7 +611,7 @@ def gen_fmha_fwd_spec(config: Mapping[str, object]) -> JitSpec:
         name=dispatch_name,
         sources=[source_file],
         generated_sources={source_file: _render_fmha_fwd_source(config)},
-        extra_cuda_cflags=_get_fmha_fwd_extra_cuda_cflags(),
+        extra_cuda_cflags=_get_fmha_fwd_extra_cuda_cflags(config),
         extra_include_paths=fmha_extra_include_paths(),
     )
 
@@ -833,6 +896,13 @@ def _fmha_fwd(
                 "seqlens_rotary must have dtype torch.int32"
             )
             assert seqlens_rotary.shape == (batch_size,)
+            if cp_world_size > 1:
+                assert seqlens_rotary.device == q.device, (
+                    "CP seqlens_rotary must be on the same device as q"
+                )
+                assert seqlens_rotary.stride(0) == 1, (
+                    "CP seqlens_rotary must be contiguous"
+                )
 
     if q_v is not None:
         assert head_dim_v <= 512, "q_v is only supported for value head dim <= 512"
@@ -891,17 +961,27 @@ def _fmha_fwd(
     kernel_pack_gqa = pack_gqa
 
     # CP sanity checks
-    assert cp_world_size > 0, (
-        "cp_world_size must be positive, required by downstream unified code path. Use 1 if CP is not enabled."
-    )
-    assert cp_world_size != 1 or cp_rank == 0, (
-        "When context parallelism is disabled, cp_rank must be zero"
-    )
-    assert cp_world_size == 1 or cp_tot_seqused_k is not None, (
-        "cp_tot_seqused_k must be provided when context parallelism is enabled."
-    )
+    assert cp_world_size > 0, "cp_world_size must be positive"
+    assert 0 <= cp_rank < cp_world_size, "cp_rank must be in [0, cp_world_size)"
+    if cp_world_size > 1:
+        assert cp_tot_seqused_k is not None, (
+            "cp_tot_seqused_k must be provided when context parallelism is enabled"
+        )
+        assert cp_tot_seqused_k.device == q.device, (
+            "cp_tot_seqused_k must be on the same device as q"
+        )
+        assert cp_tot_seqused_k.dtype == torch.int32, (
+            "cp_tot_seqused_k must have dtype torch.int32"
+        )
+        assert cp_tot_seqused_k.shape == (batch_size,), (
+            "cp_tot_seqused_k must contain one final global KV length per batch"
+        )
+        assert cp_tot_seqused_k.stride(0) == 1, "cp_tot_seqused_k must be contiguous"
     assert not (is_local and cp_world_size > 1), (
         "Local attention (sliding window) is not currently supported with context parallelism (cp_world_size > 1)."
+    )
+    assert cp_world_size == 1 or rotary_cos is None or seqlens_rotary is not None, (
+        "CP AppendKV rotary requires rotary_seqlens to contain global sequence offsets."
     )
 
     out_torch_dtype = torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype
@@ -951,6 +1031,7 @@ def _fmha_fwd(
         headdim_v_rounded,
         consumers_qk,
         consumers_pv,
+        tile_head_dim,
         enable_packgqa,
     ) = _get_fwd_kernel_config(
         max_seqlen_q,
@@ -963,6 +1044,7 @@ def _fmha_fwd(
         q.dtype in _FP8_DTYPES,
         is_local and attention_chunk != 0,
     )
+    multi_chunk = tile_head_dim > 0
     # print(
     #     f"{tile_m=}, {tile_n=}, {stages_k=}, {stages_v=}, {headdim_rounded=}, {headdim_v_rounded=}, {consumers_qk=}, {consumers_pv=}, {enable_packgqa=}"
     # )
@@ -974,6 +1056,8 @@ def _fmha_fwd(
         has_qv=q_v is not None,
         dtype=q.dtype,
     )
+    if multi_chunk and q_v is None:
+        use_lsu_load_k = use_lsu_load_v = use_lsu_load_k or use_lsu_load_v
     constexpr_dict = {
         "has_cu_seqlens_q": cu_seqlens_q is not None,
         "has_cu_seqlens_k": cu_seqlens_k is not None,
@@ -1004,6 +1088,7 @@ def _fmha_fwd(
         "head_dim_vo": headdim_v_rounded,
         "consumers_qk": consumers_qk,
         "consumers_pv": consumers_pv,
+        "tile_head_dim": tile_head_dim,
         "is_even_headdim": headdim_v_rounded == head_dim_v,
         "has_metadata": scheduler_metadata is not None,
         "enable_cp": cp_world_size > 1,
@@ -1018,9 +1103,6 @@ def _fmha_fwd(
 
     dispatch_name, mod = _fmha_fwd_module(constexpr_dict)
     fmha_fwd_impl = mod.get_function(dispatch_name)
-
-    # Short-circuit kernel call in fake mode.
-    raise_complete_if_dry_run()
 
     accums, num_splits = fmha_fwd_impl(
         q,
@@ -1062,6 +1144,7 @@ def _fmha_fwd(
         cp_world_size,
         cp_rank,
         cp_tot_seqused_k,
+        skip_kernel_launch_if_dry_run(),
     )
     o_accum, lse_accum = accums
 

@@ -24,6 +24,8 @@ __all__ = ["fused_chunk_gdn_prefill"]
         "-mllvm",
         "-mtgpu-if-convert=1",
         "-mllvm",
+        "-misched=mtgpu-max-ilp",
+        "-mllvm",
         "-mtgpu-tiny-offset-hint=1",
         "-mllvm",
         "-mtgpu-enable-postra-sched=0",

@@ -5,7 +5,14 @@ SageAttention compatibility package for MATE.
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from sageattention.interface import sageattn, sageattn_qk_int8_pv_fp8_cuda_sm90
+from sageattention.interface import (
+    sageattn,
+    sageattn_varlen,
+    sageattn_qk_int8_pv_fp16_cuda,
+    sageattn_qk_int8_pv_fp16_triton,
+    sageattn_qk_int8_pv_fp8_cuda,
+    sageattn_qk_int8_pv_fp8_cuda_sm90,
+)
 
 
 try:
@@ -44,5 +51,9 @@ __all__ = [
     "__version__",
     "__git_version__",
     "sageattn",
+    "sageattn_varlen",
+    "sageattn_qk_int8_pv_fp16_cuda",
+    "sageattn_qk_int8_pv_fp16_triton",
+    "sageattn_qk_int8_pv_fp8_cuda",
     "sageattn_qk_int8_pv_fp8_cuda_sm90",
 ]

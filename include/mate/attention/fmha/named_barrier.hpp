@@ -16,6 +16,14 @@ static void named_barrier_sync(uint32_t barrier_id_) {
   mutlass::arch::AsyncBarrier::sync(barrier_id);
 }
 
-enum class FwdNamedBarriers { QueryEmpty = 0, AppendKV = 1, BarrierKV = 2, RotaryQ = 3, NumFwdNamedBarriers = 4 };
+enum class FwdNamedBarriers {
+  PipelineWrapPhase0  = 0,
+  PipelineWrapPhase1  = 1,
+  ReuseP              = 2,
+  AppendKV            = 3,
+  BarrierKV           = 4,
+  RotaryQ             = 5,
+  NumFwdNamedBarriers = 6
+};
 
 }  // namespace mate::attention::fmha

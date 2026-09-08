@@ -10,8 +10,8 @@ This wrapper is designed for projects that already target
 SageAttention-style Python APIs, allowing you to run on MUSA through MATE
 with minimal integration effort.
 
-The current compatibility scope includes `sageattn` and
-`sageattn_qk_int8_pv_fp8_cuda_sm90`.
+The current compatibility scope includes all APIs from the upstream package.
+For details, refer to [Public APIs](#public-apis) section.
 
 ## Package and import
 
@@ -79,7 +79,14 @@ import sageattention
 Import individual APIs:
 
 ```python
-from sageattention import sageattn, sageattn_qk_int8_pv_fp8_cuda_sm90
+from sageattention import (
+    sageattn,
+    sageattn_varlen,
+    sageattn_qk_int8_pv_fp16_cuda,
+    sageattn_qk_int8_pv_fp16_triton,
+    sageattn_qk_int8_pv_fp8_cuda,
+    sageattn_qk_int8_pv_fp8_cuda_sm90,
+)
 ```
 
 ## Public APIs
@@ -87,8 +94,14 @@ from sageattention import sageattn, sageattn_qk_int8_pv_fp8_cuda_sm90
 The wrapper currently exposes:
 
 - `sageattn`: primary SageAttention-compatible dense attention entry
-- `sageattn_qk_int8_pv_fp8_cuda_sm90`: compatibility alias for the supported
-  dense quantized attention path
+- `sageattn_varlen`: SageAttention-compatible varlen attention entry
+- `sageattn_qk_int8_pv_fp8_cuda` and
+  `sageattn_qk_int8_pv_fp8_cuda_sm90`: compatibility entrypoints for the
+  supported dense quantized attention path
+- `sageattn_qk_int8_pv_fp16_cuda` and
+  `sageattn_qk_int8_pv_fp16_triton`: API compatibility entrypoints routed to
+  the MATE FP8-PV kernel; the Triton-style entrypoint uses per-block QK
+  quantization
 
 ## Quick Start
 
@@ -161,9 +174,14 @@ pytest tests/test_sageattn_interface.py
   `quant_recipe` overrides `qk_quant_gran`
 - Only `qk_quant_gran="per_thread"` is supported as a shortcut; other
   granularities should be expressed via an explicit supported `quant_recipe`
+- MATE does not currently provide a native FP16-PV SageAttention kernel; the
+  FP16-PV compatibility names use the supported FP8-PV kernel internally
+- `sageattn_varlen` reads cumulative sequence lengths on the host and launches
+  one dense attention pipeline per sequence; it prioritizes compatibility over
+  varlen performance
+- `attn_mask` is not supported by the Triton-style compatibility entrypoint
 - `fp8_output=True` returns an FP8 tensor plus a `torch.float32` `out_scale`
   tensor; `out_scale` has the same public tensor layout as the output and a
   final scale dimension of `1`
-- Unsupported in this wrapper package: varlen, KV-cache wrapper entrypoints,
-  public INT8 wrapper entrypoints other than the SM90-compatible name, and
-  low-level pre-quantized public APIs
+- Unsupported in this wrapper package: KV-cache wrapper entrypoints, arbitrary
+  attention masks, and low-level pre-quantized public APIs

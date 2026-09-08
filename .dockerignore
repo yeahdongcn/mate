@@ -21,3 +21,7 @@ dist/**
 .ruff_cache/**
 .mypy_cache
 .mypy_cache/**
+
+# Required to build historical documentation versions from Git tags.
+!.git
+!.git/**

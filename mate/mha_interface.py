@@ -13,7 +13,7 @@ from .jit.attention.fmha import (
 )  # noqa: F401
 from .jit.attention.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
 from .jit.attention.fmha.fmha_combine import _flash_attn_combine
-from .execution_context import raise_complete_if_dry_run
+from .execution_context import skip_kernel_launch_if_dry_run
 
 
 @functools.cache
@@ -439,9 +439,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             )
 
         elif select_backend == "mubin":
-            # In dry run, don't run mubin kernels
-            raise_complete_if_dry_run()
-
             is_varlen = cu_seqlens_q is not None and cu_seqlens_k is not None
 
             window_size_left, window_size_right = window_size
@@ -504,19 +501,20 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                     (batch, nr_heads, seq_q), dtype=torch.float32, device=q.device
                 )
 
-            flash_atten_varlen_asm_mubin(
-                q,
-                k,
-                v,
-                softmax_scale,
-                out,
-                softmax_lse,
-                causal,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-            )
+            if not skip_kernel_launch_if_dry_run():
+                flash_atten_varlen_asm_mubin(
+                    q,
+                    k,
+                    v,
+                    softmax_scale,
+                    out,
+                    softmax_lse,
+                    causal,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                )
 
         else:
             raise ValueError(
@@ -715,10 +713,10 @@ def flash_attn_varlen_func(
     cp_rank: int
         The rank of the current device within the CP group. Default 0.
     cp_tot_seqused_k: Optional[Tensor]
-        The **global** (across all CP ranks) cumulative key sequence lengths, shape
-        ``(batch_size + 1,)``, dtype ``int32``. Required when CP is enabled (``cp_world_size > 1``)
-        so that each rank can correctly compute causal masking boundaries against the full
-        key sequence. Ignored when ``cp_world_size == 1``.
+        The final **global** key sequence length for each batch across all CP ranks, shape
+        ``(batch_size,)``, dtype ``int32``. Required when CP is enabled (``cp_world_size > 1``)
+        so that each rank can compute masking boundaries against the full key sequence.
+        Ignored when ``cp_world_size == 1``.
 
     Returns
     -------
@@ -905,10 +903,12 @@ def flash_attn_with_kvcache(
     cp_rank: int
         The rank of the current device within the CP group. Default 0.
     cp_tot_seqused_k: Optional[Tensor]
-        The **global** (across all CP ranks) cumulative key sequence lengths, shape
-        ``(batch_size + 1,)``, dtype ``int32``. Required when CP is enabled (``cp_world_size > 1``)
-        so that each rank can correctly compute causal masking boundaries against the full
-        key sequence. Ignored when ``cp_world_size == 1``.
+        The final **global** key sequence length for each batch across all CP ranks, shape
+        ``(batch_size,)``, dtype ``int32``. Required when CP is enabled (``cp_world_size > 1``).
+        With AppendKV, each value must include the KV appended by all ranks in this call;
+        ``cache_seqlens`` remains the rank-local pre-append cache position. With rotary,
+        ``rotary_seqlens`` is the global pre-append position and each rank's new KV must use
+        the cyclic global positions owned by that rank. Ignored when ``cp_world_size == 1``.
     only_qv: bool
         Skip the QK score and use only the QV score.
 

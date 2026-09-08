@@ -54,15 +54,14 @@ struct Mp31PipelineStateWarpSpecialized {
   int      stage_index_   = 0;
   uint32_t barrier_index_ = 0;
   uint32_t phase_         = 0;
-  uint32_t count_         = 0;
 
   MUTLASS_DEVICE
-  Mp31PipelineStateWarpSpecialized() : stage_index_{}, barrier_index_{}, phase_{}, count_{} {
+  Mp31PipelineStateWarpSpecialized() : stage_index_{}, barrier_index_{}, phase_{} {
   }
 
   MUTLASS_DEVICE
-  Mp31PipelineStateWarpSpecialized(int stage_index, uint32_t barrier_index, uint32_t phase, uint32_t count)
-      : stage_index_(stage_index), barrier_index_(barrier_index), phase_(phase), count_(count) {
+  Mp31PipelineStateWarpSpecialized(int stage_index, uint32_t barrier_index, uint32_t phase)
+      : stage_index_(stage_index), barrier_index_(barrier_index), phase_(phase) {
   }
 
   MUTLASS_DEVICE
@@ -81,16 +80,10 @@ struct Mp31PipelineStateWarpSpecialized {
   }
 
   MUTLASS_DEVICE
-  uint32_t count() const {
-    return count_;
-  }
-
-  MUTLASS_DEVICE
   void operator++() {
     if constexpr (Stages > 0) {
-      ++barrier_index_;
-      ++count_;
       ++stage_index_;
+      ++barrier_index_;
       if (stage_index_ == static_cast<int>(Stages)) {
         stage_index_ = 0;
       }
@@ -111,19 +104,16 @@ struct Mp31PipelineStateWarpSpecialized {
     stage_index_   = other.index();
     barrier_index_ = other.barrier_index();
     phase_         = other.phase();
-    count_         = other.count();
     return *this;
   }
 
   MUTLASS_DEVICE
   Mp31PipelineStateWarpSpecialized& advance(uint32_t num_iterations) {
     if constexpr (Stages > 0) {
-      uint32_t const next_barrier_index = barrier_index_ + num_iterations;
-      uint32_t const next_stage_index   = static_cast<uint32_t>(stage_index_) + num_iterations;
-      barrier_index_                    = next_barrier_index % BarrierRingSize;
-      stage_index_                      = next_stage_index % Stages;
-      phase_ ^= (next_barrier_index / BarrierRingSize) & 1;
-      count_ += num_iterations;
+      while (num_iterations != 0) {
+        ++*this;
+        --num_iterations;
+      }
     }
     return *this;
   }
@@ -140,8 +130,7 @@ MUTLASS_DEVICE typename Pipeline::PipelineState make_producer_start_state_warpsp
   constexpr int      InitialProducerStage   = 0;
   constexpr uint32_t InitialProducerBarrier = 0;
   constexpr uint32_t InitialProducerPhase   = 1;
-  constexpr uint32_t InitialProducerCount   = 0;
-  return {InitialProducerStage, InitialProducerBarrier, InitialProducerPhase, InitialProducerCount};
+  return {InitialProducerStage, InitialProducerBarrier, InitialProducerPhase};
 }
 
 template <int MaxBarPerStageRatio_, int AdditionalBarrier_, int... PipelineStages_>
@@ -217,7 +206,8 @@ class Mp31PipelineTmeAsyncWarpSpecialized {
         MUTLASS_PRAGMA_UNROLL
         for (int j = 0; j < BarPerStageRatio; ++j) {
           uint32_t const barrier_index = i * BarPerStageRatio + j;
-          uint32_t const init_phase    = barrier_index < Stages ? 0 : 1;
+          // Physical empty j is master's logical empty (j + Stages) % NumFullBarriers.
+          uint32_t const init_phase = barrier_index < NumFullBarriers - Stages ? 1 : 0;
           EmptyBarrier::init(barrier_base_ + NumFullBarriers + barrier_index, params_.num_consumers, init_phase);
         }
       }
@@ -272,7 +262,11 @@ class Mp31PipelineTmeAsyncWarpSpecialized {
 
   MUTLASS_DEVICE
   void producer_acquire(uint32_t stage, uint32_t barrier_pair, uint32_t phase) {
-    uint32_t empty_barrier_id = barrier_base_ + NumFullBarriers + barrier_pair;
+    uint32_t acquire_pair = barrier_pair + NumFullBarriers - Stages;
+    if (acquire_pair >= NumFullBarriers) {
+      acquire_pair -= NumFullBarriers;
+    }
+    uint32_t empty_barrier_id = barrier_base_ + NumFullBarriers + acquire_pair;
     EmptyBarrier::wait(empty_barrier_id, phase);
 
     uint32_t full_barrier_id = barrier_base_ + barrier_pair;
@@ -298,7 +292,7 @@ class Mp31PipelineTmeAsyncWarpSpecialized {
 
   MUTLASS_DEVICE
   void consumer_release(uint32_t stage, uint32_t barrier_pair) {
-    uint32_t empty_barrier_id = barrier_base_ + NumFullBarriers + (barrier_pair + Stages) % NumFullBarriers;
+    uint32_t empty_barrier_id = barrier_base_ + NumFullBarriers + barrier_pair;
     EmptyBarrier::arrive(empty_barrier_id);
   }
 };
@@ -353,7 +347,8 @@ class Mp31PipelineAsyncWarpSpecialized {
         MUTLASS_PRAGMA_UNROLL
         for (int j = 0; j < BarPerStageRatio; ++j) {
           uint32_t const barrier_index = i * BarPerStageRatio + j;
-          uint32_t const init_phase    = barrier_index < Stages ? 0 : 1;
+          // Physical empty j is master's logical empty (j + Stages) % NumFullBarriers.
+          uint32_t const init_phase = barrier_index < NumFullBarriers - Stages ? 1 : 0;
           EmptyBarrier::init(barrier_base_ + NumFullBarriers + barrier_index, params_.consumer_arv_count, init_phase);
         }
       }
@@ -408,7 +403,11 @@ class Mp31PipelineAsyncWarpSpecialized {
 
   MUTLASS_DEVICE
   void producer_acquire(uint32_t stage, uint32_t barrier_pair, uint32_t phase) {
-    uint32_t empty_barrier_id = barrier_base_ + NumFullBarriers + barrier_pair;
+    uint32_t acquire_pair = barrier_pair + NumFullBarriers - Stages;
+    if (acquire_pair >= NumFullBarriers) {
+      acquire_pair -= NumFullBarriers;
+    }
+    uint32_t empty_barrier_id = barrier_base_ + NumFullBarriers + acquire_pair;
     EmptyBarrier::wait(empty_barrier_id, phase);
   }
 
@@ -431,7 +430,7 @@ class Mp31PipelineAsyncWarpSpecialized {
 
   MUTLASS_DEVICE
   void consumer_release(uint32_t stage, uint32_t barrier_pair) {
-    uint32_t empty_barrier_id = barrier_base_ + NumFullBarriers + (barrier_pair + Stages) % NumFullBarriers;
+    uint32_t empty_barrier_id = barrier_base_ + NumFullBarriers + barrier_pair;
     EmptyBarrier::arrive(empty_barrier_id);
   }
 };

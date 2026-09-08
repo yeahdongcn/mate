@@ -92,10 +92,16 @@ from deep_gemm import (
     bf16_gemm_nt,
     bf16_gemm_tn,
     bf16_gemm_tt,
+    cublaslt_gemm_nn,
+    cublaslt_gemm_nt,
+    cublaslt_gemm_tn,
+    cublaslt_gemm_tt,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_fp8_fp4_gemm_nt_contiguous,
     m_grouped_fp8_fp4_gemm_nt_masked,
+    m_grouped_fp8_gemm_nn_contiguous,
+    k_grouped_fp8_gemm_nt_contiguous,
     k_grouped_fp8_gemm_tn_contiguous,
     k_grouped_bf16_gemm_tn_contiguous,
     fp8_fp4_gemm_nt,
@@ -124,14 +130,23 @@ Dense BF16 GEMM:
 - `bf16_gemm_tn`
 - `bf16_gemm_tt`
 
+cuBLASLt-compatible GEMM:
+
+- `cublaslt_gemm_nt`
+- `cublaslt_gemm_nn`
+- `cublaslt_gemm_tn`
+- `cublaslt_gemm_tt`
+
 Grouped GEMM:
 
 - `m_grouped_bf16_gemm_nt_contiguous`
 - `m_grouped_bf16_gemm_nt_masked`
 - `m_grouped_fp8_fp4_gemm_nt_contiguous`
 - `m_grouped_fp8_fp4_gemm_nt_masked`
+- `m_grouped_fp8_gemm_nn_contiguous`
 - `m_grouped_fp8_gemm_nt_contiguous`
 - `m_grouped_fp8_gemm_nt_masked`
+- `k_grouped_fp8_gemm_nt_contiguous`
 - `k_grouped_fp8_gemm_tn_contiguous`
 - `k_grouped_bf16_gemm_tn_contiguous`
 - Legacy aliases: `fp8_m_grouped_gemm_nt_masked`, `bf16_m_grouped_gemm_nt_masked`

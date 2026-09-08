@@ -103,6 +103,42 @@ def m_grouped_fp8_gemm_nt_contiguous(
     )
 
 
+def m_grouped_fp8_gemm_nn_contiguous(
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    m_indices: torch.Tensor,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    compiled_dims: str = "nk",
+    disable_ue8m0_cast: bool = True,
+    alignment_m: int = 128,
+    backend: str = "auto",
+):
+    _ = compiled_dims
+    if not disable_ue8m0_cast:
+        raise ValueError(
+            "m_grouped_fp8_gemm_nn_contiguous does not support UE8M0 casting"
+        )
+    if recipe is None:
+        recipe = (1, 128, 128)
+    if recipe != (1, 128, 128):
+        raise ValueError(
+            "m_grouped_fp8_gemm_nn_contiguous requires recipe (1, 128, 128)"
+        )
+
+    ragged_m_moe_gemm_8bit(
+        a,
+        b,
+        m_indices,
+        d,
+        major_a_mode="K",
+        major_b_mode="N",
+        scale_granularity_mnk=recipe,
+        alignment_m=alignment_m,
+        backend=backend,
+    )
+
+
 def m_grouped_fp8_gemm_nt_masked(
     a: Tuple[torch.Tensor, torch.Tensor],
     b: Tuple[torch.Tensor, torch.Tensor],

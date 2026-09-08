@@ -14,7 +14,8 @@ template <class Element,
           class TileShapeMNK,
           class MaxInstructionM,
           class MaxInstructionN,
-          class AtomLayout>
+          class AtomLayout,
+          int Stages = 2>
 struct Mp31TmeSqmmaCollective {
   using ElementAMma = mute::conditional_t<mute::is_same_v<Element, float>, tfloat32_t, Element>;
   using ElementBMma = ElementAMma;
@@ -39,21 +40,22 @@ struct Mp31TmeSqmmaCollective {
   using SmemLayoutAtomB = decltype(mutlass::gemm::collective::detail::
                                        ss_smem_selector_B<SqmmaMajorB, ElementBMma, SqmmaOp, TileShapeMNK>());
 
-  using CollectiveOp = mutlass::gemm::collective::CollectiveMma<mutlass::gemm::MainloopMp31TmeSqmmaWarpSpecialized<2>,
-                                                                TileShapeMNK,
-                                                                Element,
-                                                                mutlass::detail::TagToStrideA_t<GmemLayoutA>,
-                                                                Element,
-                                                                mutlass::detail::TagToStrideB_t<GmemLayoutB>,
-                                                                TiledMma,
-                                                                MP31_TME_LOAD,
-                                                                SmemLayoutAtomA,
-                                                                void,
-                                                                mute::identity,
-                                                                MP31_TME_LOAD,
-                                                                SmemLayoutAtomB,
-                                                                void,
-                                                                mute::identity>;
+  using CollectiveOp =
+      mutlass::gemm::collective::CollectiveMma<mutlass::gemm::MainloopMp31TmeSqmmaWarpSpecialized<Stages>,
+                                               TileShapeMNK,
+                                               Element,
+                                               mutlass::detail::TagToStrideA_t<GmemLayoutA>,
+                                               Element,
+                                               mutlass::detail::TagToStrideB_t<GmemLayoutB>,
+                                               TiledMma,
+                                               MP31_TME_LOAD,
+                                               SmemLayoutAtomA,
+                                               void,
+                                               mute::identity,
+                                               MP31_TME_LOAD,
+                                               SmemLayoutAtomB,
+                                               void,
+                                               mute::identity>;
 };
 
 }  // namespace mate::flat::collective

@@ -10,6 +10,9 @@ import torch
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
+from mate.execution_context import skip_kernel_launch_if_dry_run
+
+from ..mate_runtime import resolve_num_mps
 from . import env as jit_env
 from .core import JitSpec, gen_jit_spec
 from .utils import TVM_HEADER, maybe_contiguous
@@ -22,7 +25,6 @@ CXX_FLAGS = [
 
 CUDA_FLAGS = [
     "-Od3",
-    "-O2",
     "-DNDEBUG",
     "-fno-strict-aliasing",
     "-fno-signed-zeros",
@@ -100,8 +102,10 @@ if _FP8_E4M3_DTYPE is not None:
     }
 
 
-def _maxscore_k_tiles(max_seqlen_k: int) -> int:
-    kv_tiles = (int(max_seqlen_k) + 127) // 128
+def _maxscore_k_tiles(max_seqlen_k: int, page_size: int = 128) -> int:
+    if int(page_size) <= 0:
+        raise ValueError(f"maxscore page_size must be positive, got {page_size}")
+    kv_tiles = (int(max_seqlen_k) + int(page_size) - 1) // int(page_size)
     return ((kv_tiles + 127) // 128) * 128
 
 
@@ -109,20 +113,36 @@ def _maxscore_k_tiles(max_seqlen_k: int) -> int:
 def _msa_maxscore_encode(
     dtype_name: str,
     is_paged_kv: bool,
+    page_table_kind: str,
+    page_size: int,
     causal: bool,
     head_dim: int,
     head_ratio: int,
     tile_q: int,
     parallel_k_tiles: bool,
+    q_stages: int,
+    k_stages: int,
+    enable_k_prefetch: bool,
+    mma_tile_q: int,
+    is_varlen: bool,
+    has_metadata: bool,
 ) -> str:
     return (
         f"msa_maxscore_dtype_{dtype_name}"
         f"_paged_{int(is_paged_kv)}"
+        f"_pt_{page_table_kind}"
+        f"_ps_{int(page_size)}"
         f"_causal_{int(causal)}"
         f"_hd_{head_dim}"
         f"_hr_{head_ratio}"
         f"_tq_{tile_q}"
         f"_pk_{int(parallel_k_tiles)}"
+        f"_qs_{int(q_stages)}"
+        f"_ks_{int(k_stages)}"
+        f"_pf_{int(enable_k_prefetch)}"
+        f"_mq_{int(mma_tile_q)}"
+        f"_vl_{int(is_varlen)}"
+        f"_hm_{int(has_metadata)}"
     )
 
 
@@ -130,11 +150,19 @@ def _msa_maxscore_encode_config(config: Mapping[str, object]) -> str:
     return _msa_maxscore_encode(
         str(config["dtype_name"]),
         bool(config["is_paged_kv"]),
+        str(config["page_table_kind"]),
+        cast(int, config["page_size"]),
         bool(config["causal"]),
         cast(int, config["head_dim"]),
         cast(int, config["head_ratio"]),
         cast(int, config["tile_q"]),
         bool(config["parallel_k_tiles"]),
+        cast(int, config["q_stages"]),
+        cast(int, config["k_stages"]),
+        bool(config["enable_k_prefetch"]),
+        cast(int, config["mma_tile_q"]),
+        bool(config["is_varlen"]),
+        bool(config["has_metadata"]),
     )
 
 
@@ -146,23 +174,37 @@ def _maxscore_tile_q(
     dtype: torch.dtype | None = None,
     max_seqlen_q: int | None = None,
 ) -> int:
-    # A larger Q tile amortizes the K TME transaction and pipeline barriers
-    # over more rows.  It only pays off once a prefill has enough Q tiles to
-    # keep one 20-warp CTA per MP resident; short prefill and decode retain
-    # the 8-warp TQ16 variant.  The larger variant is currently validated for
-    # BF16 only; FP8's TCE path regresses at the same shape.
+    # Match the original FP8 MSA TileLang prefill geometry: one 128-row Q
+    # tile feeds four consumer warp-squads (512 consumer threads). Keep the
+    # small decode geometry because a one-row request cannot amortize that
+    # tile. BF16 retains its tested 64-row generic geometry below.
+    if (
+        dtype == _FP8_E4M3_DTYPE
+        and parallel_k_tiles
+        and int(head_ratio) == 1
+        and max_seqlen_q is not None
+        and int(max_seqlen_q) > 512
+    ):
+        return 128
     if (
         dtype == torch.bfloat16
         and parallel_k_tiles
         and int(head_ratio) == 1
         and max_seqlen_q is not None
-        and int(max_seqlen_q) >= 64 * 1024
+        and int(max_seqlen_q) >= 64
     ):
-        return 128
+        return 64
     if (
         parallel_k_tiles
         and max_seqlen_q is not None
-        and (int(max_seqlen_q) == 1 or dtype == torch.bfloat16)
+        and (
+            (
+                dtype == _FP8_E4M3_DTYPE
+                and int(head_ratio) == 1
+                and int(max_seqlen_q) <= 512
+            )
+            or dtype == torch.bfloat16
+        )
         and 16 % int(head_ratio) == 0
     ):
         return 16
@@ -181,18 +223,43 @@ def make_msa_maxscore_config(
     head_dim: int,
     head_ratio: int,
     max_seqlen_q: int,
+    page_table_kind: str | None = None,
+    page_size: int = 128,
+    is_varlen: bool = True,
+    has_metadata: bool | None = None,
 ) -> dict[str, object]:
     if dtype not in MSA_DTYPE_MUTLASS:
         raise TypeError(
             "msa maxscore only supports torch.float16, torch.bfloat16, "
             "and torch.float8_e4m3fn."
         )
+    if has_metadata is None:
+        has_metadata = bool(is_varlen)
     if int(head_dim) <= 0 or int(head_dim) % 8 != 0:
         raise ValueError(
             f"msa maxscore expects head_dim divisible by 8, got {head_dim}"
         )
     if int(head_ratio) <= 0:
         raise ValueError(f"msa maxscore expects positive head_ratio, got {head_ratio}")
+    if page_table_kind is None:
+        page_table_kind = "batched2d" if is_paged_kv else "dense"
+    page_table_kind = str(page_table_kind)
+    if page_table_kind not in {"dense", "batched2d", "flat"}:
+        raise ValueError(f"unsupported MSA maxscore page_table_kind: {page_table_kind}")
+    if bool(is_paged_kv) != (page_table_kind != "dense"):
+        raise ValueError(
+            "page_table_kind and is_paged_kv disagree: "
+            f"{page_table_kind=} {is_paged_kv=}"
+        )
+    if int(page_size) <= 0:
+        raise ValueError(f"msa maxscore expects positive page_size, got {page_size}")
+    # The current SQMMA/output contract is one 128-column K tile per page.
+    # Keep the parameter explicit in the specialization key while rejecting
+    # unsupported cross-page TME layouts until they are implemented.
+    if int(page_size) != 128:
+        raise ValueError(
+            f"paged MSA maxscore currently requires page_size == 128, got {page_size}"
+        )
     # The MSA selector uses one proxy-Q head per KV head.  Split K whenever that
     # contract holds so short-Q and tail waves expose enough independent work.
     # The scheduler chooses the partition count from the actual Q-work capacity.
@@ -212,16 +279,35 @@ def make_msa_maxscore_config(
             "msa maxscore tile_q must be a positive multiple of 4 and "
             f"head_ratio, got tile_q={selected_tile_q}, head_ratio={head_ratio}"
         )
+    q_stages = 1
+    # One K stage is faster for this max-score epilogue: the register rowmax
+    # and store already hide the next TME load, while a second stage adds
+    # barrier/shared-state traffic. The MUTLASS builder still uses its
+    # required dispatch-policy stage count internally.
+    k_stages = 1
+    enable_k_prefetch = bool(selected_tile_q > 16 and dtype != torch.bfloat16)
+    # Keep the tested generic geometry for production. MmaTileQ remains an
+    # explicit option for A/Bs; the current long-tile path uses M32, while
+    # the small decode tile uses M16.
+    mma_tile_q = 32 if selected_tile_q >= 32 else 16
     return {
         "element": MSA_DTYPE_MUTLASS[dtype],
         "element_dtype": MSA_DTYPE_FFI[dtype],
         "dtype_name": MSA_DTYPE_NAMES[dtype],
         "is_paged_kv": bool(is_paged_kv),
+        "page_table_kind": page_table_kind,
+        "page_size": int(page_size),
         "causal": bool(causal),
         "head_dim": int(head_dim),
         "head_ratio": int(head_ratio),
         "tile_q": selected_tile_q,
         "parallel_k_tiles": bool(parallel_k_tiles),
+        "q_stages": q_stages,
+        "k_stages": k_stages,
+        "enable_k_prefetch": enable_k_prefetch,
+        "mma_tile_q": mma_tile_q,
+        "is_varlen": bool(is_varlen),
+        "has_metadata": bool(has_metadata),
     }
 
 
@@ -229,6 +315,108 @@ def _render_msa_maxscore_kernel_source(config: Mapping[str, object]) -> str:
     render_config = dict(config)
     render_config["func_name"] = _msa_maxscore_encode_config(config)
     return MSA_MAXSCORE_KERN_TEMPLATE.render(render_config)
+
+
+def _msa_k_partitions_for_mps(
+    *,
+    num_mps: int,
+    q_work_count: int,
+    max_k_tiles: int,
+    parallel_k_tiles: bool,
+) -> int:
+    ctas_per_mp = 3 if parallel_k_tiles else 1
+    target_ctas = max(1, int(num_mps)) * ctas_per_mp
+    q_works = max(1, int(q_work_count))
+    return min(
+        max(1, int(max_k_tiles)),
+        max(1, (target_ctas + q_works // 2) // q_works),
+    )
+
+
+def _msa_schedule_num_mps(
+    *,
+    hardware_mps: int,
+    q_work_count: int,
+    max_k_tiles: int,
+    parallel_k_tiles: bool,
+) -> int:
+    """Choose the active MP-slot count for the per-MP persistent schedule.
+
+    The metadata kernel uses the same fixed-point calculation.  Keeping the
+    slot count close to the amount of Q/K work avoids launching a full-device
+    grid for decode-sized inputs while retaining one Q range per active slot.
+    """
+    ctas_per_mp = 3 if parallel_k_tiles else 1
+    mps = max(1, int(hardware_mps))
+    q_work_count = max(1, int(q_work_count))
+    max_k_tiles = max(1, int(max_k_tiles))
+    for _ in range(3):
+        partitions = _msa_k_partitions_for_mps(
+            num_mps=mps,
+            q_work_count=q_work_count,
+            max_k_tiles=max_k_tiles,
+            parallel_k_tiles=parallel_k_tiles,
+        )
+        partition_groups = (partitions + ctas_per_mp - 1) // ctas_per_mp
+        next_mps = min(mps, max(1, q_work_count * partition_groups))
+        if next_mps == mps:
+            break
+        mps = next_mps
+    return mps
+
+
+# Building the weighted range table is a fixed-cost device launch (and the
+# metadata-enabled main kernel has a small prologue of its own).  A Q-count
+# threshold by itself is not stable: two Q work items with 1K of KV do not
+# amortize that cost, while the same two items with 128K of KV can.  Express
+# the policy as an aggregate Q-work/K-tile budget and derive the Q threshold
+# from the actual, unpadded K tile count.  The constants are deliberately
+# conservative for the decode path where metadata is rebuilt on every call.
+_MSA_MAXSCORE_SCHEDULE_MIN_Q_WORK = 2
+_MSA_MAXSCORE_SCHEDULE_WORK_BUDGET = 8192
+
+
+def _msa_schedule_q_work_threshold(valid_k_tiles: int) -> int:
+    """Return the minimum logical Q-work count worth scheduling.
+
+    ``q_work_count`` counts ``(batch, Q tile, KV head)`` work items, rather
+    than individual query tokens.  The threshold decreases for long KV
+    sequences because each Q-work then carries more SQMMA work.  Keeping this
+    as a pure helper makes the dispatch rule easy to test and tune without
+    changing the kernel ABI.
+    """
+
+    k_tiles = max(1, int(valid_k_tiles))
+    return max(
+        _MSA_MAXSCORE_SCHEDULE_MIN_Q_WORK,
+        math.ceil(_MSA_MAXSCORE_SCHEDULE_WORK_BUDGET / k_tiles),
+    )
+
+
+def _msa_should_use_schedule(
+    *,
+    q_work_count: int,
+    valid_k_tiles: int,
+    schedule_requested: bool,
+    tile_q: int | None = None,
+) -> bool:
+    """Decide whether to pay for the per-MP metadata schedule.
+
+    The decision is made on the host from launch-capacity metadata; no device
+    length readback is introduced.  ``schedule_requested`` retains the old
+    contract: a varlen call or an explicit schedule workspace opts into the
+    policy, while uniform non-varlen calls continue to use the legacy path.
+    """
+
+    if not schedule_requested:
+        return False
+    # TileQ16 is the guarded small-Q geometry.  Its direct grid is cheaper
+    # than entering the weighted metadata path (the latter can hit the slow
+    # serial scan once the number of Q works exceeds one partition group).
+    # Long-Q geometries retain the aggregate-work threshold below.
+    if tile_q is not None and int(tile_q) <= 16:
+        return False
+    return int(q_work_count) >= _msa_schedule_q_work_threshold(valid_k_tiles)
 
 
 def gen_msa_maxscore_spec(
@@ -239,6 +427,10 @@ def gen_msa_maxscore_spec(
     head_dim: int,
     head_ratio: int,
     max_seqlen_q: int,
+    page_table_kind: str | None = None,
+    page_size: int = 128,
+    is_varlen: bool = True,
+    has_metadata: bool | None = None,
 ) -> JitSpec:
     config = make_msa_maxscore_config(
         dtype,
@@ -247,6 +439,10 @@ def gen_msa_maxscore_spec(
         head_dim=head_dim,
         head_ratio=head_ratio,
         max_seqlen_q=max_seqlen_q,
+        page_table_kind=page_table_kind,
+        page_size=page_size,
+        is_varlen=is_varlen,
+        has_metadata=has_metadata,
     )
     dispatch_name = _msa_maxscore_encode_config(config)
     source_file = Path(jit_env.MATE_GEN_SRC_DIR / "msa" / f"{dispatch_name}.mu")
@@ -268,6 +464,10 @@ def get_msa_maxscore_module(
     head_dim: int,
     head_ratio: int,
     max_seqlen_q: int,
+    page_table_kind: str | None = None,
+    page_size: int = 128,
+    is_varlen: bool = True,
+    has_metadata: bool | None = None,
 ):
     return gen_msa_maxscore_spec(
         dtype,
@@ -276,6 +476,10 @@ def get_msa_maxscore_module(
         head_dim=head_dim,
         head_ratio=head_ratio,
         max_seqlen_q=max_seqlen_q,
+        page_table_kind=page_table_kind,
+        page_size=page_size,
+        is_varlen=is_varlen,
+        has_metadata=has_metadata,
     ).build_and_load()
 
 
@@ -289,10 +493,22 @@ def _msa_maxscore(
     max_seqlen_q: int,
     max_seqlen_k: int,
     causal: bool,
+    page_size: int | None = None,
+    is_varlen: bool = True,
     page_table: Optional[torch.Tensor] = None,
     kv_page_indptr: Optional[torch.Tensor] = None,
+    schedule_metadata: Optional[torch.Tensor] = None,
+    schedule_metadata_ready: bool = False,
     max_score: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if schedule_metadata_ready and schedule_metadata is None:
+        raise ValueError(
+            "schedule_metadata_ready requires a supplied schedule_metadata tensor"
+        )
+    if schedule_metadata_ready and not schedule_metadata.is_contiguous():
+        raise ValueError(
+            "schedule_metadata_ready requires the exact contiguous schedule workspace"
+        )
     q = maybe_contiguous(q)
     k = maybe_contiguous(k)
     cu_seqlens_q = maybe_contiguous(cu_seqlens_q)
@@ -307,6 +523,27 @@ def _msa_maxscore(
     if q.dtype not in MSA_DTYPE_MUTLASS:
         raise TypeError(f"unsupported MSA maxscore dtype: {q.dtype}")
     is_paged_kv = page_table is not None
+    if is_paged_kv:
+        if page_size is None:
+            page_size = int(k.shape[1])
+        if int(page_size) != int(k.shape[1]):
+            raise ValueError(
+                f"page_size must match paged K layout, got {page_size} and {int(k.shape[1])}"
+            )
+        if kv_page_indptr is not None:
+            if page_table.ndim != 1:
+                raise ValueError("flat paged maxscore requires a rank-1 page_table")
+            page_table_kind = "flat"
+        elif page_table.ndim == 2:
+            page_table_kind = "batched2d"
+        else:
+            raise ValueError(
+                "paged maxscore expects a rank-2 page_table or flat page indices "
+                "with kv_page_indptr"
+            )
+    else:
+        page_size = 128 if page_size is None else int(page_size)
+        page_table_kind = "dense"
     if kv_page_indptr is not None:
         if page_table is None:
             raise ValueError("kv_page_indptr requires flat page indices")
@@ -337,8 +574,8 @@ def _msa_maxscore(
     if int(k.shape[-1]) != head_dim:
         raise ValueError(f"q/k head_dim mismatch: {head_dim} vs {int(k.shape[-1])}")
 
-    valid_k_tiles = (int(max_seqlen_k) + 127) // 128
-    max_k_tiles = _maxscore_k_tiles(max_seqlen_k)
+    valid_k_tiles = (int(max_seqlen_k) + int(page_size) - 1) // int(page_size)
+    max_k_tiles = _maxscore_k_tiles(max_seqlen_k, int(page_size))
     if max_score is None:
         max_score = torch.full(
             (total_q, num_qo_heads, max_k_tiles),
@@ -355,16 +592,41 @@ def _msa_maxscore(
             )
         if max_score.dtype != torch.float32:
             raise TypeError(f"max_score must be torch.float32, got {max_score.dtype}")
-        # The causal max-score kernel skips K tiles that are wholly in the
-        # future of a Q tile.  Keep the dense output contract by initializing
-        # those entries (and any padded tail) to -inf before the kernel writes
-        # the visible tiles.
-        if causal or valid_k_tiles < max_k_tiles:
-            max_score.fill_(-torch.inf)
+        # Every specialization may skip sequence-local or padded K tiles.
+        # Always poison a caller-provided buffer so ragged noncausal batches do
+        # not retain values from an earlier invocation.
+        max_score.fill_(-torch.inf)
 
     if total_q == 0 or valid_k_tiles == 0:
         return max_score
 
+    # Small Q work sets have no useful range to balance: the legacy grid
+    # scheduler can launch them directly, avoiding the extra metadata CTA and
+    # the fixed persistent-grid prologue.  Keep IsVarlen so cu-seqlens remain
+    # supported, but decouple it from HasMetadata for this decode fast path.
+    q_work_count = 0
+    if is_varlen or schedule_metadata is not None:
+        config_for_work = make_msa_maxscore_config(
+            q.dtype,
+            is_paged_kv=is_paged_kv,
+            causal=causal,
+            head_dim=head_dim,
+            head_ratio=head_ratio,
+            max_seqlen_q=int(max_seqlen_q),
+            page_table_kind=page_table_kind,
+            page_size=int(page_size),
+            is_varlen=bool(is_varlen),
+            has_metadata=False,
+        )
+        q_tokens_per_tile = cast(int, config_for_work["tile_q"]) // max(1, head_ratio)
+        q_tiles = (int(max_seqlen_q) + q_tokens_per_tile - 1) // q_tokens_per_tile
+        q_work_count = max(1, (int(cu_seqlens_q.numel()) - 1) * q_tiles * num_kv_heads)
+    use_schedule_metadata = _msa_should_use_schedule(
+        q_work_count=q_work_count,
+        valid_k_tiles=valid_k_tiles,
+        schedule_requested=schedule_metadata is not None or bool(is_varlen),
+        tile_q=cast(int, config_for_work["tile_q"]) if q_work_count else None,
+    )
     config = make_msa_maxscore_config(
         q.dtype,
         is_paged_kv=is_paged_kv,
@@ -372,22 +634,93 @@ def _msa_maxscore(
         head_dim=head_dim,
         head_ratio=head_ratio,
         max_seqlen_q=int(max_seqlen_q),
+        page_table_kind=page_table_kind,
+        page_size=int(page_size),
+        is_varlen=bool(is_varlen),
+        has_metadata=use_schedule_metadata,
     )
     dispatch_name = _msa_maxscore_encode_config(config)
-    kernel = get_msa_maxscore_module(
+    module = get_msa_maxscore_module(
         q.dtype,
         is_paged_kv,
         bool(causal),
         head_dim,
         head_ratio,
         int(max_seqlen_q),
-    ).get_function(dispatch_name)
+        page_table_kind,
+        int(page_size),
+        bool(is_varlen),
+        use_schedule_metadata,
+    )
+    if skip_kernel_launch_if_dry_run():
+        return max_score
+    if use_schedule_metadata:
+        hardware_mps = resolve_num_mps(q.device, None)
+        schedule_num_mps = _msa_schedule_num_mps(
+            hardware_mps=hardware_mps,
+            q_work_count=q_work_count,
+            max_k_tiles=valid_k_tiles,
+            parallel_k_tiles=bool(config["parallel_k_tiles"]),
+        )
+        if schedule_metadata is None:
+            schedule_metadata = torch.empty(
+                (schedule_num_mps, 2), dtype=torch.int32, device=q.device
+            )
+        else:
+            if not schedule_metadata_ready:
+                schedule_metadata = maybe_contiguous(schedule_metadata)
+            if schedule_metadata.dtype != torch.int32:
+                raise TypeError("schedule_metadata must be int32")
+            if schedule_metadata.ndim != 2 or schedule_metadata.shape[1] != 2:
+                raise ValueError("schedule_metadata must have shape [num_mps, 2]")
+            if (
+                schedule_metadata.shape[0] <= 0
+                or schedule_metadata.shape[0] > hardware_mps
+            ):
+                raise ValueError(
+                    "schedule_metadata MP count is outside the active device range"
+                )
+            schedule_rows = int(schedule_metadata.shape[0])
+            kernel_k_partitions = _msa_k_partitions_for_mps(
+                num_mps=hardware_mps,
+                q_work_count=q_work_count,
+                max_k_tiles=valid_k_tiles,
+                parallel_k_tiles=bool(config["parallel_k_tiles"]),
+            )
+            schedule_k_partitions = _msa_k_partitions_for_mps(
+                num_mps=schedule_rows,
+                q_work_count=q_work_count,
+                max_k_tiles=valid_k_tiles,
+                parallel_k_tiles=bool(config["parallel_k_tiles"]),
+            )
+            if schedule_k_partitions != kernel_k_partitions:
+                valid_row_counts = " or ".join(
+                    str(rows) for rows in sorted({schedule_num_mps, hardware_mps})
+                )
+                raise ValueError(
+                    "schedule_metadata row count changes max-score K partitioning: "
+                    f"{schedule_rows} rows select {schedule_k_partitions} partitions, "
+                    f"but the kernel uses {kernel_k_partitions}; use {valid_row_counts} rows"
+                )
+
+        if not schedule_metadata_ready:
+            module.get_function(f"{dispatch_name}_metadata")(
+                cu_seqlens_q,
+                cu_seqlens_k,
+                qo_offset,
+                schedule_metadata,
+                int(max_seqlen_q),
+                int(max_seqlen_k),
+                num_kv_heads,
+            )
+    kernel = module.get_function(dispatch_name)
     kernel(
         q,
         k,
         cu_seqlens_q,
         cu_seqlens_k,
         qo_offset,
+        schedule_metadata if use_schedule_metadata else None,
         page_table,
         kv_page_indptr,
         max_score,
@@ -428,7 +761,10 @@ def _msa_sparse_topk_select(
 ) -> torch.Tensor:
     max_score = maybe_contiguous(max_score)
     output_indices = maybe_contiguous(output_indices)
-    get_msa_sparse_topk_select_module().get_function("sparse_topk_select")(
+    kernel = get_msa_sparse_topk_select_module().get_function("sparse_topk_select")
+    if skip_kernel_launch_if_dry_run():
+        return output_indices
+    kernel(
         max_score,
         output_indices,
         int(topk),
@@ -453,8 +789,24 @@ def _resolve_fwd_dtype(dtype: Optional[torch.dtype]) -> torch.dtype:
 
 
 @lru_cache(maxsize=256)
-def _msa_fwd_encode(*, dtype: torch.dtype, causal: bool) -> str:
-    return f"msa_fwd_{MSA_FWD_DTYPE_CONFIG[dtype]['name']}_causal_{int(causal)}"
+def _msa_fwd_encode(
+    *, dtype: torch.dtype, output_dtype: torch.dtype, causal: bool
+) -> str:
+    dtype_name = MSA_FWD_DTYPE_CONFIG[dtype]["name"]
+    output_name = MSA_FWD_DTYPE_CONFIG[output_dtype]["name"]
+    output_suffix = "" if output_dtype == dtype else f"_out_{output_name}"
+    return f"msa_fwd_{dtype_name}{output_suffix}_causal_{int(causal)}"
+
+
+@lru_cache(maxsize=256)
+def _resolve_fwd_output_dtype(
+    dtype: torch.dtype, output_dtype: Optional[torch.dtype]
+) -> torch.dtype:
+    if output_dtype is None:
+        return dtype
+    if output_dtype not in MSA_FWD_DTYPE_CONFIG:
+        raise TypeError(f"unsupported MSA forward output dtype: {output_dtype}")
+    return output_dtype
 
 
 @lru_cache(maxsize=256)
@@ -462,11 +814,21 @@ def make_msa_fwd_config(
     *,
     causal: bool,
     dtype: Optional[torch.dtype] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> dict[str, object]:
     dtype = _resolve_fwd_dtype(dtype)
+    output_dtype = _resolve_fwd_output_dtype(dtype, output_dtype)
+    input_config = MSA_FWD_DTYPE_CONFIG[dtype]
+    output_config = MSA_FWD_DTYPE_CONFIG[output_dtype]
     return {
-        **MSA_FWD_DTYPE_CONFIG[dtype],
+        **input_config,
+        "output_name": output_config["name"],
+        "element_output": output_config["element"],
+        "element_output_dtype": output_config["element_dtype"],
         "causal": bool(causal),
+        "func_name": _msa_fwd_encode(
+            dtype=dtype, output_dtype=output_dtype, causal=causal
+        ),
         "head_ratio": 16,
         "head_dim": 128,
         "tile_kv": 128,
@@ -475,21 +837,21 @@ def make_msa_fwd_config(
 
 
 def _render_msa_fwd_kernel_source(config: dict[str, object]) -> str:
-    render_config = dict(config)
-    render_config["func_name"] = (
-        f"msa_fwd_{config['name']}_causal_{int(bool(config['causal']))}"
-    )
-    return TVM_HEADER + MSA_FWD_KERN_TEMPLATE.render(render_config)
+    return TVM_HEADER + MSA_FWD_KERN_TEMPLATE.render(config)
 
 
 def gen_msa_fwd_spec(
     *,
     causal: bool,
     dtype: Optional[torch.dtype] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> JitSpec:
     dtype = _resolve_fwd_dtype(dtype)
-    config = make_msa_fwd_config(causal=causal, dtype=dtype)
-    dispatch_name = _msa_fwd_encode(dtype=dtype, causal=causal)
+    output_dtype = _resolve_fwd_output_dtype(dtype, output_dtype)
+    config = make_msa_fwd_config(causal=causal, dtype=dtype, output_dtype=output_dtype)
+    dispatch_name = _msa_fwd_encode(
+        dtype=dtype, output_dtype=output_dtype, causal=causal
+    )
     source_file = Path(jit_env.MATE_GEN_SRC_DIR / "msa" / f"{dispatch_name}.mu")
     return gen_jit_spec(
         dispatch_name,
@@ -502,8 +864,10 @@ def gen_msa_fwd_spec(
 
 
 @functools.cache
-def get_msa_fwd_module(dtype: torch.dtype, causal: bool):
-    return gen_msa_fwd_spec(dtype=dtype, causal=causal).build_and_load()
+def get_msa_fwd_module(dtype: torch.dtype, output_dtype: torch.dtype, causal: bool):
+    return gen_msa_fwd_spec(
+        dtype=dtype, output_dtype=output_dtype, causal=causal
+    ).build_and_load()
 
 
 def _require_int32_vector(name: str, value: torch.Tensor) -> torch.Tensor:
@@ -601,16 +965,27 @@ def _msa_fwd(
 
     if out is None:
         out = torch.empty_like(q)
-    elif tuple(out.shape) != tuple(q.shape) or out.dtype != q.dtype:
-        raise ValueError("out must have the same shape and dtype as q")
+    elif tuple(out.shape) != tuple(q.shape):
+        raise ValueError("out must have the same shape as q")
+    output_dtype = _resolve_fwd_output_dtype(q.dtype, out.dtype)
     if lse is None:
         lse = torch.empty((total_q, num_q_heads), dtype=torch.float32, device=q.device)
     elif tuple(lse.shape) != (total_q, num_q_heads) or lse.dtype != torch.float32:
         raise ValueError("lse must have shape [total_q, Hq] and dtype float32")
 
-    config = make_msa_fwd_config(causal=causal, dtype=q.dtype)
-    dispatch_name = _msa_fwd_encode(dtype=q.dtype, causal=bool(config["causal"]))
-    kernel = get_msa_fwd_module(q.dtype, causal).get_function(dispatch_name)
+    config = make_msa_fwd_config(
+        causal=causal, dtype=q.dtype, output_dtype=output_dtype
+    )
+    dispatch_name = _msa_fwd_encode(
+        dtype=q.dtype,
+        output_dtype=output_dtype,
+        causal=bool(config["causal"]),
+    )
+    kernel = get_msa_fwd_module(q.dtype, output_dtype, causal).get_function(
+        dispatch_name
+    )
+    if skip_kernel_launch_if_dry_run():
+        return out, lse
     kernel(
         q,
         k,
@@ -641,9 +1016,12 @@ def gen_msa_ops_aot() -> list[JitSpec]:
     dtypes = [torch.float16, torch.bfloat16]
     if _FP8_E4M3_DTYPE is not None:
         dtypes.append(_FP8_E4M3_DTYPE)
+    dtype_pairs = [(dtype, dtype) for dtype in dtypes]
+    if _FP8_E4M3_DTYPE is not None:
+        dtype_pairs.append((_FP8_E4M3_DTYPE, torch.bfloat16))
     specs = [
-        gen_msa_fwd_spec(dtype=dtype, causal=causal)
-        for dtype in dtypes
+        gen_msa_fwd_spec(dtype=dtype, output_dtype=output_dtype, causal=causal)
+        for dtype, output_dtype in dtype_pairs
         for causal in (False, True)
     ]
     specs.append(gen_msa_sparse_topk_select_spec())
@@ -654,4 +1032,4 @@ def gen_msa_ops_aot() -> list[JitSpec]:
 def get_msa_ops_module():
     if _FP8_E4M3_DTYPE is None:
         raise RuntimeError("torch.float8_e4m3fn is unavailable")
-    return get_msa_fwd_module(_FP8_E4M3_DTYPE, causal=True)
+    return get_msa_fwd_module(_FP8_E4M3_DTYPE, _FP8_E4M3_DTYPE, causal=True)

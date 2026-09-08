@@ -27,7 +27,7 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
   static constexpr int      SharedStorageSize          = sizeof(SharedStorage);
   static constexpr int      MaxThreadsPerBlock         = CollectiveMainloop::NumThreads;
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
-  static_assert(sizeof(BarrierStorage) + mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount <=
+  static_assert(CollectiveMainloop::AsyncBarrierCount <=
                     mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers,
                 "MSA max-score async barrier id exceeds the MP31 hardware limit.");
 
@@ -75,8 +75,7 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
 
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-    mutlass::arch::allocate_async_barriers(sizeof(BarrierStorage) +
-                                           mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount);
+    mutlass::arch::allocate_async_barriers(CollectiveMainloop::AsyncBarrierCount);
     BarrierStorage* barrier_storage = reinterpret_cast<BarrierStorage*>(0);
 
     CollectiveMainloop                    mainloop;
@@ -85,9 +84,11 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
     __syncthreads();
 
     if (warp_squad_idx == 0) {
-      int lane_idx = thread_idx % mutlass::NumThreadsPerWarp;
-      for (auto q_work_tile = scheduler.get_initial_work(params.scheduler); q_work_tile.is_valid(params.scheduler);
-           q_work_tile      = scheduler.get_next_work(params.scheduler, q_work_tile)) {
+      int  lane_idx      = thread_idx % mutlass::NumThreadsPerWarp;
+      auto schedule_info = scheduler.get_schedule_info(params.scheduler);
+      for (auto q_work_tile = scheduler.get_initial_work(params.scheduler, schedule_info);
+           q_work_tile.is_valid(params.scheduler);
+           q_work_tile = scheduler.get_next_work(params.scheduler, q_work_tile, schedule_info)) {
         __musa_loop_transparent_outermost();
         if (!TileScheduler::is_valid_q_tile(q_work_tile)) {
           continue;
@@ -107,32 +108,55 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
           continue;
         }
         if constexpr (TileScheduler::ParallelKTiles) {
+          int page_idx = 0;
+          if constexpr (CollectiveMainloop::EnableKPrefetch) {
+            int first_k_tile_idx = q_work_tile.k_partition_idx;
+            if (lane_idx == 0 && first_k_tile_idx < k_tile_count) {
+              auto first_k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, first_k_tile_idx);
+              page_idx               = mainloop.safe_page_idx(params.mainloop, first_k_work_tile);
+            }
+          }
           MUTLASS_PRAGMA_NO_UNROLL
           for (int k_tile_idx = q_work_tile.k_partition_idx; k_tile_idx < k_tile_count;
                k_tile_idx += params.scheduler.k_partitions) {
             auto k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, k_tile_idx);
             if (lane_idx == 0) {
-              mainloop.load_k(params.mainloop, pipeline, shared_storage, k_work_tile);
+              if constexpr (!CollectiveMainloop::EnableKPrefetch) {
+                page_idx = mainloop.safe_page_idx(params.mainloop, k_work_tile);
+              }
+              mainloop.load_k(params.mainloop, pipeline, shared_storage, k_work_tile, page_idx);
               if constexpr (CollectiveMainloop::EnableKPrefetch) {
                 int next_k_tile_idx = k_tile_idx + params.scheduler.k_partitions;
                 if (next_k_tile_idx < k_tile_count) {
                   auto next_k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, next_k_tile_idx);
-                  mainloop.prefetch_k(params.mainloop, next_k_work_tile);
+                  page_idx              = mainloop.safe_page_idx(params.mainloop, next_k_work_tile);
+                  mainloop.prefetch_k(params.mainloop, next_k_work_tile, page_idx);
                 }
               }
             }
           }
         } else {
+          int page_idx = 0;
+          if constexpr (CollectiveMainloop::EnableKPrefetch) {
+            if (lane_idx == 0 && k_tile_count > 0) {
+              auto first_k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, 0);
+              page_idx               = mainloop.safe_page_idx(params.mainloop, first_k_work_tile);
+            }
+          }
           MUTLASS_PRAGMA_NO_UNROLL
           for (int k_tile_idx = 0; k_tile_idx < k_tile_count; ++k_tile_idx) {
             auto k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, k_tile_idx);
             if (lane_idx == 0) {
-              mainloop.load_k(params.mainloop, pipeline, shared_storage, k_work_tile);
+              if constexpr (!CollectiveMainloop::EnableKPrefetch) {
+                page_idx = mainloop.safe_page_idx(params.mainloop, k_work_tile);
+              }
+              mainloop.load_k(params.mainloop, pipeline, shared_storage, k_work_tile, page_idx);
               if constexpr (CollectiveMainloop::EnableKPrefetch) {
                 int next_k_tile_idx = k_tile_idx + 1;
                 if (next_k_tile_idx < k_tile_count) {
                   auto next_k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, next_k_tile_idx);
-                  mainloop.prefetch_k(params.mainloop, next_k_work_tile);
+                  page_idx              = mainloop.safe_page_idx(params.mainloop, next_k_work_tile);
+                  mainloop.prefetch_k(params.mainloop, next_k_work_tile, page_idx);
                 }
               }
             }
@@ -140,8 +164,10 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
         }
       }
     } else if (warp_squad_idx <= CollectiveMainloop::NumMmaWarpSquads) {
-      for (auto q_work_tile = scheduler.get_initial_work(params.scheduler); q_work_tile.is_valid(params.scheduler);
-           q_work_tile      = scheduler.get_next_work(params.scheduler, q_work_tile)) {
+      auto schedule_info = scheduler.get_schedule_info(params.scheduler);
+      for (auto q_work_tile = scheduler.get_initial_work(params.scheduler, schedule_info);
+           q_work_tile.is_valid(params.scheduler);
+           q_work_tile = scheduler.get_next_work(params.scheduler, q_work_tile, schedule_info)) {
         __musa_loop_transparent_outermost();
         if (!TileScheduler::is_valid_q_tile(q_work_tile)) {
           continue;
@@ -150,19 +176,33 @@ struct MsaMaxScoreKernelTmeWarpSpecialized {
         if (TileScheduler::ParallelKTiles && q_work_tile.k_partition_idx >= k_tile_count) {
           continue;
         }
+        int  first_masked_k_tile = mainloop.first_masked_k_tile(params.mainloop, q_work_tile);
+        auto rowmax_store_params = mainloop.make_rowmax_store_params(params.mainloop, q_work_tile, consumer_thread_idx);
         mainloop.wait_q(pipeline, consumer_thread_idx);
         if constexpr (TileScheduler::ParallelKTiles) {
           MUTLASS_PRAGMA_NO_UNROLL
           for (int k_tile_idx = q_work_tile.k_partition_idx; k_tile_idx < k_tile_count;
                k_tile_idx += params.scheduler.k_partitions) {
             auto k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, k_tile_idx);
-            mainloop.compute_k_tile(params.mainloop, pipeline, shared_storage, k_work_tile, consumer_thread_idx);
+            mainloop.compute_k_tile(params.mainloop,
+                                    pipeline,
+                                    shared_storage,
+                                    k_work_tile,
+                                    first_masked_k_tile,
+                                    rowmax_store_params,
+                                    consumer_thread_idx);
           }
         } else {
           MUTLASS_PRAGMA_NO_UNROLL
           for (int k_tile_idx = 0; k_tile_idx < k_tile_count; ++k_tile_idx) {
             auto k_work_tile = TileScheduler::make_k_work_tile(q_work_tile, k_tile_idx);
-            mainloop.compute_k_tile(params.mainloop, pipeline, shared_storage, k_work_tile, consumer_thread_idx);
+            mainloop.compute_k_tile(params.mainloop,
+                                    pipeline,
+                                    shared_storage,
+                                    k_work_tile,
+                                    first_masked_k_tile,
+                                    rowmax_store_params,
+                                    consumer_thread_idx);
           }
         }
         mainloop.release_q(pipeline, consumer_thread_idx);

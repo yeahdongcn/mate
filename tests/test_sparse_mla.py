@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import mate
+from mate.execution_context import raise_complete_if_dry_run
 from mate.sparse_mla_interface import (
     get_batch_decode_metadata_mla,
     mla_rope_quantize_fp8,
@@ -140,6 +141,7 @@ def test_sparse_mla_prefill(case: SparseMlaCase, pytestconfig: pytest.Config):
         attn_sink=data.attn_sink,
         topk_length=data.topk_length,
     )
+    raise_complete_if_dry_run()
 
     assert_sparse_mla_close(
         out,
@@ -176,6 +178,7 @@ def test_mla_rope_quantize_fp8(case: RopeCase, pytestconfig: pytest.Config):
         q_nope_out=q_merged[..., :512],
         k_nope_out=k_merged[..., :512],
     )
+    raise_complete_if_dry_run()
 
     for actual, expected in zip(outputs, data.ref_outputs):
         torch.testing.assert_close(
@@ -219,6 +222,7 @@ def test_sparse_mla_decode(case: SparseMlaCase, pytestconfig: pytest.Config):
         topk_length=data.topk_length,
         extra_topk_length=data.extra_topk_length,
     )
+    raise_complete_if_dry_run()
 
     assert_sparse_mla_close(out, data.ref_out, lse, data.ref_lse)
 
@@ -247,6 +251,7 @@ def test_sparse_mla_fp8_decode(case: Fp8DecodeCase, pytestconfig: pytest.Config)
         return_lse=True,
         metadata=metadata,
     )
+    raise_complete_if_dry_run()
 
     assert_sparse_mla_close(out, data.ref_out, lse, data.ref_lse)
 
@@ -284,6 +289,7 @@ def test_sparse_mla_fp8_decode_stress(pytestconfig: pytest.Config):
     }
 
     baseline_out, baseline_lse = sparse_mla_fp8_decode(**decode_kwargs)
+    raise_complete_if_dry_run()
     torch.musa.synchronize()
     assert_sparse_mla_close(baseline_out, data.ref_out, baseline_lse, data.ref_lse)
     baseline_out = baseline_out.clone()

@@ -8,10 +8,10 @@ import torch
 
 import mate
 from mate import msa_interface as msa
-from mate.execution_context import is_dry_run_enabled
+from mate.execution_context import is_dry_run_enabled, raise_complete_if_dry_run
 from mate.testing import supported_musa_compute_capability
-from mate.testing.operator import OpMode
-from mate.testing.operator.msa import (
+from mate.testing.operators import OpMode
+from mate.testing.operators.msa import (
     MsaApi,
     MsaKernelMode,
     MsaKvLayout,
@@ -36,7 +36,7 @@ def test_msa_maxscore_prefill_tile_q_dispatch():
             dtype=torch.bfloat16,
             max_seqlen_q=64 * 1024,
         )
-        == 128
+        == 64
     )
     assert (
         _maxscore_tile_q(
@@ -45,6 +45,15 @@ def test_msa_maxscore_prefill_tile_q_dispatch():
             dtype=torch.bfloat16,
             max_seqlen_q=32 * 1024,
         )
+        == 64
+    )
+    assert (
+        _maxscore_tile_q(
+            1,
+            True,
+            dtype=torch.bfloat16,
+            max_seqlen_q=63,
+        )
         == 16
     )
     assert _maxscore_tile_q(
@@ -52,7 +61,135 @@ def test_msa_maxscore_prefill_tile_q_dispatch():
         True,
         dtype=torch.float8_e4m3fn if _HAS_FP8_E4M3 else torch.bfloat16,
         max_seqlen_q=128 * 1024,
-    ) == (_HAS_FP8_E4M3 and 64 or 128)
+    ) == (128 if _HAS_FP8_E4M3 else 64)
+    if _HAS_FP8_E4M3:
+        for max_seqlen_q in (1, 16, 17, 64, 128, 512):
+            assert (
+                _maxscore_tile_q(
+                    1,
+                    True,
+                    dtype=torch.float8_e4m3fn,
+                    max_seqlen_q=max_seqlen_q,
+                )
+                == 16
+            )
+        assert (
+            _maxscore_tile_q(
+                1,
+                True,
+                dtype=torch.float8_e4m3fn,
+                max_seqlen_q=513,
+            )
+            == 128
+        )
+
+
+def test_msa_maxscore_template_config_encodes_page_and_pipeline_options():
+    from mate.jit.msa_ops import _msa_maxscore_encode_config, make_msa_maxscore_config
+
+    config = make_msa_maxscore_config(
+        torch.float8_e4m3fn if _HAS_FP8_E4M3 else torch.bfloat16,
+        is_paged_kv=True,
+        causal=True,
+        head_dim=128,
+        head_ratio=1,
+        max_seqlen_q=3584,
+        page_table_kind="flat",
+        page_size=128,
+        is_varlen=False,
+    )
+    encoded = _msa_maxscore_encode_config(config)
+    assert config["page_table_kind"] == "flat"
+    assert config["page_size"] == 128
+    assert config["q_stages"] == 1
+    assert config["mma_tile_q"] in {16, 32}
+    assert config["is_varlen"] is False
+    assert config["has_metadata"] is False
+    assert "_pt_flat_ps_128_" in encoded
+    assert f"_ks_{config['k_stages']}_pf_{int(config['enable_k_prefetch'])}_" in encoded
+    assert f"_mq_{config['mma_tile_q']}_vl_0" in encoded
+
+    metadata_config = make_msa_maxscore_config(
+        torch.bfloat16,
+        is_paged_kv=True,
+        causal=True,
+        head_dim=128,
+        head_ratio=1,
+        max_seqlen_q=64,
+        page_table_kind="batched2d",
+        page_size=128,
+        is_varlen=True,
+    )
+    assert metadata_config["has_metadata"] is True
+    assert _msa_maxscore_encode_config(metadata_config).endswith("_hm_1")
+
+    with pytest.raises(ValueError, match="page_size == 128"):
+        make_msa_maxscore_config(
+            torch.bfloat16,
+            is_paged_kv=True,
+            causal=True,
+            head_dim=128,
+            head_ratio=1,
+            max_seqlen_q=64,
+            page_table_kind="batched2d",
+            page_size=64,
+        )
+
+
+def test_msa_per_mp_schedule_slot_count_tracks_q_work():
+    from mate.jit.msa_ops import _msa_schedule_num_mps
+
+    # A decode-sized Q range should not need a full-device persistent grid,
+    # while the long prefill shape still uses all logical MP slots.
+    assert (
+        _msa_schedule_num_mps(
+            hardware_mps=56,
+            q_work_count=1,
+            max_k_tiles=8,
+            parallel_k_tiles=True,
+        )
+        == 3
+    )
+    assert (
+        _msa_schedule_num_mps(
+            hardware_mps=56,
+            q_work_count=28,
+            max_k_tiles=1024,
+            parallel_k_tiles=True,
+        )
+        == 56
+    )
+
+
+def test_msa_schedule_q_threshold_accounts_for_k_work():
+    from mate.jit.msa_ops import (
+        _msa_schedule_q_work_threshold,
+        _msa_should_use_schedule,
+    )
+
+    # The threshold is expressed in logical Q-work tiles, not raw query rows.
+    # A long-K work item amortizes the metadata launch sooner than a short-K
+    # work item.
+    assert _msa_schedule_q_work_threshold(1024) == 8
+    assert _msa_schedule_q_work_threshold(32) == 256
+    assert not _msa_should_use_schedule(
+        q_work_count=1, valid_k_tiles=1024, schedule_requested=True
+    )
+    assert not _msa_should_use_schedule(
+        q_work_count=16, valid_k_tiles=32, schedule_requested=True
+    )
+    assert not _msa_should_use_schedule(
+        q_work_count=256, valid_k_tiles=32, schedule_requested=True, tile_q=16
+    )
+    assert not _msa_should_use_schedule(
+        q_work_count=4, valid_k_tiles=1024, schedule_requested=True
+    )
+    assert _msa_should_use_schedule(
+        q_work_count=8, valid_k_tiles=1024, schedule_requested=True, tile_q=128
+    )
+    assert not _msa_should_use_schedule(
+        q_work_count=1024, valid_k_tiles=32, schedule_requested=False
+    )
 
 
 def test_msa_plan_from_lengths_dense_contract():
@@ -74,6 +211,7 @@ def test_msa_plan_from_lengths_dense_contract():
     assert plan.mode == "dense"
     assert plan.num_qo_heads == 16
     assert plan.num_kv_heads == 4
+    assert plan.prefill_plan.is_varlen is True
     assert plan.kv_page_indptr is None
     assert plan.prefill_plan.total_seqlen_k == 96
     assert torch.equal(
@@ -99,6 +237,7 @@ def test_msa_sparse_prefill_mode_is_declared():
     )
 
     assert plan.mode == "sparse_prefill"
+    assert plan.prefill_plan.is_varlen is False
     assert plan.prefill_plan.total_seqlen_k == 256
     assert torch.equal(
         plan.kv_page_indptr,
@@ -276,6 +415,8 @@ def test_msa_static_runtime_metadata_reaches_paged_maxscore(monkeypatch):
         cu_seqlens_k=torch.tensor([0, 256, 640], dtype=torch.int32),
         seqused_k=torch.tensor([256, 384], dtype=torch.int32),
         page_table=torch.zeros((2, 32), dtype=torch.int32),
+        maxscore_schedule=torch.empty((4, 2), dtype=torch.int32),
+        maxscore_schedule_ready=True,
     )
     q = torch.empty((2, 1, 128), dtype=torch.float16)
     k = torch.empty((64, 128, 1, 128), dtype=torch.float16)
@@ -299,6 +440,148 @@ def test_msa_static_runtime_metadata_reaches_paged_maxscore(monkeypatch):
     assert calls[0][4] is runtime.qo_offset
     assert calls[0][5]["page_table"] is runtime.page_table
     assert calls[0][5]["kv_page_indptr"] is None
+    assert calls[0][5]["schedule_metadata"] is runtime.maxscore_schedule
+    assert calls[0][5]["schedule_metadata_ready"] is True
+
+
+def test_msa_maxscore_reuses_supplied_schedule_metadata(monkeypatch):
+    from mate.jit import msa_ops
+
+    metadata_calls = []
+    kernel_calls = []
+
+    class FakeModule:
+        def get_function(self, name):
+            if name.endswith("_metadata"):
+                return lambda *args: metadata_calls.append(args)
+            return lambda *args: kernel_calls.append(args)
+
+    monkeypatch.setattr(
+        msa_ops,
+        "make_msa_maxscore_config",
+        lambda *args, **kwargs: {
+            "tile_q": 128,
+            "parallel_k_tiles": False,
+        },
+    )
+    monkeypatch.setattr(msa_ops, "_msa_maxscore_encode_config", lambda config: "fake")
+    # This test isolates the ready-workspace ABI from the independent host-side
+    # scheduler policy.  Upstream may legitimately bypass metadata for tiny
+    # work sets, so force the scheduled branch here and verify build-vs-reuse.
+    monkeypatch.setattr(msa_ops, "_msa_should_use_schedule", lambda **kwargs: True)
+    monkeypatch.setattr(
+        msa_ops, "get_msa_maxscore_module", lambda *args, **kwargs: FakeModule()
+    )
+    monkeypatch.setattr(msa_ops, "resolve_num_mps", lambda device, limit: 4)
+
+    q = torch.empty((1, 1, 128), dtype=torch.float16)
+    k = torch.empty((1, 128, 1, 128), dtype=torch.float16)
+    cu_lens = torch.tensor([0, 1], dtype=torch.int32)
+    qo_offset = torch.zeros((1,), dtype=torch.int32)
+    schedule = torch.empty((4, 2), dtype=torch.int32)
+
+    for ready in (False, True):
+        msa_ops._msa_maxscore(
+            q,
+            k,
+            cu_lens,
+            cu_lens,
+            qo_offset,
+            max_seqlen_q=1,
+            max_seqlen_k=128,
+            causal=True,
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            schedule_metadata=schedule,
+            schedule_metadata_ready=ready,
+            max_score=torch.empty((1, 1, 128), dtype=torch.float32),
+        )
+
+    assert len(metadata_calls) == 1
+    assert len(kernel_calls) == 2
+    assert kernel_calls[0][5] is schedule
+    assert kernel_calls[1][5] is schedule
+
+
+def test_msa_maxscore_rejects_schedule_rows_that_change_k_partitioning(
+    monkeypatch,
+):
+    from mate.jit import msa_ops
+
+    class FakeModule:
+        def get_function(self, name):
+            raise AssertionError("invalid schedule must fail before kernel launch")
+
+    monkeypatch.setattr(
+        msa_ops,
+        "make_msa_maxscore_config",
+        lambda *args, **kwargs: {
+            "tile_q": 64,
+            "parallel_k_tiles": True,
+        },
+    )
+    monkeypatch.setattr(msa_ops, "_msa_maxscore_encode_config", lambda config: "fake")
+    monkeypatch.setattr(
+        msa_ops, "get_msa_maxscore_module", lambda *args, **kwargs: FakeModule()
+    )
+    monkeypatch.setattr(msa_ops, "resolve_num_mps", lambda device, limit: 56)
+    monkeypatch.setattr(msa_ops, "_msa_should_use_schedule", lambda **kwargs: True)
+
+    with pytest.raises(ValueError, match="changes max-score K partitioning"):
+        msa_ops._msa_maxscore(
+            torch.empty((512, 1, 128), dtype=torch.bfloat16),
+            torch.empty((1, 128, 1, 128), dtype=torch.bfloat16),
+            torch.tensor([0, 512], dtype=torch.int32),
+            torch.tensor([0, 131072], dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+            max_seqlen_q=512,
+            max_seqlen_k=131072,
+            causal=True,
+            page_table=torch.zeros((1, 1024), dtype=torch.int32),
+            schedule_metadata=torch.empty((1, 2), dtype=torch.int32),
+            schedule_metadata_ready=True,
+            max_score=torch.empty((512, 1, 1024), dtype=torch.float32),
+        )
+
+
+def test_msa_maxscore_ready_schedule_requires_workspace():
+    from mate.jit.msa_ops import _msa_maxscore
+
+    with pytest.raises(ValueError, match="requires a supplied schedule_metadata"):
+        _msa_maxscore(
+            torch.empty((1, 1, 128), dtype=torch.float16),
+            torch.empty((1, 128, 1, 128), dtype=torch.float16),
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.zeros((1,), dtype=torch.int32),
+            max_seqlen_q=1,
+            max_seqlen_k=128,
+            causal=True,
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            schedule_metadata_ready=True,
+            max_score=torch.empty((1, 1, 128), dtype=torch.float32),
+        )
+
+
+def test_msa_maxscore_ready_schedule_requires_exact_contiguous_workspace():
+    from mate.jit.msa_ops import _msa_maxscore
+
+    noncontiguous_schedule = torch.empty((4, 4), dtype=torch.int32)[:, ::2]
+    assert not noncontiguous_schedule.is_contiguous()
+    with pytest.raises(ValueError, match="exact contiguous schedule workspace"):
+        _msa_maxscore(
+            torch.empty((1, 1, 128), dtype=torch.float16),
+            torch.empty((1, 128, 1, 128), dtype=torch.float16),
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.zeros((1,), dtype=torch.int32),
+            max_seqlen_q=1,
+            max_seqlen_k=128,
+            causal=True,
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            schedule_metadata=noncontiguous_schedule,
+            schedule_metadata_ready=True,
+            max_score=torch.empty((1, 1, 128), dtype=torch.float32),
+        )
 
 
 def test_sparse_msa_plan_rejects_page_block_size_mismatch():
@@ -373,8 +656,9 @@ def test_sparse_modes_route_to_unified_msa_fwd(
 
     def fake_msa_fwd(q, k, v, block_indexes, *args, **kwargs):
         calls.append((q, k, v, block_indexes, args, kwargs))
+        output = kwargs["out"] if kwargs["out"] is not None else torch.empty_like(q)
         return (
-            torch.empty_like(q),
+            output,
             torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32),
         )
 
@@ -399,6 +683,11 @@ def test_sparse_modes_route_to_unified_msa_fwd(
     block_indexes = torch.full((q_len, num_kv_heads, 16), -1, dtype=torch.int32)
     block_indexes[..., :2] = torch.tensor([0, 1], dtype=torch.int32)
     kv_indices = torch.arange(2, dtype=torch.int32)
+    mixed_out = (
+        torch.empty(q.shape, dtype=torch.bfloat16)
+        if _HAS_FP8_E4M3 and dtype == torch.float8_e4m3fn
+        else None
+    )
 
     if mode == "prefill":
         out, lse = msa.sparse_msa(
@@ -408,6 +697,7 @@ def test_sparse_modes_route_to_unified_msa_fwd(
             plan_info,
             kv_indices=kv_indices,
             kv_block_indexes=block_indexes,
+            out=mixed_out,
             k_scale=1.25,
             v_scale=1.5,
         )
@@ -420,11 +710,15 @@ def test_sparse_modes_route_to_unified_msa_fwd(
             plan_info,
             kv_indices=kv_indices,
             kv_block_indexes=block_indexes,
+            out=mixed_out,
             k_scale=1.25,
             v_scale=1.5,
         )
 
     assert out.shape == q.shape
+    if mixed_out is not None:
+        assert out is mixed_out
+        assert calls[0][5]["out"] is mixed_out
     assert len(calls) == 1
     assert calls[0][3] is block_indexes
     assert calls[0][5]["k_scale"] == 1.25
@@ -479,6 +773,30 @@ _MAXSCORE_WORKLOADS = [
         causal=True,
         seed=304,
     ),
+    MsaWorkload(
+        api=MsaApi.MAXSCORE,
+        num_q_heads=1,
+        num_kv_heads=1,
+        q_lengths=(128,),
+        kv_lengths=(256,),
+        kv_layout=MsaKvLayout.PAGED,
+        page_mode="reverse",
+        dtype=torch.bfloat16,
+        causal=True,
+        seed=306,
+    ),
+    MsaWorkload(
+        api=MsaApi.MAXSCORE,
+        num_q_heads=1,
+        num_kv_heads=1,
+        q_lengths=(2, 4),
+        kv_lengths=(128, 16384),
+        kv_layout=MsaKvLayout.DENSE,
+        dtype=torch.bfloat16,
+        causal=False,
+        preallocated_max_score=True,
+        seed=307,
+    ),
 ]
 if _HAS_FP8_E4M3:
     _MAXSCORE_WORKLOADS.extend(
@@ -517,6 +835,18 @@ if _HAS_FP8_E4M3:
                 dtype=torch.float8_e4m3fn,
                 causal=True,
                 seed=305,
+            ),
+            MsaWorkload(
+                api=MsaApi.MAXSCORE,
+                num_q_heads=1,
+                num_kv_heads=1,
+                q_lengths=(128,),
+                kv_lengths=(256,),
+                kv_layout=MsaKvLayout.PAGED,
+                page_mode="reverse",
+                dtype=torch.float8_e4m3fn,
+                causal=True,
+                seed=308,
             ),
         ]
     )
@@ -750,6 +1080,7 @@ def _run_msa_workload(workload: MsaWorkload) -> None:
             pytest.skip(str(error))
         reference = operator.reference(inputs) if mode is OpMode.NORMAL else None
         outputs = operator.call(inputs)
+        raise_complete_if_dry_run()
         if reference is not None:
             operator.verify(inputs, outputs, reference)
 
@@ -759,6 +1090,148 @@ def _run_msa_workload(workload: MsaWorkload) -> None:
 @torch.inference_mode()
 def test_msa_output_maxscore_matches_reference(workload: MsaWorkload) -> None:
     _run_msa_workload(workload)
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode()
+def test_msa_maxscore_runtime_offset_kv_tail() -> None:
+    from mate.jit.msa_ops import _msa_maxscore
+
+    device = torch.device("musa")
+    torch.manual_seed(309)
+    q = (torch.randn((128, 1, 128), dtype=torch.float16, device=device) * 0.2).to(
+        torch.bfloat16
+    )
+    k = (torch.randn((2, 128, 1, 128), dtype=torch.float16, device=device) * 0.2).to(
+        torch.bfloat16
+    )
+    cu_q = torch.tensor([0, 128], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, 130], dtype=torch.int32, device=device)
+    qo_offset = torch.tensor([100], dtype=torch.int32, device=device)
+    page_table = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
+    actual = _msa_maxscore(
+        q,
+        k,
+        cu_q,
+        cu_k,
+        qo_offset,
+        max_seqlen_q=128,
+        max_seqlen_k=256,
+        causal=True,
+        page_table=page_table,
+        max_score=torch.full((128, 1, 128), 7.0, dtype=torch.float32, device=device),
+    )
+
+    logical_k = torch.cat((k[1, :, 0], k[0, :2, 0]), dim=0).float()
+    scores = q[:, 0].float() @ logical_k.transpose(0, 1)
+    valid = torch.arange(130, device=device).view(1, -1) <= (
+        torch.arange(128, device=device).view(-1, 1) + 100
+    )
+    scores.masked_fill_(~valid, -torch.inf)
+    expected = torch.full_like(actual, -torch.inf)
+    expected[:, 0, 0] = scores[:, :128].amax(dim=1)
+    expected[:, 0, 1] = scores[:, 128:].amax(dim=1)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode()
+def test_msa_maxscore_reuses_schedule_across_k_barrier_wraps() -> None:
+    from mate.jit import msa_ops
+
+    device = torch.device("musa")
+    page_size = 128
+    num_pages = 1024
+    q_len = 512
+    q = torch.ones((q_len, 1, 128), dtype=torch.bfloat16, device=device)
+    page_values = (((torch.arange(num_pages) % 32) + 1).float() / 32).to(
+        device=device, dtype=torch.bfloat16
+    )
+    k = page_values[:, None, None, None].expand(-1, page_size, 1, 128).contiguous()
+    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, num_pages * page_size], dtype=torch.int32, device=device)
+    qo_offset = torch.zeros(1, dtype=torch.int32, device=device)
+    page_table = torch.arange(
+        num_pages - 1, -1, -1, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    schedule = torch.empty(
+        (msa_ops.resolve_num_mps(device, None), 2), dtype=torch.int32, device=device
+    )
+
+    outputs = [
+        msa_ops._msa_maxscore(
+            q,
+            k,
+            cu_q,
+            cu_k,
+            qo_offset,
+            max_seqlen_q=q_len,
+            max_seqlen_k=num_pages * page_size,
+            causal=False,
+            page_table=page_table,
+            schedule_metadata=schedule,
+        )
+    ]
+    for _ in range(31):
+        outputs.append(
+            msa_ops._msa_maxscore(
+                q,
+                k,
+                cu_q,
+                cu_k,
+                qo_offset,
+                max_seqlen_q=q_len,
+                max_seqlen_k=num_pages * page_size,
+                causal=False,
+                page_table=page_table,
+                schedule_metadata=schedule,
+                schedule_metadata_ready=True,
+            )
+        )
+    torch.musa.synchronize()
+
+    expected_pages = page_values.flip(0).float() * 128
+    expected = torch.full_like(outputs[0], -torch.inf)
+    expected[:, :, :num_pages] = expected_pages.view(1, 1, num_pages)
+    for actual in outputs:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode()
+def test_msa_maxscore_flat_page_indices() -> None:
+    from mate.jit.msa_ops import _msa_maxscore
+
+    device = torch.device("musa")
+    torch.manual_seed(310)
+    q = (torch.randn((2, 1, 128), dtype=torch.float16, device=device) * 0.2).to(
+        torch.bfloat16
+    )
+    k = (torch.randn((3, 128, 1, 128), dtype=torch.float16, device=device) * 0.2).to(
+        torch.bfloat16
+    )
+    cu_q = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, 128, 256], dtype=torch.int32, device=device)
+    qo_offset = torch.tensor([127, 127], dtype=torch.int32, device=device)
+    page_indices = torch.tensor([2, 0], dtype=torch.int32, device=device)
+    page_indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    actual = _msa_maxscore(
+        q,
+        k,
+        cu_q,
+        cu_k,
+        qo_offset,
+        max_seqlen_q=1,
+        max_seqlen_k=128,
+        causal=True,
+        page_table=page_indices,
+        kv_page_indptr=page_indptr,
+    )
+
+    expected = torch.full_like(actual, -torch.inf)
+    expected[0, 0, 0] = (q[0, 0].float() @ k[2, :, 0].float().T).amax()
+    expected[1, 0, 0] = (q[1, 0].float() @ k[0, :, 0].float().T).amax()
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
 @supported_musa_compute_capability([31])

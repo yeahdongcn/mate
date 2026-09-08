@@ -149,6 +149,7 @@ struct StaticPersistentTileScheduler {
 
   struct WorkTileInfo {
     int32_t tile_idx;
+    int32_t tile_delta;
 
     MUTLASS_DEVICE
     bool is_valid(Params const& params) const {
@@ -170,7 +171,9 @@ struct StaticPersistentTileScheduler {
 
   MUTLASS_DEVICE
   WorkTileInfo get_initial_work(Params const& params) const {
-    return {static_cast<int32_t>(blockIdx.x)};
+    int32_t const grid_size = static_cast<int32_t>(gridDim.x);
+    int32_t const block_idx = static_cast<int32_t>(blockIdx.x);
+    return {block_idx, 2 * grid_size - 1 - 2 * block_idx};
   }
 
   MUTLASS_DEVICE
@@ -183,7 +186,8 @@ struct StaticPersistentTileScheduler {
 
   MUTLASS_DEVICE
   WorkTileInfo get_next_work(Params const& params, WorkTileInfo const& current_work) const {
-    return {current_work.tile_idx + static_cast<int32_t>(gridDim.x)};
+    int32_t const tile_delta = 2 * static_cast<int32_t>(gridDim.x) - current_work.tile_delta;
+    return {current_work.tile_idx + current_work.tile_delta, tile_delta};
 
     // int round_idx    = current_work.tile_idx / static_cast<int32_t>(gridDim.x) + 1;
     // int is_odd_round = round_idx & 1;

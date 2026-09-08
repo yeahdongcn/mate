@@ -39,6 +39,7 @@ from mate.mha_interface import (  # noqa: E402
 HEAD_DIM = 128
 PAGE_SIZE = 128
 TOPK = 16
+SYNC_INTERVAL = 16
 FP8 = getattr(torch, "float8_e4m3fn", None)
 DTYPES = {
     "fp16": torch.float16,
@@ -83,12 +84,86 @@ def _bench(
     torch.musa.synchronize()
     starts = [torch.musa.Event(enable_timing=True) for _ in range(repeat)]
     ends = [torch.musa.Event(enable_timing=True) for _ in range(repeat)]
-    for start, end in zip(starts, ends):
+    for idx, (start, end) in enumerate(zip(starts, ends)):
         start.record()
         fn()
         end.record()
+        if (idx + 1) % SYNC_INTERVAL == 0:
+            torch.musa.synchronize()
     torch.musa.synchronize()
     return _summarize([start.elapsed_time(end) for start, end in zip(starts, ends)])
+
+
+def _summarize_ratio(samples: list[float]) -> dict[str, float | int]:
+    ordered = sorted(samples)
+    return {
+        "min": min(samples),
+        "p50": statistics.median(samples),
+        "mean": statistics.mean(samples),
+        "p90": ordered[int(0.9 * (len(ordered) - 1))],
+        "max": max(samples),
+        "repeat": len(samples),
+    }
+
+
+def _bench_pair(
+    first_fn: Callable[[], object],
+    second_fn: Callable[[], object],
+    *,
+    warmup: int,
+    repeat: int,
+) -> dict[str, object]:
+    """Interleave two paths and report per-iteration timing ratios.
+
+    Alternating the launch order limits systematic bias from shared-device
+    load and clock changes between separately batched measurements.
+    """
+    for idx in range(warmup):
+        if idx % 2 == 0:
+            first_fn()
+            second_fn()
+        else:
+            second_fn()
+            first_fn()
+    torch.musa.synchronize()
+
+    first_events = [
+        (torch.musa.Event(enable_timing=True), torch.musa.Event(enable_timing=True))
+        for _ in range(repeat)
+    ]
+    second_events = [
+        (torch.musa.Event(enable_timing=True), torch.musa.Event(enable_timing=True))
+        for _ in range(repeat)
+    ]
+    for idx, ((first_start, first_end), (second_start, second_end)) in enumerate(
+        zip(first_events, second_events)
+    ):
+        if idx % 2 == 0:
+            first_start.record()
+            first_fn()
+            first_end.record()
+            second_start.record()
+            second_fn()
+            second_end.record()
+        else:
+            second_start.record()
+            second_fn()
+            second_end.record()
+            first_start.record()
+            first_fn()
+            first_end.record()
+        if (idx + 1) % SYNC_INTERVAL == 0:
+            torch.musa.synchronize()
+    torch.musa.synchronize()
+
+    first_samples = [start.elapsed_time(end) for start, end in first_events]
+    second_samples = [start.elapsed_time(end) for start, end in second_events]
+    ratios = [second / first for first, second in zip(first_samples, second_samples)]
+    return {
+        "first": _summarize(first_samples),
+        "second": _summarize(second_samples),
+        "second_over_first": _summarize_ratio(ratios),
+    }
 
 
 def _accuracy(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
@@ -119,6 +194,7 @@ def run_case(
     q_heads: int,
     kv_heads: int,
     q_len_override: int | None = None,
+    zero: bool = False,
 ) -> dict[str, object]:
     if kv_heads <= 0 or q_heads % kv_heads != 0 or q_heads // kv_heads not in (8, 16):
         raise ValueError(f"q_heads/kv_heads must be 8 or 16, got {q_heads}/{kv_heads}")
@@ -136,9 +212,14 @@ def run_case(
     softmax_scale = HEAD_DIM**-0.5
 
     torch.manual_seed(seed)
-    q = _rand_input((q_len, q_heads, HEAD_DIM), device, dtype)
-    k = _rand_input((num_pages, PAGE_SIZE, kv_heads, HEAD_DIM), device, dtype)
-    v = _rand_input((num_pages, PAGE_SIZE, kv_heads, HEAD_DIM), device, dtype)
+    make_input = torch.zeros if zero else _rand_input
+    q = make_input((q_len, q_heads, HEAD_DIM), device=device, dtype=dtype)
+    k = make_input(
+        (num_pages, PAGE_SIZE, kv_heads, HEAD_DIM), device=device, dtype=dtype
+    )
+    v = make_input(
+        (num_pages, PAGE_SIZE, kv_heads, HEAD_DIM), device=device, dtype=dtype
+    )
     proxy_q = q[:, :: q_heads // kv_heads, :].contiguous()
 
     qo_lens = torch.tensor([q_len], dtype=torch.int32, device=device)
@@ -205,6 +286,9 @@ def run_case(
             runtime_metadata=maxscore_runtime,
         )
 
+    def maxscore_fill_stage():
+        return max_score.fill_(-torch.inf)
+
     def topk_stage():
         return msa.sparse_topk_select(
             max_score,
@@ -245,6 +329,7 @@ def run_case(
     torch.musa.synchronize()
 
     stages = {
+        "maxscore_fill": _bench(maxscore_fill_stage, warmup=warmup, repeat=repeat),
         "maxscore": _bench(maxscore_stage, warmup=warmup, repeat=repeat),
         "topk_select": _bench(topk_stage, warmup=warmup, repeat=repeat),
         "sparse_attention": _bench(
@@ -270,6 +355,7 @@ def run_case(
         "causal": True,
         "num_pages": num_pages,
         "selector_bypassed": selector_bypassed,
+        "zero": zero,
         "stage_ms": stages,
     }
 
@@ -317,6 +403,17 @@ def run_case(
         dense_ms = float(dense_stats["p50_ms"])
         result["sparse_attention_over_dense"] = sparse_ms / dense_ms
         result["sparse_e2e_over_dense"] = e2e_ms / dense_ms
+        paired = _bench_pair(
+            dense_stage,
+            sparse_e2e_stage,
+            warmup=warmup,
+            repeat=repeat,
+        )
+        result["paired_stage_ms"] = {
+            "dense": paired["first"],
+            "sparse_e2e": paired["second"],
+        }
+        result["paired_sparse_e2e_over_dense"] = paired["second_over_first"]
         if num_pages <= TOPK:
             sparse_e2e_stage()
             dense_out = dense_stage().to(dtype)
@@ -350,27 +447,47 @@ def main() -> None:
         help="override prefill Q length while --lengths controls KV length",
     )
     parser.add_argument("--skip-dense", action="store_true")
+    parser.add_argument("--zero", action="store_true")
+    parser.add_argument(
+        "--output-jsonl",
+        type=Path,
+        default=None,
+        help="write each completed result row to this JSONL file",
+    )
     args = parser.parse_args()
 
     modes = ("prefill", "decode") if args.mode == "both" else (args.mode,)
-    for mode in modes:
-        for seq_len in _parse_lengths(args.lengths):
-            row = run_case(
-                mode=mode,
-                seq_len=seq_len,
-                warmup=args.warmup,
-                repeat=args.repeat,
-                seed=args.seed,
-                run_dense=not args.skip_dense,
-                dtype=DTYPES[args.dtype],
-                q_heads=args.q_heads,
-                kv_heads=args.kv_heads,
-                q_len_override=args.q_len,
-            )
-            print(json.dumps(row, sort_keys=True), flush=True)
-            del row
-            gc.collect()
-            torch.musa.empty_cache()
+    output_file = None
+    if args.output_jsonl is not None:
+        args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        output_file = args.output_jsonl.open("w", encoding="utf-8")
+    try:
+        for mode in modes:
+            for seq_len in _parse_lengths(args.lengths):
+                row = run_case(
+                    mode=mode,
+                    seq_len=seq_len,
+                    warmup=args.warmup,
+                    repeat=args.repeat,
+                    seed=args.seed,
+                    run_dense=not args.skip_dense,
+                    dtype=DTYPES[args.dtype],
+                    q_heads=args.q_heads,
+                    kv_heads=args.kv_heads,
+                    q_len_override=args.q_len,
+                    zero=args.zero,
+                )
+                line = json.dumps(row, sort_keys=True)
+                print(line, flush=True)
+                if output_file is not None:
+                    output_file.write(line + "\n")
+                    output_file.flush()
+                del row
+                gc.collect()
+                torch.musa.empty_cache()
+    finally:
+        if output_file is not None:
+            output_file.close()
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from .sparse_mla_decode_scheduled_common import (
     make_scheduled_decode_indices_loader,
     make_scheduled_decode_stage_value_shared,
 )
-from ...execution_context import raise_complete_if_dry_run
+from ...execution_context import skip_kernel_launch_if_dry_run
 from ...mate_runtime import get_physical_num_mps
 
 
@@ -216,6 +216,7 @@ def sparse_attention_fwd_kernel(
         lse: T.Tensor([batch, seq_len, num_heads], T.float32),  # type: ignore
         bmm1_scale: T.float32,
         bmm2_scale: T.float32,
+        kv_span_bytes: T.int64,
     ):
         with T.Kernel(
             seq_len * head_repeats, kv_group, num_mp_parts, threads=threads
@@ -267,7 +268,7 @@ def sparse_attention_fwd_kernel(
             bar_consumer1_protect = T.alloc_barrier(arrive_count=256)
             kv_robust_desc = T.make_robust_desc(
                 T.address_of(kv[0, 0, 0]),
-                seq_len_kv * kv_group * dim_bytes,
+                kv_span_bytes,
             )
             T.sync_threads()
 
@@ -524,7 +525,7 @@ def sparse_attention_fwd_kernel(
                         T.warpgroup_commit_batch()
                         # Preserve PV0 as the producer for the following scalar
                         # window; otherwise mtcc hoists the PV1 rescale above it.
-                        T.sched_boundary()
+                        # T.sched_boundary()  # B baseline: intentionally disabled
                         # The second accumulator is independent of the first
                         # PV batch.  Scale it in that TCE flight instead of
                         # extending the zero-slack P-ready publication path.
@@ -1062,6 +1063,7 @@ def sparse_attention_fwd_kernel(
         lse: T.Tensor([batch, seq_len, num_heads], accum_dtype),  # type: ignore
         bmm1_scale: T.float32,
         bmm2_scale: T.float32,
+        kv_span_bytes: T.int64,
     ):
         dsa_decode_split(
             q,
@@ -1078,6 +1080,7 @@ def sparse_attention_fwd_kernel(
             lse,
             bmm1_scale,
             bmm2_scale,
+            kv_span_bytes,
         )
         if support_split:
             dsa_combine(
@@ -1226,6 +1229,7 @@ def sparse_mla_fp8_decode_interface(
         assert lse.device == q.device
         assert lse.is_contiguous()
     threads = 640
+    # The robust-descriptor bound is launch metadata, not a JIT specialization.
     kernel = sparse_attention_fwd_kernel(
         heads,
         dim,
@@ -1238,10 +1242,9 @@ def sparse_mla_fp8_decode_interface(
     )
     if verbose:
         kernel.show_source()
-    raise_complete_if_dry_run()
     kv_latent_f8 = kv.view(torch.float8_e4m3fn)
     kv_packed_bf16 = kv.view(torch.bfloat16)
-    kernel(
+    args = (
         q,
         kv_latent_f8,
         kv_packed_bf16,
@@ -1256,5 +1259,8 @@ def sparse_mla_fp8_decode_interface(
         lse,
         float(bmm1_scale),
         float(bmm2_scale),
+        int(seq_len_kv) * int(kv_group) * dim_bytes,
     )
+    if not skip_kernel_launch_if_dry_run():
+        kernel(*args)
     return out, lse

@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import gc
 import math
 import os
 import random
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 from einops import rearrange
 
-from mate.execution_context import empty_if_dry_run, is_fake_mode
+from mate.execution_context import is_fake_mode
 from mate.mha_interface import (
     flash_attn_combine,
     flash_attn_varlen_func,
@@ -25,12 +24,19 @@ from mate.testing.flash_attn import (
     apply_rotary_emb,
     attention_ref,
     generate_block_kvcache,
-    generate_random_padding_mask,
     lse_ref_from_score,
     unpad_input,
 )
 
-from .operator import Operator
+from .operator import (
+    Operator,
+    OperatorInputs,
+    OperatorOutputs,
+    OperatorReference,
+    OperatorWorkload,
+)
+
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 class FmhaApi(Enum):
@@ -46,17 +52,58 @@ class FmhaLayout(Enum):
     PAGED = "paged"
 
 
-class FmhaInputMode(Enum):
-    STANDARD = "standard"
-    METADATA = "metadata"
-    NONCONTIGUOUS = "noncontiguous"
-    LARGE_STRIDE = "large-stride"
-    ADVANCED = "advanced"
-
-
 class FmhaVerifyMode(Enum):
-    CLOSE = "close"
-    ADVANCED = "advanced"
+    THREASHOLD = "threashold"
+    DIFF = "diff"
+
+
+FmhaTensorInitializer = Callable[[torch.Tensor], torch.Tensor]
+
+
+def default_tensor_init(tensor: torch.Tensor) -> torch.Tensor:
+    """Use the generated tensor without changing its storage layout."""
+    return tensor
+
+
+def noncontiguous_tensor_init(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy values into a view with a non-contiguous leading dimension."""
+    for dim, size in enumerate(tensor.shape[:-1]):
+        if size <= 1:
+            continue
+        storage_shape = list(tensor.shape)
+        storage_shape[dim] *= 2
+        storage = torch.empty(
+            storage_shape,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        slices = [slice(None)] * tensor.dim()
+        slices[dim] = slice(None, None, 2)
+        view = storage[tuple(slices)]
+        view.copy_(tensor)
+        return view
+    raise ValueError(
+        "noncontiguous tensor initialization requires a non-singleton "
+        "dimension before the head dimension"
+    )
+
+
+def large_stride_tensor_init(tensor: torch.Tensor) -> torch.Tensor:
+    """Give a singleton leading dimension a stride larger than int32."""
+    if tensor.dim() == 0 or tensor.shape[0] != 1:
+        raise ValueError("large-stride tensor initialization requires shape[0] == 1")
+    return tensor.as_strided(
+        tensor.shape,
+        (2**31 + 1024, *tensor.stride()[1:]),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class FmhaTensorSpec:
+    """Describe one tensor's logical layout and value-preserving initializer."""
+
+    layout: FmhaLayout = FmhaLayout.NORMAL
+    init: FmhaTensorInitializer = default_tensor_init
 
 
 class UnsupportedFmhaWorkload(ValueError):
@@ -64,7 +111,7 @@ class UnsupportedFmhaWorkload(ValueError):
 
 
 @dataclass(frozen=True, kw_only=True)
-class FmhaWorkload:
+class FmhaWorkload(OperatorWorkload):
     api: FmhaApi
     batch_size: int
     seqlen_q: int
@@ -80,10 +127,14 @@ class FmhaWorkload:
     seed: int | None = 666
     label: str | None = None
 
-    input_mode: FmhaInputMode = FmhaInputMode.STANDARD
-    verify_mode: FmhaVerifyMode = FmhaVerifyMode.CLOSE
-    q_layout: FmhaLayout = FmhaLayout.NORMAL
-    kv_layout: FmhaLayout = FmhaLayout.NORMAL
+    verify_mode: FmhaVerifyMode = FmhaVerifyMode.THREASHOLD
+    q: FmhaTensorSpec | None = None
+    k: FmhaTensorSpec | None = None
+    v: FmhaTensorSpec | None = None
+    qv: FmhaTensorSpec | None = None
+    k_cache: FmhaTensorSpec | None = None
+    v_cache: FmhaTensorSpec | None = None
+    combine_layout: FmhaLayout = FmhaLayout.NORMAL
     q_lengths: Sequence[int] | None = None
     kv_lengths: Sequence[int] | None = None
     q_used_lengths: Sequence[int] | None = None
@@ -107,9 +158,7 @@ class FmhaWorkload:
     learnable_sink: bool = False
     expect_single_split: bool = False
 
-    has_qv: bool = False
     only_qv: bool = False
-    new_kv: bool = False
     seqlen_new_eq_seqlen_q: bool = False
     has_cache_batch_idx: bool = False
     has_cache_leftpad: bool = False
@@ -128,18 +177,20 @@ class FmhaWorkload:
             raise ValueError("backend must be 'auto', 'mutlass', or 'mubin'")
         if self.cp_world_size <= 0:
             raise ValueError("cp_world_size must be positive")
-        if self.q_layout is FmhaLayout.PAGED:
-            raise ValueError("query layout cannot be paged")
+        if self.only_qv and self.api is not FmhaApi.KVCACHE:
+            raise ValueError("only_qv is only supported by the kvcache API")
         self._validate_lengths("q_lengths", self.q_lengths, self.seqlen_q)
         self._validate_used_lengths("q_used_lengths", self.q_used_lengths)
 
         if self.api is FmhaApi.COMBINE:
             if self.num_splits <= 0:
                 raise ValueError("combine workloads require num_splits > 0")
-            if self.kv_layout is not FmhaLayout.NORMAL:
-                raise ValueError("combine workloads do not use a KV layout")
+            if self.combine_layout is FmhaLayout.PAGED:
+                raise ValueError("combine workloads cannot use a paged layout")
             return
 
+        if self.q is None:
+            raise ValueError("attention workloads require a q tensor spec")
         if self.seqlen_k is None or self.seqlen_k <= 0:
             raise ValueError("seqlen_k must be positive for attention workloads")
         if self.num_heads_kv is None or self.num_heads_kv <= 0:
@@ -151,20 +202,51 @@ class FmhaWorkload:
         self._validate_lengths("kv_lengths", self.kv_lengths, self.seqlen_k)
         self._validate_used_lengths("kv_used_lengths", self.kv_used_lengths)
 
-        if self.api is FmhaApi.VARLEN and self.kv_layout is FmhaLayout.PAGED:
-            raise ValueError("paged KV uses the kvcache API")
-        if self.api is FmhaApi.KVCACHE and self.kv_layout not in (
-            FmhaLayout.NORMAL,
-            FmhaLayout.PAGED,
-        ):
-            raise ValueError("kvcache KV layout must be normal or paged")
-        if self.kv_layout is FmhaLayout.PAGED:
+        for name in ("q", "k", "v", "qv"):
+            spec = getattr(self, name)
+            if spec is not None and spec.layout is FmhaLayout.PAGED:
+                raise ValueError(f"{name} cannot use a paged layout")
+        if (self.k is None) != (self.v is None):
+            raise ValueError("k and v tensor specs must be provided together")
+        if (self.k_cache is None) != (self.v_cache is None):
+            raise ValueError(
+                "k_cache and v_cache tensor specs must be provided together"
+            )
+        if self.qv is not None and self.qv.layout is not self.q.layout:
+            raise ValueError("q and qv must use the same layout")
+        if self.k is not None and self.k.layout is not self.v.layout:
+            raise ValueError("k and v must use the same layout")
+        if self.k_cache is not None and self.k_cache.layout is not self.v_cache.layout:
+            raise ValueError("k_cache and v_cache must use the same layout")
+        for name in ("k_cache", "v_cache"):
+            spec = getattr(self, name)
+            if spec is not None and spec.layout not in (
+                FmhaLayout.NORMAL,
+                FmhaLayout.PAGED,
+            ):
+                raise ValueError(f"{name} layout must be normal or paged")
+
+        if self.api is FmhaApi.VARLEN:
+            if self.k is None:
+                raise ValueError("varlen workloads require k and v tensor specs")
+            if self.k_cache is not None:
+                raise ValueError("varlen workloads cannot use cache tensor specs")
+        elif self.api is FmhaApi.KVCACHE:
+            if self.k_cache is None:
+                raise ValueError("kvcache workloads require cache tensor specs")
+
+        cache_layout = (
+            self.k_cache.layout if self.k_cache is not None else FmhaLayout.NORMAL
+        )
+        if cache_layout is FmhaLayout.PAGED:
             if self.page_size is None or self.page_size <= 0:
                 raise ValueError("paged KV workloads require a positive page_size")
         elif self.page_size is not None:
             raise ValueError("page_size is only valid for paged KV workloads")
-        if self.only_qv and not self.has_qv:
-            raise ValueError("only_qv requires has_qv")
+        if self.only_qv and self.qv is None:
+            raise ValueError("only_qv requires a qv tensor spec")
+        if self.seqlen_new_eq_seqlen_q and not self.appends_kv:
+            raise ValueError("seqlen_new_eq_seqlen_q requires appended k and v")
 
     def _validate_lengths(
         self,
@@ -192,12 +274,22 @@ class FmhaWorkload:
             return self.label
         parts = [
             self.api.value,
-            self.input_mode.value,
-            f"q-{self.q_layout.value}",
-            f"kv-{self.kv_layout.value}",
             f"b{self.batch_size}",
             f"sq{self.seqlen_q}",
         ]
+        if self.api is FmhaApi.COMBINE:
+            parts.append(f"combine-{self.combine_layout.value}")
+        for name in ("q", "k", "v", "qv", "k_cache", "v_cache"):
+            spec = getattr(self, name)
+            if spec is None:
+                continue
+            tensor_part = f"{name}-{spec.layout.value}"
+            if spec.init is not default_tensor_init:
+                initializer_name = getattr(
+                    spec.init, "__name__", type(spec.init).__name__
+                )
+                tensor_part += f"-{initializer_name.removesuffix('_tensor_init')}"
+            parts.append(tensor_part)
         if self.seqlen_k is not None:
             parts.append(f"sk{self.seqlen_k}")
         heads = f"h{self.num_heads_q}"
@@ -226,9 +318,13 @@ class FmhaWorkload:
             parts.append(self.backend)
         return "-".join(parts)
 
+    @property
+    def appends_kv(self) -> bool:
+        return self.k_cache is not None and self.k is not None
+
 
 @dataclass(kw_only=True)
-class FmhaInputs:
+class FmhaInputs(OperatorInputs):
     api: FmhaApi
     workload: FmhaWorkload | None = None
 
@@ -261,6 +357,7 @@ class FmhaInputs:
     rotary_cos_reference: torch.Tensor | None = None
     rotary_sin_reference: torch.Tensor | None = None
     rotary_seqlens: torch.Tensor | None = None
+    rotary_seqlens_reference: torch.Tensor | None = None
     q_descale: torch.Tensor | None = None
     k_descale: torch.Tensor | None = None
     v_descale: torch.Tensor | None = None
@@ -299,11 +396,10 @@ class FmhaInputs:
     q_lengths: tuple[int, ...] | None = None
     kv_lengths: tuple[int, ...] | None = None
     rotary_dim: int = 0
-    baseline_inputs: FmhaInputs | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
-class FmhaOutputs:
+class FmhaOutputs(OperatorOutputs):
     out: torch.Tensor
     lse: torch.Tensor | None = None
     out_accum: torch.Tensor | None = None
@@ -312,64 +408,52 @@ class FmhaOutputs:
 
 
 @dataclass(frozen=True, kw_only=True)
-class FmhaReference:
+class FmhaReference(OperatorReference):
     out: torch.Tensor
     lse: torch.Tensor | None = None
-    baseline_out: torch.Tensor | None = None
+    high_precision_out: torch.Tensor | None = None
     expected_k_cache: torch.Tensor | None = None
     expected_v_cache: torch.Tensor | None = None
 
 
-class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference]):
+class FmhaOperator(Operator):
     """Generate, invoke, reference, and verify FMHA workloads."""
 
-    def generate(self, workload: FmhaWorkload) -> FmhaInputs:
+    def generate(self, workload):
         unsupported = self._unsupported_reason(workload)
         if unsupported is not None:
             raise UnsupportedFmhaWorkload(unsupported)
         self._seed(workload.seed, workload.device)
         if workload.api is FmhaApi.COMBINE:
             return self._generate_combine(workload)
-        if workload.input_mode is FmhaInputMode.NONCONTIGUOUS:
-            return self._generate_noncontiguous(workload)
-        if workload.input_mode is FmhaInputMode.LARGE_STRIDE:
-            return self._generate_large_stride(workload)
-        if workload.input_mode is FmhaInputMode.ADVANCED:
-            return self._generate_advanced(workload)
         return self._generate_attention(workload)
 
-    def call(self, inputs: FmhaInputs) -> FmhaOutputs:
+    def call(self, inputs):
+        if inputs.only_qv and inputs.api is not FmhaApi.KVCACHE:
+            raise ValueError("only_qv is only supported by the kvcache API")
         if inputs.api is FmhaApi.COMBINE:
             return self._call_combine(inputs)
         if inputs.cp_world_size > 1:
             return self._call_cp(inputs)
         return self._call_attention_once(inputs)
 
-    def reference(self, inputs: FmhaInputs) -> FmhaReference:
-        if inputs.baseline_inputs is not None:
-            return FmhaReference(
-                out=self._call_attention_once(inputs.baseline_inputs).out
-            )
+    def reference(self, inputs):
         if inputs.api is FmhaApi.COMBINE:
             return self._reference_combine(inputs)
-        if (
-            inputs.workload is not None
-            and inputs.workload.input_mode is FmhaInputMode.ADVANCED
-        ):
-            return self._reference_advanced(inputs)
         return self._reference_attention(inputs)
 
     def verify(
         self,
-        inputs: FmhaInputs,
-        outputs: FmhaOutputs,
-        reference: FmhaReference,
+        inputs,
+        outputs,
+        reference,
     ) -> None:
         workload = inputs.workload
-        if workload is not None and workload.verify_mode is FmhaVerifyMode.ADVANCED:
-            self._verify_advanced(inputs, outputs, reference)
-            return
-        self._verify_close(inputs, outputs, reference)
+        if workload is not None and workload.verify_mode is FmhaVerifyMode.DIFF:
+            self._verify_diff(inputs, outputs, reference)
+        else:
+            self._verify_threashold(inputs, outputs, reference)
+        self._verify_appended_cache(inputs, reference)
 
     def _call_attention_once(self, inputs: FmhaInputs) -> FmhaOutputs:
         metadata = inputs.scheduler_metadata
@@ -466,9 +550,59 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             raise ValueError("CP workloads require ragged q and cu_seqlens_q")
         if inputs.kv_lengths is None:
             raise ValueError("CP workloads require concrete KV lengths")
+        if inputs.api is FmhaApi.KVCACHE and (
+            inputs.k is not None or inputs.v is not None
+        ):
+            raise ValueError("append-KV is not supported with context parallelism")
+        k_init = (
+            inputs.workload.k.init
+            if inputs.workload is not None and inputs.workload.k is not None
+            else default_tensor_init
+        )
+        v_init = (
+            inputs.workload.v.init
+            if inputs.workload is not None and inputs.workload.v is not None
+            else default_tensor_init
+        )
+        k_cache_init = (
+            inputs.workload.k_cache.init
+            if inputs.workload is not None and inputs.workload.k_cache is not None
+            else default_tensor_init
+        )
+        v_cache_init = (
+            inputs.workload.v_cache.init
+            if inputs.workload is not None and inputs.workload.v_cache is not None
+            else default_tensor_init
+        )
 
+        cache_leftpads = (0,) * len(inputs.kv_lengths)
+        if inputs.api is FmhaApi.VARLEN:
+            if inputs.seqused_k is not None and not is_fake_mode():
+                used_kv_lengths = tuple(
+                    int(value) for value in inputs.seqused_k.cpu().tolist()
+                )
+            elif (
+                inputs.workload is not None
+                and inputs.workload.kv_used_lengths is not None
+            ):
+                used_kv_lengths = self._resolve_used_lengths(
+                    inputs.workload.kv_used_lengths, inputs.kv_lengths
+                )
+            else:
+                used_kv_lengths = inputs.kv_lengths
+            physical_kv_lengths = inputs.kv_lengths
+        else:
+            if inputs.cache_leftpad is not None and not is_fake_mode():
+                cache_leftpads = tuple(
+                    int(value) for value in inputs.cache_leftpad.cpu().tolist()
+                )
+            used_kv_lengths = tuple(
+                length - leftpad
+                for length, leftpad in zip(inputs.kv_lengths, cache_leftpads)
+            )
+            physical_kv_lengths = used_kv_lengths
         cp_tot_seqused_k = torch.tensor(
-            inputs.kv_lengths, dtype=torch.int32, device=inputs.q.device
+            used_kv_lengths, dtype=torch.int32, device=inputs.q.device
         )
         rank_inputs_keepalive: list[FmhaInputs] = []
         rank_outputs: list[FmhaOutputs] = []
@@ -479,34 +613,52 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
                     (length - cp_rank + inputs.cp_world_size - 1)
                     // inputs.cp_world_size,
                 )
-                for length in inputs.kv_lengths
+                for length in physical_kv_lengths
+            )
+            local_used_lengths = tuple(
+                max(
+                    0,
+                    (length - cp_rank + inputs.cp_world_size - 1)
+                    // inputs.cp_world_size,
+                )
+                for length in used_kv_lengths
             )
             if inputs.api is FmhaApi.VARLEN:
                 if inputs.k_padded is None or inputs.v_padded is None:
                     raise ValueError("varlen CP requires padded source K and V")
                 k_segments = [
                     inputs.k_padded[index, cp_rank : length : inputs.cp_world_size]
-                    for index, length in enumerate(inputs.kv_lengths)
+                    for index, length in enumerate(physical_kv_lengths)
                 ]
                 v_segments = [
                     inputs.v_padded[index, cp_rank : length : inputs.cp_world_size]
-                    for index, length in enumerate(inputs.kv_lengths)
+                    for index, length in enumerate(physical_kv_lengths)
                 ]
                 cu_seqlens_k = torch.tensor(
                     self._cumulative_lengths(local_lengths),
                     dtype=torch.int32,
                     device=inputs.q.device,
                 )
+                seqused_k = (
+                    torch.tensor(
+                        local_used_lengths,
+                        dtype=torch.int32,
+                        device=inputs.q.device,
+                    )
+                    if inputs.seqused_k is not None
+                    else None
+                )
                 rank_inputs = replace(
                     inputs,
-                    k=torch.cat(k_segments, dim=0),
-                    v=torch.cat(v_segments, dim=0),
+                    k=k_init(torch.cat(k_segments, dim=0).to(inputs.q.dtype)),
+                    v=v_init(torch.cat(v_segments, dim=0).to(inputs.q.dtype)),
                     cu_seqlens_k=cu_seqlens_k,
-                    seqused_k=None,
+                    seqused_k=seqused_k,
                     max_seqlen_k=max(local_lengths),
                     scheduler_metadata=None,
                     cp_rank=cp_rank,
                     cp_tot_seqused_k=cp_tot_seqused_k,
+                    kv_lengths=local_lengths,
                 )
             else:
                 if (
@@ -522,26 +674,34 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
                         inputs,
                         cp_rank=cp_rank,
                         local_lengths=local_lengths,
+                        cache_leftpads=cache_leftpads,
                     )
                 )
                 rank_inputs = replace(
                     inputs,
-                    k_cache=k_local,
-                    v_cache=v_local,
+                    k_cache=k_cache_init(k_local),
+                    v_cache=v_cache_init(v_local),
                     page_table=page_table_local,
                     cache_seqlens=local_seqlens,
+                    cache_batch_idx=None,
+                    cache_leftpad=None,
                     max_seqlen_k=max(local_lengths),
                     scheduler_metadata=None,
                     cp_rank=cp_rank,
                     cp_tot_seqused_k=cp_tot_seqused_k,
                 )
+            rank_inputs = replace(rank_inputs, return_softmax_lse=True)
             rank_inputs_keepalive.append(rank_inputs)
             rank_outputs.append(self._call_attention_once(rank_inputs))
             if not is_fake_mode() and hasattr(torch, "musa"):
                 torch.musa.synchronize()
 
         if is_fake_mode():
-            return rank_outputs[0]
+            output = rank_outputs[0]
+            return replace(
+                output,
+                lse=output.lse if inputs.return_softmax_lse else None,
+            )
         total_q = inputs.q.shape[0]
         combined_out = torch.zeros(
             total_q,
@@ -550,20 +710,37 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             dtype=torch.float32,
             device=inputs.q.device,
         )
-        combined_lse = torch.empty(
-            inputs.q.shape[-2], total_q, dtype=torch.float32, device=inputs.q.device
+        combined_lse = torch.full(
+            (inputs.q.shape[-2], total_q),
+            float("-inf"),
+            dtype=torch.float32,
+            device=inputs.q.device,
         )
         cu_q = [int(value) for value in inputs.cu_seqlens_q.cpu().tolist()]
-        for batch_index, (start, end) in enumerate(zip(cu_q, cu_q[1:])):
+        used_q = (
+            [int(value) for value in inputs.seqused_q.cpu().tolist()]
+            if inputs.seqused_q is not None
+            else [end - start for start, end in zip(cu_q, cu_q[1:])]
+        )
+        for start, physical_end, used_length in zip(cu_q, cu_q[1:], used_q):
+            end = min(start + used_length, physical_end)
             if start == end:
                 continue
+            rank_lses = []
+            for output in rank_outputs:
+                if output.lse is None:
+                    raise AssertionError("CP rank did not return its required LSE")
+                rank_lses.append(output.lse[:, start:end].float())
             out_item, lse_item = _combine_cp_partials(
                 [output.out[start:end].float() for output in rank_outputs],
-                [output.lse[:, start:end].float() for output in rank_outputs],
+                rank_lses,
             )
             combined_out[start:end] = out_item
             combined_lse[:, start:end] = lse_item
-        return FmhaOutputs(out=combined_out.to(inputs.q.dtype), lse=combined_lse)
+        return FmhaOutputs(
+            out=combined_out.to(rank_outputs[0].out.dtype),
+            lse=combined_lse if inputs.return_softmax_lse else None,
+        )
 
     def _make_cp_paged_cache(
         self,
@@ -571,6 +748,7 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         *,
         cp_rank: int,
         local_lengths: tuple[int, ...],
+        cache_leftpads: tuple[int, ...],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if (
             inputs.k_cache is None
@@ -587,6 +765,10 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         padded_length = pages_per_sequence * page_size
         k_dense = self._logical_cache(inputs.k_cache, inputs.page_table)
         v_dense = self._logical_cache(inputs.v_cache, inputs.page_table)
+        if inputs.cache_batch_idx is not None:
+            indices = inputs.cache_batch_idx.long()
+            k_dense = k_dense[indices]
+            v_dense = v_dense[indices]
         k_local_dense = torch.zeros(
             batch_size,
             padded_length,
@@ -605,11 +787,16 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             assert inputs.kv_lengths is not None
             for batch_index, global_length in enumerate(inputs.kv_lengths):
                 local_length = local_lengths[batch_index]
+                leftpad = cache_leftpads[batch_index]
+                # CP positions are relative to the logical sequence, after the
+                # physical cache's left padding has been removed.
                 k_local_dense[batch_index, :local_length] = k_dense[
-                    batch_index, cp_rank : global_length : inputs.cp_world_size
+                    batch_index,
+                    leftpad + cp_rank : global_length : inputs.cp_world_size,
                 ]
                 v_local_dense[batch_index, :local_length] = v_dense[
-                    batch_index, cp_rank : global_length : inputs.cp_world_size
+                    batch_index,
+                    leftpad + cp_rank : global_length : inputs.cp_world_size,
                 ]
         k_local = k_local_dense.reshape(
             batch_size * pages_per_sequence,
@@ -629,7 +816,7 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         seqlens = torch.tensor(local_lengths, dtype=torch.int32, device=k_dense.device)
         return k_local, v_local, page_table, seqlens
 
-    def _verify_close(
+    def _verify_threashold(
         self,
         inputs: FmhaInputs,
         outputs: FmhaOutputs,
@@ -640,10 +827,8 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         rtol = workload.rtol if workload is not None else 1e-2
         out = outputs.out
         out_ref = reference.out.to(dtype=out.dtype)
-        valid_queries: torch.Tensor | None = None
-        if out.dim() == 4 and inputs.seqused_q is not None:
-            valid_queries = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
-            valid_queries = valid_queries < inputs.seqused_q.to(out.device).unsqueeze(1)
+        valid_queries = self._valid_query_mask(inputs, out)
+        if valid_queries is not None:
             out = out[valid_queries]
             out_ref = out_ref[valid_queries]
         torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
@@ -654,13 +839,18 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
                 raise AssertionError("FMHA did not return the requested softmax LSE")
             lse = outputs.lse
             lse_ref = reference.lse.to(dtype=lse.dtype)
-            if valid_queries is not None and lse.dim() == 3:
-                if inputs.api is FmhaApi.COMBINE:
+            if valid_queries is not None:
+                if valid_queries.dim() == 1 and lse.dim() == 2:
+                    lse = lse[:, valid_queries]
+                    lse_ref = lse_ref[:, valid_queries]
+                elif inputs.api is FmhaApi.COMBINE:
                     valid_lse = valid_queries.unsqueeze(-1).expand_as(lse)
-                else:
+                    lse = lse[valid_lse]
+                    lse_ref = lse_ref[valid_lse]
+                elif valid_queries.dim() == 2 and lse.dim() == 3:
                     valid_lse = valid_queries.unsqueeze(1).expand_as(lse)
-                lse = lse[valid_lse]
-                lse_ref = lse_ref[valid_lse]
+                    lse = lse[valid_lse]
+                    lse_ref = lse_ref[valid_lse]
             torch.testing.assert_close(lse, lse_ref, atol=atol, rtol=rtol)
 
         if (
@@ -675,28 +865,66 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             splits = inputs.scheduler_metadata[: workload.batch_size]
             torch.testing.assert_close(splits, torch.ones_like(splits), atol=0, rtol=0)
 
-    def _verify_advanced(
+    def _verify_diff(
         self,
         inputs: FmhaInputs,
         outputs: FmhaOutputs,
         reference: FmhaReference,
     ) -> None:
-        if reference.baseline_out is None or inputs.workload is None:
-            raise ValueError("advanced verification requires a baseline reference")
+        if reference.high_precision_out is None or inputs.workload is None:
+            raise ValueError("diff verification requires a high-precision reference")
         out = outputs.out.float()
-        out_ref = reference.out.float()
-        baseline = reference.baseline_out.float()
-        max_multiplier = 4 if inputs.workload.dtype == torch.float8_e4m3fn else 2
-        mean_multiplier = 3 if inputs.workload.dtype == torch.float8_e4m3fn else 1.5
-        diff = (out - out_ref).abs()
-        baseline_diff = (baseline - out_ref).abs()
-        if diff.max().item() > max_multiplier * baseline_diff.max().item() + 1e-5:
-            raise AssertionError("FMHA maximum error exceeded the advanced threshold")
-        if diff.mean().item() > mean_multiplier * baseline_diff.mean().item() + 1e-5:
-            raise AssertionError("FMHA mean error exceeded the advanced threshold")
-
-        if not inputs.workload.new_kv:
+        out_ref = reference.high_precision_out.float()
+        low_precision_out = reference.out.float()
+        valid_queries = self._valid_query_mask(inputs, out)
+        if valid_queries is not None:
+            out = out[valid_queries]
+            out_ref = out_ref[valid_queries]
+            low_precision_out = low_precision_out[valid_queries]
+        if out.numel() == 0:
             return
+        max_multiplier = 4 if inputs.workload.dtype in _FP8_DTYPES else 2
+        mean_multiplier = 3 if inputs.workload.dtype in _FP8_DTYPES else 1.5
+        diff = (out - out_ref).abs()
+        reference_diff = (low_precision_out - out_ref).abs()
+        if diff.max().item() > max_multiplier * reference_diff.max().item() + 1e-5:
+            raise AssertionError("FMHA maximum error exceeded the diff threshold")
+        if diff.mean().item() > mean_multiplier * reference_diff.mean().item() + 1e-5:
+            raise AssertionError("FMHA mean error exceeded the diff threshold")
+
+    @staticmethod
+    def _valid_query_mask(
+        inputs: FmhaInputs, output: torch.Tensor
+    ) -> torch.Tensor | None:
+        mask = inputs.query_padding_mask
+        if mask is not None:
+            if inputs.q_indices is not None:
+                return mask.flatten()[inputs.q_indices]
+            return mask
+        if inputs.seqused_q is None:
+            return None
+
+        seqused_q = inputs.seqused_q.to(device=output.device, dtype=torch.long)
+        if inputs.cu_seqlens_q is None:
+            positions = torch.arange(output.shape[1], device=output.device)
+            return positions.unsqueeze(0) < seqused_q.unsqueeze(1)
+
+        cu_seqlens_q = inputs.cu_seqlens_q.to(device=output.device, dtype=torch.long)
+        physical_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        starts = torch.repeat_interleave(cu_seqlens_q[:-1], physical_lengths)
+        used_lengths = torch.repeat_interleave(seqused_q, physical_lengths)
+        positions = torch.arange(output.shape[0], device=output.device) - starts
+        return positions < used_lengths
+
+    def _verify_appended_cache(
+        self,
+        inputs: FmhaInputs,
+        reference: FmhaReference,
+    ) -> None:
+        if inputs.k is None or inputs.k_cache is None:
+            return
+        if inputs.workload is None:
+            raise ValueError("append-KV verification requires its workload")
         if reference.expected_k_cache is None or reference.expected_v_cache is None:
             raise ValueError("append-KV verification requires expected caches")
         k_actual = self._logical_cache(
@@ -715,7 +943,7 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         v_actual = v_actual[:, : inputs.workload.seqlen_k].to(
             inputs.workload.reference_dtype
         )
-        if inputs.workload.dtype == torch.float8_e4m3fn:
+        if inputs.workload.dtype in _FP8_DTYPES:
             torch.testing.assert_close(
                 v_actual, reference.expected_v_cache, atol=1e-3, rtol=1e-3
             )
@@ -725,7 +953,7 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             )
         if inputs.rotary_dim == 0:
             atol = rtol = 0.0
-        elif inputs.workload.dtype == torch.float8_e4m3fn:
+        elif inputs.workload.dtype in _FP8_DTYPES:
             atol = rtol = 1e-1
         else:
             atol, rtol = 1e-2, 1.5e-2
@@ -747,27 +975,47 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         local = workload.window_size not in ((None, None), (-1, -1))
         if workload.learnable_sink and not local:
             return "learnable sink is only supported by these workloads with local attention"
-        if workload.input_mode is not FmhaInputMode.ADVANCED:
-            return None
+        if workload.cp_world_size > 1:
+            if workload.api is FmhaApi.COMBINE:
+                return "combine does not support context parallelism"
+            if workload.q is None or workload.q.layout is not FmhaLayout.RAGGED:
+                return "context parallelism requires a ragged q layout"
+            if local or workload.attention_chunk > 0:
+                return "context parallelism does not support local or chunked attention"
+            if workload.appends_kv:
+                return "append-KV is not supported with context parallelism"
+            if workload.api is FmhaApi.KVCACHE and (
+                workload.k_cache is None
+                or workload.k_cache.layout is not FmhaLayout.PAGED
+            ):
+                return "kvcache context parallelism requires a paged cache layout"
         dimensions = (workload.head_dim_qk, workload.head_dim_v)
-        if not workload.has_qv and dimensions not in ((192, 128), (128, 128)):
-            return "non-QV advanced attention only supports d192x128 and d128x128"
-        if workload.seqlen_k is not None and workload.seqlen_q > workload.seqlen_k:
+        if (
+            workload.appends_kv
+            and workload.qv is None
+            and dimensions not in ((192, 128), (128, 128))
+        ):
+            return "non-QV append-KV only supports d192x128 and d128x128"
+        if (
+            workload.appends_kv
+            and workload.seqlen_k is not None
+            and workload.seqlen_q > workload.seqlen_k
+        ):
             return "append KV requires seqlen_q <= seqlen_k"
-        if not workload.new_kv and (
+        if not workload.appends_kv and (
             workload.rotary_fraction > 0
             or workload.seqlen_new_eq_seqlen_q
             or workload.has_rotary_seqlens
         ):
-            return "rotary append-KV options require new_kv"
+            return "rotary append-KV options require appended k and v"
         if workload.rotary_fraction == 0 and (
             workload.has_rotary_seqlens or not workload.rotary_interleaved
         ):
             return "rotary layout options require rotary embeddings"
-        if workload.dtype == torch.float8_e4m3fn and workload.has_qv:
+        if workload.dtype in _FP8_DTYPES and workload.qv is not None:
             if dimensions not in ((64, 256), (64, 512)):
                 return "float8 QV only supports d64x256 and d64x512"
-            if workload.new_kv or workload.rotary_fraction > 0:
+            if workload.appends_kv or workload.rotary_fraction > 0:
                 return "float8 QV does not support append KV or rotary"
         return None
 
@@ -775,25 +1023,38 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         assert workload.seqlen_k is not None
         assert workload.num_heads_kv is not None
         assert workload.head_dim_qk is not None
+        assert workload.q is not None
         q_lengths = self._resolve_lengths(
             workload.q_lengths, workload.batch_size, workload.seqlen_q
         )
-        kv_lengths = self._resolve_lengths(
-            workload.kv_lengths, workload.batch_size, workload.seqlen_k
-        )
         q_used = self._resolve_used_lengths(workload.q_used_lengths, q_lengths)
-        kv_used = self._resolve_used_lengths(workload.kv_used_lengths, kv_lengths)
-        q, q_padded, q_mask, q_indices, cu_q, seqused_q = self._generate_layout_tensor(
-            workload.q_layout,
+        q, q_padded, q_mask, q_indices, cu_q, seqused_q = self._generate_tensor(
+            workload.q,
             q_lengths,
             q_used,
             workload.seqlen_q,
             workload.num_heads_q,
             workload.head_dim_qk,
             workload.dtype,
+            workload.reference_dtype,
             workload.device,
             use_seqused=workload.q_used_lengths is not None,
         )
+        if workload.qv is not None:
+            qv, qv_padded, _, _, _, _ = self._generate_tensor(
+                workload.qv,
+                q_lengths,
+                q_used,
+                workload.seqlen_q,
+                workload.num_heads_q,
+                workload.head_dim_v,
+                workload.dtype,
+                workload.reference_dtype,
+                workload.device,
+            )
+        else:
+            qv = qv_padded = None
+
         learnable_sink = (
             torch.randn(
                 workload.num_heads_q, device=workload.device, dtype=workload.dtype
@@ -802,432 +1063,229 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             if workload.learnable_sink
             else None
         )
-        common = dict(
-            api=workload.api,
-            workload=workload,
-            q=q,
-            q_padded=q_padded,
-            query_padding_mask=q_mask,
-            q_indices=q_indices,
-            q_lengths=q_used,
-            cu_seqlens_q=cu_q,
-            seqused_q=seqused_q,
-            max_seqlen_q=(
-                workload.seqlen_q if workload.q_layout is FmhaLayout.RAGGED else None
-            ),
-            max_seqlen_k=workload.seqlen_k,
-            softmax_scale=(
-                workload.softmax_scale
-                if workload.softmax_scale is not None
-                else workload.head_dim_qk**-0.5
-            ),
-            causal=workload.causal,
-            window_size=workload.window_size,
-            learnable_sink=learnable_sink,
-            attention_chunk=workload.attention_chunk,
-            softcap=workload.softcap,
-            num_splits=workload.num_splits,
-            pack_gqa=workload.pack_gqa,
-            backend=workload.backend,
-            cp_world_size=workload.cp_world_size,
-            return_softmax_lse=workload.return_softmax_lse,
-            prepare_scheduler_metadata=True,
-            kv_lengths=kv_used,
-        )
-        if workload.api is FmhaApi.VARLEN:
-            k, k_padded, k_mask, k_indices, cu_k, seqused_k = (
-                self._generate_layout_tensor(
-                    workload.kv_layout,
-                    kv_lengths,
-                    kv_used,
+
+        has_direct_kv = workload.k is not None and workload.v is not None
+        has_cache = workload.k_cache is not None and workload.v_cache is not None
+        appends_kv = has_direct_kv and has_cache
+        k = v = k_padded = v_padded = None
+        k_mask = k_indices = cu_k = seqused_k = None
+        max_seqlen_k_new = 0
+        direct_lengths: tuple[int, ...] | None = None
+        direct_used: tuple[int, ...] | None = None
+        if has_direct_kv:
+            assert workload.k is not None and workload.v is not None
+            if appends_kv:
+                max_seqlen_k_new = (
+                    workload.seqlen_q
+                    if workload.seqlen_new_eq_seqlen_q
+                    else random.randint(1, workload.seqlen_q)
+                )
+                direct_lengths = (
+                    tuple(
+                        random.randint(1, max_seqlen_k_new)
+                        for _ in range(workload.batch_size)
+                    )
+                    if workload.k.layout is FmhaLayout.RAGGED
+                    else (max_seqlen_k_new,) * workload.batch_size
+                )
+                direct_used = direct_lengths
+                use_seqused_k = False
+            else:
+                direct_lengths = self._resolve_lengths(
+                    workload.kv_lengths, workload.batch_size, workload.seqlen_k
+                )
+                direct_used = self._resolve_used_lengths(
+                    workload.kv_used_lengths, direct_lengths
+                )
+                max_seqlen_k_new = 0
+                use_seqused_k = workload.kv_used_lengths is not None
+            direct_maximum = max_seqlen_k_new if appends_kv else workload.seqlen_k
+            k, k_padded, k_mask, k_indices, cu_k, seqused_k = self._generate_tensor(
+                workload.k,
+                direct_lengths,
+                direct_used,
+                direct_maximum,
+                workload.num_heads_kv,
+                workload.head_dim_qk,
+                workload.dtype,
+                workload.reference_dtype,
+                workload.device,
+                use_seqused=use_seqused_k,
+            )
+            v, v_padded, _, _, _, _ = self._generate_tensor(
+                workload.v,
+                direct_lengths,
+                direct_used,
+                direct_maximum,
+                workload.num_heads_kv,
+                workload.head_dim_v,
+                workload.dtype,
+                workload.reference_dtype,
+                workload.device,
+            )
+
+        k_cache = v_cache = None
+        k_cache_reference = v_cache_reference = None
+        page_table = cache_seqlens = cache_leftpad = cache_batch_idx = None
+        cache_lengths: tuple[int, ...] | None = None
+        num_pages = 0
+        if has_cache:
+            assert workload.k_cache is not None and workload.v_cache is not None
+            batch_size_cache = (
+                workload.batch_size * 2
+                if workload.has_cache_batch_idx
+                else workload.batch_size
+            )
+            if workload.k_cache.layout is FmhaLayout.PAGED:
+                assert workload.page_size is not None
+                (
+                    _,
+                    _,
+                    page_table,
+                    k_cache_reference,
+                    v_cache_reference,
+                    num_pages,
+                ) = generate_block_kvcache(
                     workload.seqlen_k,
+                    workload.page_size,
+                    batch_size_cache,
                     workload.num_heads_kv,
                     workload.head_dim_qk,
-                    workload.dtype,
+                    workload.head_dim_v,
                     workload.device,
-                    use_seqused=workload.kv_used_lengths is not None,
+                    workload.dtype,
+                    workload.reference_dtype,
+                    torch.randn,
                 )
-            )
-            v, v_padded, _, _, _, _ = self._generate_layout_tensor(
-                workload.kv_layout,
-                kv_lengths,
-                kv_used,
-                workload.seqlen_k,
-                workload.num_heads_kv,
-                workload.head_dim_v,
-                workload.dtype,
-                workload.device,
-                mask=k_mask,
-            )
-            return FmhaInputs(
-                **common,
-                k=k,
-                v=v,
-                k_padded=k_padded,
-                v_padded=v_padded,
-                key_padding_mask=k_mask,
-                k_indices=k_indices,
-                cu_seqlens_k=cu_k,
-                seqused_k=seqused_k,
-            )
-
-        cache_seqlens = torch.tensor(kv_used, dtype=torch.int32, device=workload.device)
-        if workload.kv_layout is FmhaLayout.PAGED:
-            assert workload.page_size is not None
-            k_dense, v_dense, page_table, k_cache, v_cache, _ = generate_block_kvcache(
-                workload.seqlen_k,
-                workload.page_size,
-                workload.batch_size,
-                workload.num_heads_kv,
-                workload.head_dim_qk,
-                workload.head_dim_v,
-                workload.device,
-                workload.dtype,
-            )
-        else:
-            k_dense = torch.randn(
-                workload.batch_size,
-                workload.seqlen_k,
-                workload.num_heads_kv,
-                workload.head_dim_qk,
-                dtype=workload.dtype,
-                device=workload.device,
-            )
-            v_dense = torch.randn(
-                workload.batch_size,
-                workload.seqlen_k,
-                workload.num_heads_kv,
-                workload.head_dim_v,
-                dtype=workload.dtype,
-                device=workload.device,
-            )
-            k_cache, v_cache, page_table = k_dense, v_dense, None
-        key_mask = self._length_mask(kv_used, workload.seqlen_k, workload.device)
-        return FmhaInputs(
-            **common,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            k_padded=k_dense,
-            v_padded=v_dense,
-            key_padding_mask=key_mask,
-            cache_seqlens=cache_seqlens,
-            page_table=page_table,
-        )
-
-    def _generate_noncontiguous(self, workload: FmhaWorkload) -> FmhaInputs:
-        assert workload.head_dim_qk is not None
-        assert workload.num_heads_kv is not None
-        total = sum(
-            self._resolve_lengths(
-                workload.q_lengths, workload.batch_size, workload.seqlen_q
-            )
-        )
-        qkv = torch.randn(
-            total,
-            3,
-            workload.num_heads_q,
-            workload.head_dim_qk,
-            device=workload.device,
-            dtype=workload.dtype,
-        )
-        q, k, v = qkv.unbind(dim=1)
-        lengths = self._resolve_lengths(
-            workload.q_lengths, workload.batch_size, workload.seqlen_q
-        )
-        cu = torch.tensor(
-            self._cumulative_lengths(lengths),
-            dtype=torch.int32,
-            device=workload.device,
-        )
-        inputs = FmhaInputs(
-            api=FmhaApi.VARLEN,
-            workload=workload,
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu,
-            cu_seqlens_k=cu,
-            max_seqlen_q=workload.seqlen_q,
-            max_seqlen_k=workload.seqlen_q,
-            backend=workload.backend,
-            return_softmax_lse=False,
-        )
-        inputs.baseline_inputs = replace(inputs, k=k.contiguous(), baseline_inputs=None)
-        return inputs
-
-    def _generate_large_stride(self, workload: FmhaWorkload) -> FmhaInputs:
-        assert workload.head_dim_qk is not None
-        assert workload.num_heads_kv is not None
-
-        def make_view(
-            num_heads: int, head_dim: int
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            base = torch.randn(
-                workload.seqlen_q,
-                num_heads,
-                head_dim,
-                device=workload.device,
-                dtype=workload.dtype,
-            )
-            view = base.as_strided(
-                (1, workload.seqlen_q, num_heads, head_dim),
-                (2**31 + 1024, num_heads * head_dim, head_dim, 1),
-            )
-            return view, base.unsqueeze(0).contiguous()
-
-        q, q_regular = make_view(workload.num_heads_q, workload.head_dim_qk)
-        k, k_regular = make_view(workload.num_heads_kv, workload.head_dim_qk)
-        v, v_regular = make_view(workload.num_heads_kv, workload.head_dim_v)
-        inputs = FmhaInputs(
-            api=FmhaApi.VARLEN,
-            workload=workload,
-            q=q,
-            k=k,
-            v=v,
-            backend=workload.backend,
-            return_softmax_lse=False,
-        )
-        inputs.baseline_inputs = replace(
-            inputs,
-            q=q_regular,
-            k=k_regular,
-            v=v_regular,
-            baseline_inputs=None,
-        )
-        return inputs
-
-    def _generate_advanced(self, workload: FmhaWorkload) -> FmhaInputs:
-        assert workload.seqlen_k is not None
-        assert workload.num_heads_kv is not None
-        assert workload.head_dim_qk is not None
-        if hasattr(torch, "musa"):
-            gc.collect()
-            torch.musa.empty_cache()
-        input_dtype = workload.dtype
-        ref_dtype = workload.reference_dtype
-        q_ref = (
-            torch.randn(
-                workload.batch_size,
-                workload.seqlen_q,
-                workload.num_heads_q,
-                workload.head_dim_qk,
-                device=workload.device,
-                dtype=ref_dtype,
-            )
-            .to(input_dtype)
-            .to(ref_dtype)
-        )
-        qv_ref = (
-            torch.randn(
-                workload.batch_size,
-                workload.seqlen_q,
-                workload.num_heads_q,
-                workload.head_dim_v,
-                device=workload.device,
-                dtype=ref_dtype,
-            )
-            .to(input_dtype)
-            .to(ref_dtype)
-            if workload.has_qv
-            else None
-        )
-        if workload.q_layout is FmhaLayout.RAGGED:
-            q_mask = generate_random_padding_mask(
-                workload.seqlen_q, workload.batch_size, workload.device, mode="random"
-            )
-            q_unpadded, q_indices, cu_q, max_q, *_ = unpad_input(q_ref, q_mask)
-            q_actual = q_unpadded.to(input_dtype)
-            qv_actual = (
-                qv_ref.reshape(-1, *qv_ref.shape[2:])[q_indices].to(input_dtype)
-                if qv_ref is not None
+            else:
+                k_cache_reference = self._generate_reference_tensor(
+                    (
+                        batch_size_cache,
+                        workload.seqlen_k,
+                        workload.num_heads_kv,
+                        workload.head_dim_qk,
+                    ),
+                    workload,
+                )
+                v_cache_reference = self._generate_reference_tensor(
+                    (
+                        batch_size_cache,
+                        workload.seqlen_k,
+                        workload.num_heads_kv,
+                        workload.head_dim_v,
+                    ),
+                    workload,
+                )
+            k_cache = workload.k_cache.init(k_cache_reference.to(workload.dtype))
+            v_cache = workload.v_cache.init(v_cache_reference.to(workload.dtype))
+            cache_batch_idx = (
+                torch.randperm(
+                    batch_size_cache,
+                    dtype=torch.int32,
+                    device=workload.device,
+                )[: workload.batch_size]
+                if workload.has_cache_batch_idx
                 else None
             )
-        else:
-            q_mask, q_indices, cu_q = None, None, None
-            max_q = workload.seqlen_q
-            q_actual = q_ref.to(input_dtype)
-            qv_actual = qv_ref.to(input_dtype) if qv_ref is not None else None
 
-        seqlen_new = (
-            workload.seqlen_q
-            if workload.seqlen_new_eq_seqlen_q
-            else random.randint(1, workload.seqlen_q)
-        )
-        if workload.new_kv:
-            k_new_ref = (
-                torch.randn(
-                    workload.batch_size,
-                    seqlen_new,
-                    workload.num_heads_kv,
-                    workload.head_dim_qk,
-                    device=workload.device,
-                    dtype=ref_dtype,
+            if appends_kv:
+                effective_local = (
+                    workload.window_size not in ((None, None), (-1, -1))
+                    or workload.attention_chunk > 0
                 )
-                .to(input_dtype)
-                .to(ref_dtype)
-            )
-            v_new_ref = (
-                torch.randn(
-                    workload.batch_size,
-                    seqlen_new,
-                    workload.num_heads_kv,
-                    workload.head_dim_v,
-                    device=workload.device,
-                    dtype=ref_dtype,
+                rotary_dim = (
+                    math.floor(workload.rotary_fraction * workload.head_dim_qk / 16)
+                    * 16
                 )
-                .to(input_dtype)
-                .to(ref_dtype)
-            )
-            if workload.q_layout is FmhaLayout.RAGGED:
-                key_new_mask = generate_random_padding_mask(
-                    seqlen_new, workload.batch_size, workload.device, mode="random"
+                cache_upper = (
+                    workload.seqlen_k
+                    - (
+                        workload.seqlen_q
+                        if (workload.causal or effective_local) and rotary_dim > 1
+                        else max_seqlen_k_new
+                    )
+                    + 1
                 )
-                k_actual, k_indices, cu_k_new, *_ = unpad_input(k_new_ref, key_new_mask)
-                v_actual, *_ = unpad_input(v_new_ref, key_new_mask)
+                cache_lengths = tuple(
+                    random.randrange(max(cache_upper, 1))
+                    for _ in range(workload.batch_size)
+                )
             else:
-                key_new_mask, k_indices, cu_k_new = None, None, None
-                k_actual, v_actual = k_new_ref, v_new_ref
-            k_actual = k_actual.to(input_dtype)
-            v_actual = v_actual.to(input_dtype)
-        else:
-            k_new_ref = v_new_ref = None
-            k_actual = v_actual = None
-            key_new_mask = k_indices = cu_k_new = None
+                configured_cache_lengths = self._resolve_lengths(
+                    workload.kv_lengths, workload.batch_size, workload.seqlen_k
+                )
+                cache_lengths = self._resolve_used_lengths(
+                    workload.kv_used_lengths, configured_cache_lengths
+                )
+            cache_seqlens = torch.tensor(
+                cache_lengths,
+                dtype=torch.int32,
+                device=workload.device,
+            )
+            cache_leftpad = self._generate_cache_leftpad(workload, cache_lengths)
 
-        batch_size_cache = (
-            workload.batch_size * 2
-            if workload.has_cache_batch_idx
-            else workload.batch_size
-        )
-        if workload.kv_layout is FmhaLayout.PAGED:
-            assert workload.page_size is not None
-            _, _, page_table, k_cache, v_cache, num_pages = generate_block_kvcache(
-                workload.seqlen_k,
-                workload.page_size,
-                batch_size_cache,
-                workload.num_heads_kv,
-                workload.head_dim_qk,
-                workload.head_dim_v,
-                workload.device,
-                input_dtype,
-                ref_dtype,
-                torch.randn,
+        key_padding_mask = k_mask
+        if has_cache:
+            assert cache_lengths is not None
+            arange = torch.arange(workload.seqlen_k, device=workload.device).reshape(
+                1, -1
             )
-        else:
-            k_cache = (
-                torch.randn(
-                    batch_size_cache,
-                    workload.seqlen_k,
-                    workload.num_heads_kv,
-                    workload.head_dim_qk,
-                    device=workload.device,
-                    dtype=ref_dtype,
+            final_cache_lengths: Sequence[int] | torch.Tensor = cache_lengths
+            if appends_kv:
+                assert direct_lengths is not None
+                final_cache_lengths = torch.tensor(
+                    cache_lengths, dtype=torch.int32, device=workload.device
+                ) + torch.tensor(
+                    direct_lengths, dtype=torch.int32, device=workload.device
                 )
-                .to(input_dtype)
-                .to(ref_dtype)
-            )
-            v_cache = (
-                torch.randn(
-                    batch_size_cache,
-                    workload.seqlen_k,
-                    workload.num_heads_kv,
-                    workload.head_dim_v,
-                    device=workload.device,
-                    dtype=ref_dtype,
-                )
-                .to(input_dtype)
-                .to(ref_dtype)
-            )
-            page_table, num_pages = None, 0
+            key_padding_mask = arange < torch.as_tensor(
+                final_cache_lengths,
+                dtype=torch.int32,
+                device=workload.device,
+            ).reshape(-1, 1)
+            if cache_leftpad is not None:
+                key_padding_mask &= arange >= cache_leftpad.unsqueeze(-1)
 
         rotary_dim = (
             math.floor(workload.rotary_fraction * workload.head_dim_qk / 16) * 16
         )
-        effective_local = (
-            workload.window_size not in ((None, None), (-1, -1))
-            or workload.attention_chunk > 0
-        )
-        cache_upper = (
-            workload.seqlen_k
-            - (
-                workload.seqlen_q
-                if (workload.causal or effective_local) and rotary_dim > 1
-                else seqlen_new
-            )
-            + 1
-        )
-        cache_seqlens = torch.randint(
-            0 if workload.new_kv else 1,
-            max(cache_upper if workload.new_kv else workload.seqlen_k + 1, 1),
-            (workload.batch_size,),
-            dtype=torch.int32,
-            device=workload.device,
-        )
-        if workload.has_cache_leftpad:
-            if is_fake_mode():
-                cache_leftpad = torch.empty(
-                    workload.batch_size, dtype=torch.int32, device=workload.device
-                )
-            else:
-                cache_leftpad = torch.cat(
-                    [
-                        torch.randint(
-                            0,
-                            int(cache_seqlens[index].item()),
-                            (1,),
-                            dtype=torch.int32,
-                            device=workload.device,
-                        )
-                        if cache_seqlens[index].item() > 0
-                        else torch.zeros(1, dtype=torch.int32, device=workload.device)
-                        for index in range(workload.batch_size)
-                    ]
-                )
-        else:
-            cache_leftpad = None
-        cache_batch_idx = (
-            torch.randperm(batch_size_cache, dtype=torch.int32, device=workload.device)[
-                : workload.batch_size
-            ]
-            if workload.has_cache_batch_idx
-            else None
-        )
-        arange = torch.arange(workload.seqlen_k, device=workload.device).reshape(1, -1)
-        cache_expanded = cache_seqlens.reshape(-1, 1)
-        if workload.new_kv:
-            new_lengths: int | torch.Tensor = (
-                key_new_mask.sum(-1, keepdim=True)
-                if key_new_mask is not None
-                else seqlen_new
-            )
-            key_mask = arange < cache_expanded + new_lengths
-        else:
-            key_mask = arange < cache_expanded
-        if cache_leftpad is not None:
-            key_mask = key_mask & (arange >= cache_leftpad.unsqueeze(-1))
-
         rotary_seqlens = (
             cache_seqlens // 2 if workload.has_rotary_seqlens else cache_seqlens
         )
         if rotary_dim > 0:
+            rotary_length = (
+                num_pages * workload.page_size
+                if workload.page_size is not None
+                else workload.seqlen_k
+            )
             angle = (
                 torch.rand(
-                    workload.seqlen_k
-                    if workload.page_size is None
-                    else num_pages * workload.page_size,
+                    rotary_length,
                     rotary_dim // 2,
                     device=workload.device,
                 )
                 * 2
                 * math.pi
             )
-            cos_ref = torch.cos(angle).to(ref_dtype).to(input_dtype).to(ref_dtype)
-            sin_ref = torch.sin(angle).to(ref_dtype).to(input_dtype).to(ref_dtype)
-            cos_actual, sin_actual = cos_ref.to(input_dtype), sin_ref.to(input_dtype)
+            rotary_cos_reference = (
+                torch.cos(angle)
+                .to(workload.reference_dtype)
+                .to(workload.dtype)
+                .to(workload.reference_dtype)
+            )
+            rotary_sin_reference = (
+                torch.sin(angle)
+                .to(workload.reference_dtype)
+                .to(workload.dtype)
+                .to(workload.reference_dtype)
+            )
+            rotary_cos = rotary_cos_reference.to(workload.dtype)
+            rotary_sin = rotary_sin_reference.to(workload.dtype)
         else:
-            cos_ref = sin_ref = cos_actual = sin_actual = None
+            rotary_cos = rotary_sin = None
+            rotary_cos_reference = rotary_sin_reference = None
 
-        if input_dtype == torch.float8_e4m3fn:
+        if workload.dtype in _FP8_DTYPES:
             q_descale, k_descale, v_descale = [
                 torch.rand(
                     workload.batch_size,
@@ -1240,62 +1298,77 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             ]
         else:
             q_descale = k_descale = v_descale = None
+
         return FmhaInputs(
-            api=FmhaApi.KVCACHE,
+            api=workload.api,
             workload=workload,
-            q=q_actual,
-            q_padded=q_ref,
-            qv=qv_actual,
-            qv_padded=qv_ref,
-            k=k_actual,
-            v=v_actual,
-            k_padded=k_new_ref,
-            v_padded=v_new_ref,
-            k_cache=k_cache.to(input_dtype),
-            v_cache=v_cache.to(input_dtype),
-            k_cache_reference=k_cache,
-            v_cache_reference=v_cache,
+            q=q,
+            q_padded=q_padded,
+            qv=qv,
+            qv_padded=qv_padded,
+            k=k,
+            v=v,
+            k_padded=k_padded,
+            v_padded=v_padded,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_cache_reference=k_cache_reference,
+            v_cache_reference=v_cache_reference,
             query_padding_mask=q_mask,
-            key_padding_mask=key_mask,
-            key_new_padding_mask=key_new_mask,
+            key_padding_mask=key_padding_mask,
+            key_new_padding_mask=k_mask if appends_kv else None,
             q_indices=q_indices,
             k_indices=k_indices,
+            q_lengths=q_lengths,
             cu_seqlens_q=cu_q,
-            cu_seqlens_k_new=cu_k_new,
-            max_seqlen_q=max_q,
+            cu_seqlens_k=None if appends_kv else cu_k,
+            cu_seqlens_k_new=cu_k if appends_kv else None,
+            seqused_q=seqused_q,
+            seqused_k=None if appends_kv else seqused_k,
+            max_seqlen_q=(
+                workload.seqlen_q if workload.q.layout is FmhaLayout.RAGGED else None
+            ),
             max_seqlen_k=workload.seqlen_k,
-            max_seqlen_k_new=seqlen_new if workload.new_kv else 0,
+            max_seqlen_k_new=max_seqlen_k_new,
             cache_seqlens=cache_seqlens,
             cache_batch_idx=cache_batch_idx,
             cache_leftpad=cache_leftpad,
             page_table=page_table,
-            rotary_cos=cos_actual,
-            rotary_sin=sin_actual,
-            rotary_cos_reference=cos_ref,
-            rotary_sin_reference=sin_ref,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            rotary_cos_reference=rotary_cos_reference,
+            rotary_sin_reference=rotary_sin_reference,
             rotary_seqlens=(
                 rotary_seqlens
-                if (not workload.has_qv or workload.has_rotary_seqlens)
+                if (workload.qv is None or workload.has_rotary_seqlens)
                 else None
             ),
+            # QV kernels without an explicit rotary_seqlens use cache_seqlens as
+            # their offset. The reference still needs that resolved value.
+            rotary_seqlens_reference=rotary_seqlens,
             rotary_dim=rotary_dim,
             rotary_interleaved=workload.rotary_interleaved,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            softmax_scale=workload.softmax_scale,
             causal=workload.causal,
             window_size=workload.window_size,
+            learnable_sink=learnable_sink,
             attention_chunk=workload.attention_chunk,
             softcap=workload.softcap,
             num_splits=workload.num_splits,
             pack_gqa=workload.pack_gqa,
+            backend=workload.backend,
+            cp_world_size=workload.cp_world_size,
             only_qv=workload.only_qv,
-            return_softmax_lse=True,
+            return_softmax_lse=workload.return_softmax_lse,
             prepare_scheduler_metadata=True,
+            kv_lengths=(cache_lengths if has_cache else direct_lengths),
         )
 
     def _generate_combine(self, workload: FmhaWorkload) -> FmhaInputs:
-        if workload.q_layout is FmhaLayout.RAGGED:
+        if workload.combine_layout is FmhaLayout.RAGGED:
             q_lengths = tuple(
                 random.randint(1, workload.seqlen_q) for _ in range(workload.batch_size)
             )
@@ -1332,7 +1405,7 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
                     dtype=torch.int32,
                     device=workload.device,
                 )
-                if workload.q_layout is FmhaLayout.PADDED
+                if workload.combine_layout is FmhaLayout.PADDED
                 else None
             )
         out_partial = torch.randn(
@@ -1352,7 +1425,7 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         )
         if not is_fake_mode():
             for batch_index, split_count in enumerate(valid_splits):
-                if workload.q_layout is FmhaLayout.RAGGED:
+                if workload.combine_layout is FmhaLayout.RAGGED:
                     assert cu_q is not None
                     start = int(cu_q[batch_index].item())
                     end = int(cu_q[batch_index + 1].item())
@@ -1388,17 +1461,17 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         )
 
     @staticmethod
-    def _generate_layout_tensor(
-        layout: FmhaLayout,
+    def _generate_tensor(
+        spec: FmhaTensorSpec,
         lengths: tuple[int, ...],
         used_lengths: tuple[int, ...],
         maximum: int,
         num_heads: int,
         head_dim: int,
         dtype: torch.dtype,
+        reference_dtype: torch.dtype,
         device: str | torch.device,
         *,
-        mask: torch.Tensor | None = None,
         use_seqused: bool = False,
     ) -> tuple[
         torch.Tensor,
@@ -1408,32 +1481,72 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        random_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-        padded = torch.randn(
-            len(lengths),
-            maximum,
-            num_heads,
-            head_dim,
-            dtype=random_dtype,
-            device=device,
-        ).to(dtype)
-        if layout is FmhaLayout.NORMAL:
-            return padded, padded, None, None, None, None
-        if mask is None:
-            mask = FmhaOperator._length_mask(used_lengths, maximum, device)
+        padded = (
+            torch.randn(
+                len(lengths),
+                maximum,
+                num_heads,
+                head_dim,
+                dtype=reference_dtype,
+                device=device,
+            )
+            .to(dtype)
+            .to(reference_dtype)
+        )
+        if spec.layout is FmhaLayout.NORMAL:
+            return spec.init(padded.to(dtype)), padded, None, None, None, None
+        used_mask = FmhaOperator._length_mask(used_lengths, maximum, device)
         seqused = torch.tensor(used_lengths, dtype=torch.int32, device=device)
-        if layout is FmhaLayout.PADDED:
-            return padded, padded, mask, None, None, seqused
-        if layout is not FmhaLayout.RAGGED:
-            raise ValueError(f"unsupported tensor layout: {layout.value}")
-        unpadded, indices, cu_seqlens, _, *_ = unpad_input(padded, mask)
+        if spec.layout is FmhaLayout.PADDED:
+            return spec.init(padded.to(dtype)), padded, used_mask, None, None, seqused
+        if spec.layout is not FmhaLayout.RAGGED:
+            raise ValueError(f"unsupported tensor layout: {spec.layout.value}")
+        # cu_seqlens describes packed storage; seqused limits the logical prefix.
+        storage_mask = FmhaOperator._length_mask(lengths, maximum, device)
+        unused_mask = storage_mask & ~used_mask
+        unpadded, indices, cu_seqlens, _, generated_seqused = unpad_input(
+            padded, used_mask, unused_mask
+        )
         return (
-            unpadded,
+            spec.init(unpadded.to(dtype)),
             padded,
-            mask,
+            used_mask,
             indices,
             cu_seqlens,
-            seqused if use_seqused else None,
+            generated_seqused if use_seqused else None,
+        )
+
+    @staticmethod
+    def _generate_reference_tensor(
+        shape: tuple[int, ...], workload: FmhaWorkload
+    ) -> torch.Tensor:
+        return (
+            torch.randn(
+                shape,
+                dtype=workload.reference_dtype,
+                device=workload.device,
+            )
+            .to(workload.dtype)
+            .to(workload.reference_dtype)
+        )
+
+    @staticmethod
+    def _generate_cache_leftpad(
+        workload: FmhaWorkload,
+        cache_lengths: Sequence[int],
+    ) -> torch.Tensor | None:
+        if not workload.has_cache_leftpad:
+            return None
+        if is_fake_mode():
+            return torch.empty(
+                workload.batch_size,
+                dtype=torch.int32,
+                device=workload.device,
+            )
+        return torch.tensor(
+            [random.randrange(length) if length > 0 else 0 for length in cache_lengths],
+            dtype=torch.int32,
+            device=workload.device,
         )
 
     @staticmethod
@@ -1521,11 +1634,7 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             raise ValueError("scheduler metadata requires K and V")
         max_seqlen_k = inputs.max_seqlen_k or kv.shape[1]
         page_size = kv.shape[1] if inputs.page_table is not None else None
-        batch_rounded = (batch_size + 3) // 4 * 4
-        empty_metadata = torch.empty(
-            4 * batch_rounded, dtype=torch.int32, device=inputs.q.device
-        )
-        return empty_if_dry_run(get_scheduler_metadata, empty_values=empty_metadata)(
+        return get_scheduler_metadata(
             batch_size=batch_size,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
@@ -1557,83 +1666,54 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
         )
 
     def _reference_attention(self, inputs: FmhaInputs) -> FmhaReference:
-        if (
-            inputs.q_padded is None
-            or inputs.k_padded is None
-            or inputs.v_padded is None
-        ):
-            raise ValueError("attention reference requires padded Q, K, and V")
-        out_ref, _, score_ref = attention_ref(
-            inputs.q_padded,
-            inputs.k_padded,
-            inputs.v_padded,
-            query_padding_mask=inputs.query_padding_mask,
-            key_padding_mask=inputs.key_padding_mask,
-            causal=inputs.causal,
-            window_size=inputs.window_size,
-            attention_chunk=inputs.attention_chunk,
-            learnable_sink=inputs.learnable_sink,
-            softcap=inputs.softcap,
-        )
-        lse_unpadded, lse_padded = lse_ref_from_score(
-            score_ref,
-            is_causal=inputs.causal,
-            cu_seqlens_q=inputs.cu_seqlens_q,
-            cu_seqlens_k=inputs.cu_seqlens_k,
-            seqused_q=inputs.seqused_q,
-            seqused_k=(
-                inputs.seqused_k
-                if inputs.api is FmhaApi.VARLEN
-                else inputs.cache_seqlens
-            ),
-            learnable_sink=inputs.learnable_sink,
-        )
-        if inputs.q is not None and inputs.q.dim() == 3:
-            if inputs.q_indices is None:
-                raise ValueError("ragged reference requires q_indices")
-            out_ref = out_ref.reshape(-1, *out_ref.shape[2:])[inputs.q_indices]
-            lse_ref = lse_unpadded
-        else:
-            lse_ref = lse_padded
-        self._register_dump_reference(out_ref, lse_ref)
-        return FmhaReference(out=out_ref, lse=lse_ref)
-
-    def _reference_advanced(self, inputs: FmhaInputs) -> FmhaReference:
         if inputs.workload is None or inputs.q_padded is None:
-            raise ValueError("advanced reference requires its workload and padded q")
+            raise ValueError("attention reference requires its workload and padded q")
         workload = inputs.workload
-        k_cache_source = (
-            inputs.k_cache_reference
-            if inputs.k_cache_reference is not None
-            else inputs.k_cache
-        )
-        v_cache_source = (
-            inputs.v_cache_reference
-            if inputs.v_cache_reference is not None
-            else inputs.v_cache
-        )
-        k_cache = self._logical_cache(k_cache_source, inputs.page_table).to(
-            workload.reference_dtype
-        )[:, : workload.seqlen_k]
-        v_cache = self._logical_cache(v_cache_source, inputs.page_table).to(
-            workload.reference_dtype
-        )[:, : workload.seqlen_k]
-        if inputs.cache_batch_idx is not None:
-            indices = inputs.cache_batch_idx.long()
-            k_cache = k_cache[indices].clone()
-            v_cache = v_cache[indices].clone()
+        has_cache = inputs.k_cache is not None and inputs.v_cache is not None
+        appends_kv = has_cache and inputs.k_padded is not None
+        if has_cache:
+            k_cache_source = (
+                inputs.k_cache_reference
+                if inputs.k_cache_reference is not None
+                else inputs.k_cache
+            )
+            v_cache_source = (
+                inputs.v_cache_reference
+                if inputs.v_cache_reference is not None
+                else inputs.v_cache
+            )
+            k_ref = self._logical_cache(k_cache_source, inputs.page_table).to(
+                workload.reference_dtype
+            )[:, : workload.seqlen_k]
+            v_ref = self._logical_cache(v_cache_source, inputs.page_table).to(
+                workload.reference_dtype
+            )[:, : workload.seqlen_k]
+            if inputs.cache_batch_idx is not None:
+                indices = inputs.cache_batch_idx.long()
+                k_ref = k_ref[indices].clone()
+                v_ref = v_ref[indices].clone()
+            else:
+                k_ref = k_ref[: workload.batch_size].clone()
+                v_ref = v_ref[: workload.batch_size].clone()
         else:
-            k_cache = k_cache[: workload.batch_size].clone()
-            v_cache = v_cache[: workload.batch_size].clone()
+            if inputs.k_padded is None or inputs.v_padded is None:
+                raise ValueError("attention reference requires logical K and V")
+            k_ref = inputs.k_padded
+            v_ref = inputs.v_padded
 
         q_ref = inputs.q_padded
         k_new = inputs.k_padded
         v_new = inputs.v_padded
         if inputs.rotary_dim > 0:
+            rotary_seqlens_reference = (
+                inputs.rotary_seqlens_reference
+                if inputs.rotary_seqlens_reference is not None
+                else inputs.rotary_seqlens
+            )
             if (
                 inputs.rotary_cos_reference is None
                 or inputs.rotary_sin_reference is None
-                or inputs.rotary_seqlens is None
+                or rotary_seqlens_reference is None
             ):
                 raise ValueError("rotary reference requires cos, sin, and seqlens")
             effective_local = (
@@ -1645,7 +1725,7 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
                     q_ref,
                     inputs.rotary_cos_reference,
                     inputs.rotary_sin_reference,
-                    seqlen_offsets=inputs.rotary_seqlens,
+                    seqlen_offsets=rotary_seqlens_reference,
                     interleaved=inputs.rotary_interleaved,
                 )
             else:
@@ -1654,7 +1734,7 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
                         rearrange(q_ref, "b s h d -> b 1 (s h) d"),
                         inputs.rotary_cos_reference,
                         inputs.rotary_sin_reference,
-                        seqlen_offsets=inputs.rotary_seqlens,
+                        seqlen_offsets=rotary_seqlens_reference,
                         interleaved=inputs.rotary_interleaved,
                     ),
                     "b 1 (s h) d -> b s h d",
@@ -1665,11 +1745,11 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
                     k_new,
                     inputs.rotary_cos_reference,
                     inputs.rotary_sin_reference,
-                    seqlen_offsets=inputs.rotary_seqlens,
+                    seqlen_offsets=rotary_seqlens_reference,
                     interleaved=inputs.rotary_interleaved,
                 )
 
-        if workload.new_kv:
+        if appends_kv:
             if (
                 k_new is None
                 or v_new is None
@@ -1693,13 +1773,13 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             if inputs.k_indices is not None:
                 k_update = k_update[inputs.k_indices]
                 v_update = v_update[inputs.k_indices]
-            k_cache[update_mask] = k_update
-            v_cache[update_mask] = v_update
+            k_ref[update_mask] = k_update
+            v_ref[update_mask] = v_update
 
-        out_ref, _, _ = attention_ref(
+        high_precision_out, _, score_ref = attention_ref(
             q_ref,
-            k_cache,
-            v_cache,
+            k_ref,
+            v_ref,
             query_padding_mask=inputs.query_padding_mask,
             key_padding_mask=inputs.key_padding_mask,
             key_leftpad=inputs.cache_leftpad,
@@ -1710,41 +1790,106 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
             v_descale=inputs.v_descale,
             window_size=inputs.window_size,
             attention_chunk=inputs.attention_chunk,
+            learnable_sink=inputs.learnable_sink,
             softcap=inputs.softcap,
             only_qv=inputs.only_qv,
+            softmax_scale=inputs.softmax_scale,
         )
-        baseline_out, _, _ = attention_ref(
-            q_ref,
-            k_cache,
-            v_cache,
-            query_padding_mask=inputs.query_padding_mask,
-            key_padding_mask=inputs.key_padding_mask,
-            key_leftpad=inputs.cache_leftpad,
-            causal=inputs.causal,
-            qv=inputs.qv_padded,
-            q_descale=inputs.q_descale,
-            k_descale=inputs.k_descale,
-            v_descale=inputs.v_descale,
-            window_size=inputs.window_size,
-            attention_chunk=inputs.attention_chunk,
-            softcap=inputs.softcap,
-            upcast=False,
-            reorder_ops=True,
-            intermediate_dtype=(
-                workload.dtype if workload.dtype == torch.float8_e4m3fn else None
-            ),
-            only_qv=inputs.only_qv,
-        )
+        if workload.verify_mode is FmhaVerifyMode.DIFF:
+            out_ref, _, _ = attention_ref(
+                q_ref,
+                k_ref,
+                v_ref,
+                query_padding_mask=inputs.query_padding_mask,
+                key_padding_mask=inputs.key_padding_mask,
+                key_leftpad=inputs.cache_leftpad,
+                causal=inputs.causal,
+                qv=inputs.qv_padded,
+                q_descale=inputs.q_descale,
+                k_descale=inputs.k_descale,
+                v_descale=inputs.v_descale,
+                window_size=inputs.window_size,
+                attention_chunk=inputs.attention_chunk,
+                learnable_sink=inputs.learnable_sink,
+                softcap=inputs.softcap,
+                upcast=False,
+                reorder_ops=True,
+                intermediate_dtype=(
+                    workload.dtype if workload.dtype in _FP8_DTYPES else None
+                ),
+                only_qv=inputs.only_qv,
+                softmax_scale=inputs.softmax_scale,
+            )
+        else:
+            out_ref = high_precision_out
+
         if inputs.q_indices is not None:
+            high_precision_out = high_precision_out.reshape(
+                -1, *high_precision_out.shape[2:]
+            )[inputs.q_indices]
             out_ref = out_ref.reshape(-1, *out_ref.shape[2:])[inputs.q_indices]
-            baseline_out = baseline_out.reshape(-1, *baseline_out.shape[2:])[
-                inputs.q_indices
-            ]
+
+        lse_ref = None
+        if (
+            workload.verify_mode is FmhaVerifyMode.THREASHOLD
+            and inputs.return_softmax_lse
+        ):
+            lse_seqused_k = inputs.seqused_k
+            if has_cache:
+                if isinstance(inputs.cache_seqlens, torch.Tensor):
+                    lse_seqused_k = inputs.cache_seqlens
+                elif isinstance(inputs.cache_seqlens, int):
+                    lse_seqused_k = torch.full(
+                        (workload.batch_size,),
+                        inputs.cache_seqlens,
+                        dtype=torch.int32,
+                        device=score_ref.device,
+                    )
+                else:
+                    lse_seqused_k = None
+                if appends_kv and lse_seqused_k is not None:
+                    new_lengths = (
+                        inputs.key_new_padding_mask.sum(-1)
+                        if inputs.key_new_padding_mask is not None
+                        else inputs.max_seqlen_k_new
+                    )
+                    lse_seqused_k = lse_seqused_k + new_lengths
+            _, lse_padded = lse_ref_from_score(
+                score_ref,
+                is_causal=inputs.causal,
+                cu_seqlens_q=inputs.cu_seqlens_q,
+                cu_seqlens_k=inputs.cu_seqlens_k,
+                seqused_q=inputs.seqused_q,
+                seqused_k=lse_seqused_k,
+                learnable_sink=inputs.learnable_sink,
+            )
+            if inputs.q_indices is not None:
+                lse_ref = lse_padded.permute(0, 2, 1).reshape(-1, lse_padded.shape[1])[
+                    inputs.q_indices
+                ]
+                lse_ref = lse_ref.transpose(0, 1)
+            else:
+                lse_ref = lse_padded
+            self._register_dump_reference(out_ref, lse_ref)
+
         return FmhaReference(
             out=out_ref,
-            baseline_out=baseline_out,
-            expected_k_cache=k_cache.to(workload.dtype).to(workload.reference_dtype),
-            expected_v_cache=v_cache.to(workload.dtype).to(workload.reference_dtype),
+            lse=lse_ref,
+            high_precision_out=(
+                high_precision_out
+                if workload.verify_mode is FmhaVerifyMode.DIFF
+                else None
+            ),
+            expected_k_cache=(
+                k_ref.to(workload.dtype).to(workload.reference_dtype)
+                if appends_kv
+                else None
+            ),
+            expected_v_cache=(
+                v_ref.to(workload.dtype).to(workload.reference_dtype)
+                if appends_kv
+                else None
+            ),
         )
 
     @staticmethod
@@ -1785,13 +1930,17 @@ class FmhaOperator(Operator[FmhaWorkload, FmhaInputs, FmhaOutputs, FmhaReference
 
 __all__ = [
     "FmhaApi",
-    "FmhaInputMode",
     "FmhaInputs",
     "FmhaLayout",
     "FmhaOperator",
     "FmhaOutputs",
     "FmhaReference",
+    "FmhaTensorInitializer",
+    "FmhaTensorSpec",
     "FmhaVerifyMode",
     "FmhaWorkload",
     "UnsupportedFmhaWorkload",
+    "large_stride_tensor_init",
+    "noncontiguous_tensor_init",
+    "default_tensor_init",
 ]

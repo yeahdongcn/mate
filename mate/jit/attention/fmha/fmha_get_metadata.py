@@ -19,7 +19,7 @@ from .fmha_utils import (
     _resolve_mask,
     round_multiple,
 )
-from ....execution_context import raise_complete_if_dry_run
+from ....execution_context import skip_kernel_launch_if_dry_run
 
 
 def _fmha_get_metadata_encode(config: Mapping[str, object]) -> str:
@@ -374,6 +374,7 @@ def _fmha_get_metadata(
         headdim_v_rounded,
         consumers_qk,
         consumers_pv,
+        tile_head_dim,
         enable_packgqa,
     ) = _get_metadata_kernel_config(
         max_seqlen_q,
@@ -387,7 +388,9 @@ def _fmha_get_metadata(
         is_local and attention_chunk != 0,
     )
 
-    packgqa = enable_packgqa if kernel_packgqa is None else kernel_packgqa
+    packgqa = (
+        enable_packgqa  # here packgqa may turn off if headdim is not 128-bit aligned.
+    )
     # num_warps = 1 << (math.ceil(batch_size / 31) - 1).bit_length()
     num_warps = min(math.ceil(batch_size / 31), 32)
     constexpr_dict = {
@@ -410,30 +413,28 @@ def _fmha_get_metadata(
     dispatch_name, mod = _fmha_metadata_module(constexpr_dict)
     fmha_metadata_impl = mod.get_function(dispatch_name)
 
-    # Exit in dry run
-    raise_complete_if_dry_run()
-
-    fmha_metadata_impl(
-        batch_size,
-        num_heads_q,
-        num_heads_kv,
-        headdim,
-        headdim_v,
-        max_seqlen_q,
-        max_seqlen_k,
-        max_seqlen_k_new,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        cu_seqlens_k_new,
-        window_size_left,
-        window_size_right,
-        leftpad_k,
-        metadata,
-        num_splits,
-        tile_m,
-        tile_n,
-        mp_margin,
-    )
+    if not skip_kernel_launch_if_dry_run():
+        fmha_metadata_impl(
+            batch_size,
+            num_heads_q,
+            num_heads_kv,
+            headdim,
+            headdim_v,
+            max_seqlen_q,
+            max_seqlen_k,
+            max_seqlen_k_new,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            cu_seqlens_k_new,
+            window_size_left,
+            window_size_right,
+            leftpad_k,
+            metadata,
+            num_splits,
+            tile_m,
+            tile_n,
+            mp_margin,
+        )
     return metadata

@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager, nullcontext
-from functools import wraps, lru_cache
-from typing import Any, Callable
+from functools import lru_cache, wraps
+from typing import Any, Callable, ContextManager, TypeVar
 
-import torch
 from torch._guards import active_fake_mode
 
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -22,14 +21,22 @@ def is_dry_run_enabled() -> bool:
     return os.environ.get(MATE_DRY_RUN_ENV, "0") == "1"
 
 
+def _fake_tensor_mode(
+    allow_non_fake_inputs: bool = False,
+) -> ContextManager[Any]:
+    if active_fake_mode() is not None:
+        return nullcontext()
+    return FakeTensorMode(allow_non_fake_inputs=allow_non_fake_inputs)
+
+
 @contextmanager
-def dry_run_context():
+def dry_run_context(allow_non_fake_inputs: bool = False):
     """Enable MATE dry-run behavior and fake tensors for one execution scope."""
     previous = os.environ.get(MATE_DRY_RUN_ENV)
     os.environ[MATE_DRY_RUN_ENV] = "1"
     is_dry_run_enabled.cache_clear()
     try:
-        with FakeTensorMode():
+        with _fake_tensor_mode(allow_non_fake_inputs=allow_non_fake_inputs):
             yield
     finally:
         if previous is None:
@@ -37,24 +44,6 @@ def dry_run_context():
         else:
             os.environ[MATE_DRY_RUN_ENV] = previous
         is_dry_run_enabled.cache_clear()
-
-
-def maybe_fake_tensor_mode(fake: bool = True):
-    """
-    One way to populate/pre-compile cache is to use torch fake tensor mode,
-    which does not allocate actual GPU tensors but retains tensor shape/dtype
-    metadata for cute.compile.
-    """
-
-    def decorator(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            with FakeTensorMode() if fake else nullcontext():
-                return fn(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
 
 
 def is_fake_mode() -> bool:
@@ -66,22 +55,34 @@ def raise_complete_if_dry_run():
         raise MateDryRunComplete
 
 
-def empty_if_dry_run(
-    fn: Callable[..., torch.Tensor],
+def skip_kernel_launch_if_dry_run() -> bool:
+    """Return whether a compiled kernel launch should be skipped."""
+    return is_dry_run_enabled()
+
+
+ResultT = TypeVar("ResultT")
+
+
+def call_or_return_if_dry_run(
+    fn: Callable[..., ResultT],
     *,
-    last: bool = False,
-    empty_values: Any = None,
-) -> Callable[..., torch.Tensor]:
-    def wrapper(*args: Any, **kwargs: Any) -> torch.Tensor:
-        if is_fake_mode():
-            return empty_values
-        else:
-            try:
-                return fn(*args, **kwargs)
-            except MateDryRunComplete:
-                assert is_fake_mode()
-                if not last:
-                    return empty_values
-                raise
+    dry_run_result: ResultT,
+) -> Callable[..., ResultT]:
+    """Call ``fn`` normally or return a caller-provided dry-run result."""
+
+    @wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> ResultT:
+        if is_dry_run_enabled():
+            return dry_run_result
+        return fn(*args, **kwargs)
 
     return wrapper
+
+
+def empty_if_dry_run(
+    fn: Callable[..., ResultT],
+    *,
+    empty_values: ResultT,
+) -> Callable[..., ResultT]:
+    """Compatibility alias for ``call_or_return_if_dry_run``."""
+    return call_or_return_if_dry_run(fn, dry_run_result=empty_values)

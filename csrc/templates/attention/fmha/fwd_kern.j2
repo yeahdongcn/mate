@@ -56,7 +56,8 @@ ffi::Array<ffi::Any> {{ func_name }} (
   // CP params — non-CP callers pass cp_world_size=1, cp_rank=0, cp_tot_seqused_k=None
   int const cp_world_size,
   int const cp_rank,
-  ffi::Optional<ffi::TensorView> cp_tot_seqused_k
+  ffi::Optional<ffi::TensorView> cp_tot_seqused_k,
+  bool const dry_run
 ) {
   // FMHA config
   constexpr bool HasQv = {{ 'true' if has_qv else 'false' }};
@@ -92,6 +93,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
   constexpr int StagesV = {{ stages_v }};
   constexpr int NumQKConsumers = {{ consumers_qk }};
   constexpr int NumPVConsumers = {{ consumers_pv }};
+  constexpr int TileHeadDim = {{ tile_head_dim }};
   constexpr bool IsPackGQA = {{ 'true' if is_packgqa else 'false' }};
   constexpr bool IsEvenHeadDim = {{ 'true' if is_even_headdim else 'false' }};
   constexpr bool HasMetadata = {{ 'true' if has_metadata else 'false' }};
@@ -149,10 +151,11 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                          HasSeqlensRotary,
                                                          EnableCP,
                                                          HasAttentionChunk,
-                                                         NumPVConsumers>;
+                                                         NumPVConsumers,
+                                                         TileHeadDim>;
   using CollectiveEpilogue =
     mate::attention::fmha::CollectiveEpilogueFwd<ElementOut,
-                                                 CollectiveMainloop::TileShapePDV,
+                                                 CollectiveMainloop::TileShapePDVFull,
                                                  HasCuseqlensQ,
                                                  HasSequsedQ,
                                                  IsPackGQA,
@@ -197,17 +200,22 @@ ffi::Array<ffi::Any> {{ func_name }} (
   int mp_count = mutlass::KernelHardwareInfo::query_device_multiprocessor_count();
   int num_mp = mp_count - mp_margin;
   int b_rounded = (batch_size + 4 - 1) / 4 * 4; // round up to multiple of 4
-  int32_t* metadata_ptr = HasMetadata ? static_cast<int32_t*>(metadata.value().data_ptr()) : nullptr;
+  char opaque_ptr_sentinel{};
+  float float_ptr_sentinel{};
+  uint32_t uint32_ptr_sentinel{};
+  int32_t int32_ptr_sentinel{};
+  int int_ptr_sentinel{};
+  int32_t* metadata_ptr = HasMetadata ? &int32_ptr_sentinel : nullptr;
   int32_t* num_splits_dynamic_ptr = metadata_ptr;
-  int32_t* batch_table_ptr = HasMetadata ? metadata_ptr + b_rounded : nullptr;
-  int32_t* num_m_blocks_ptr = HasMetadata ? metadata_ptr + b_rounded * 2 : nullptr;
+  int32_t* batch_table_ptr = HasMetadata ? &int32_ptr_sentinel : nullptr;
+  int32_t* num_m_blocks_ptr = HasMetadata ? &int32_ptr_sentinel : nullptr;
 
-  // Set Params
+  // Split selection only observes pointer presence. Real pointers are populated after dry-run.
   mate::attention::fmha::FmhaFwdParams params {
      // QKV params
-    .q_ptr = static_cast<void*>(q.data_ptr()),
-    .k_ptr = static_cast<void*>(k.data_ptr()),
-    .v_ptr = static_cast<void*>(v.data_ptr()),
+    .q_ptr = &opaque_ptr_sentinel,
+    .k_ptr = &opaque_ptr_sentinel,
+    .v_ptr = &opaque_ptr_sentinel,
     .q_batch_stride = HasCuseqlensQ ? 0 : q.stride(0),
     .k_batch_stride = HasCuseqlensK ? 0 : k.stride(0),
     .v_batch_stride = HasCuseqlensK ? 0 : v.stride(0),
@@ -222,20 +230,20 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .h_k = num_head_kv,
 
     // Output
-    .o_ptr = static_cast<void*>(out.data_ptr()),
+    .o_ptr = &opaque_ptr_sentinel,
     .o_batch_stride = HasCuseqlensQ ? 0 : out.stride(0),
     .o_row_stride = out.stride(-3),
     .o_head_stride = out.stride(-2),
 
     // LSE
-    .softmax_lse_ptr = static_cast<void*>(lse.data_ptr()),
+    .softmax_lse_ptr = &opaque_ptr_sentinel,
     .lse_batch_stride = HasCuseqlensQ ? 0 : lse.stride(0),
     .lse_head_stride = lse.stride(-2),
 
     // FP8
-    .q_descale_ptr          = HasQDescale ? static_cast<float*>(q_descale.value().data_ptr()) : nullptr,
-    .k_descale_ptr          = HasKDescale ? static_cast<float*>(k_descale.value().data_ptr()) : nullptr,
-    .v_descale_ptr          = HasVDescale ? static_cast<float*>(v_descale.value().data_ptr()) : nullptr,
+    .q_descale_ptr          = HasQDescale ? &float_ptr_sentinel : nullptr,
+    .k_descale_ptr          = HasKDescale ? &float_ptr_sentinel : nullptr,
+    .v_descale_ptr          = HasVDescale ? &float_ptr_sentinel : nullptr,
     .q_descale_batch_stride = HasQDescale ? q_descale.value().stride(0) : 0,
     .q_descale_head_stride  = HasQDescale ? q_descale.value().stride(1) : 0,
     .k_descale_batch_stride = HasKDescale ? k_descale.value().stride(0) : 0,
@@ -264,16 +272,16 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .softcap        = softcap,
 
     // Ragged params
-    .cu_seqlens_q = HasCuseqlensQ ? static_cast<uint32_t*>(cu_seqlens_q.value().data_ptr()) : nullptr,
-    .cu_seqlens_k = HasCuseqlensK ? static_cast<uint32_t*>(cu_seqlens_k.value().data_ptr()) : nullptr,
-    .cu_seqlens_knew = is_varlen_k_new ? static_cast<uint32_t*>(cu_seqlens_k_new.value().data_ptr()) : nullptr,
-    .leftpad_k = HasLeftpadK ? static_cast<uint32_t*>(leftpad_k.value().data_ptr()) : nullptr,
-    .seqused_q = HasSequsedQ ? static_cast<uint32_t*>(seqused_q.value().data_ptr()) : nullptr,
-    .seqused_k = HasSequsedK ? static_cast<uint32_t*>(seqused_k.value().data_ptr()) : nullptr,
+    .cu_seqlens_q = HasCuseqlensQ ? &uint32_ptr_sentinel : nullptr,
+    .cu_seqlens_k = HasCuseqlensK ? &uint32_ptr_sentinel : nullptr,
+    .cu_seqlens_knew = is_varlen_k_new ? &uint32_ptr_sentinel : nullptr,
+    .leftpad_k = HasLeftpadK ? &uint32_ptr_sentinel : nullptr,
+    .seqused_q = HasSequsedQ ? &uint32_ptr_sentinel : nullptr,
+    .seqused_k = HasSequsedK ? &uint32_ptr_sentinel : nullptr,
 
     // AppendKV
-    .knew_ptr = IsAppendKV ? static_cast<void*>(k_new.value().data_ptr()) : nullptr,
-    .vnew_ptr = IsAppendKV ? static_cast<void*>(v_new.value().data_ptr()) : nullptr,
+    .knew_ptr = IsAppendKV ? &opaque_ptr_sentinel : nullptr,
+    .vnew_ptr = IsAppendKV ? &opaque_ptr_sentinel : nullptr,
     .knew_batch_stride = IsAppendKV && !is_varlen_k_new ? k_new.value().stride(0) : 0,
     .vnew_batch_stride = IsAppendKV && !is_varlen_k_new ? v_new.value().stride(0) : 0,
     .knew_row_stride = IsAppendKV ? k_new.value().stride(-3) : 0,
@@ -282,23 +290,23 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .vnew_head_stride = IsAppendKV ? v_new.value().stride(-2) : 0,
 
     // Qv
-    .qv_ptr = HasQv ? static_cast<void*>(q_v.value().data_ptr()) : nullptr,
+    .qv_ptr = HasQv ? &opaque_ptr_sentinel : nullptr,
     .qv_batch_stride = HasQv && !HasCuseqlensQ ? q_v.value().stride(0) : 0,
     .qv_row_stride = HasQv ? q_v.value().stride(-3) : 0,
     .qv_head_stride = HasQv ? q_v.value().stride(-2) : 0,
 
     // Rotary
-    .rotary_cos_ptr = IsRotary ? static_cast<void*>(rotary_cos.value().data_ptr()) : nullptr,
-    .rotary_sin_ptr = IsRotary ? static_cast<void*>(rotary_sin.value().data_ptr()) : nullptr,
-    .seqlens_rotary = IsRotary && HasSeqlensRotary ? static_cast<uint32_t*>(seqlens_rotary.value().data_ptr()) : nullptr,
+    .rotary_cos_ptr = IsRotary ? &opaque_ptr_sentinel : nullptr,
+    .rotary_sin_ptr = IsRotary ? &opaque_ptr_sentinel : nullptr,
+    .seqlens_rotary = IsRotary && HasSeqlensRotary ? &uint32_ptr_sentinel : nullptr,
 
-    .kv_batch_idx = HasKvBatchIdx ? static_cast<uint32_t*>(kv_batch_idx.value().data_ptr()) : nullptr,
+    .kv_batch_idx = HasKvBatchIdx ? &uint32_ptr_sentinel : nullptr,
 
     // Learnable Sink
-    .learnable_sink_ptr =  HasLearnableSink ? static_cast<void*>(learnable_sink.value().data_ptr()) : nullptr,
+    .learnable_sink_ptr = HasLearnableSink ? &opaque_ptr_sentinel : nullptr,
 
     // Paged params
-    .page_table = PagedKV ? static_cast<int*>(page_table.value().data_ptr()) : nullptr,
+    .page_table = PagedKV ? &int_ptr_sentinel : nullptr,
     .page_table_batch_stride = PagedKV ? page_table.value().stride(0) : 0,
     .page_size = page_size,
     .num_pages = num_pages,
@@ -341,6 +349,41 @@ ffi::Array<ffi::Any> {{ func_name }} (
         params.num_splits,
         HasCuseqlensQ ? total_q : seqlen_q
     }), DLDataType{kDLFloat, 32, 1}, q.device());
+
+  if (dry_run) {
+    return ffi::Array<ffi::Any>{ffi::Array<ffi::Tensor>{o_accum, lse_accum}, params.num_splits};
+  }
+
+  metadata_ptr = HasMetadata ? static_cast<int32_t*>(metadata.value().data_ptr()) : nullptr;
+  num_splits_dynamic_ptr = metadata_ptr;
+  batch_table_ptr = HasMetadata ? metadata_ptr + b_rounded : nullptr;
+  num_m_blocks_ptr = HasMetadata ? metadata_ptr + b_rounded * 2 : nullptr;
+
+  params.q_ptr = static_cast<void*>(q.data_ptr());
+  params.k_ptr = static_cast<void*>(k.data_ptr());
+  params.v_ptr = static_cast<void*>(v.data_ptr());
+  params.o_ptr = static_cast<void*>(out.data_ptr());
+  params.softmax_lse_ptr = static_cast<void*>(lse.data_ptr());
+  params.q_descale_ptr = HasQDescale ? static_cast<float*>(q_descale.value().data_ptr()) : nullptr;
+  params.k_descale_ptr = HasKDescale ? static_cast<float*>(k_descale.value().data_ptr()) : nullptr;
+  params.v_descale_ptr = HasVDescale ? static_cast<float*>(v_descale.value().data_ptr()) : nullptr;
+  params.cu_seqlens_q = HasCuseqlensQ ? static_cast<uint32_t*>(cu_seqlens_q.value().data_ptr()) : nullptr;
+  params.cu_seqlens_k = HasCuseqlensK ? static_cast<uint32_t*>(cu_seqlens_k.value().data_ptr()) : nullptr;
+  params.cu_seqlens_knew = is_varlen_k_new ? static_cast<uint32_t*>(cu_seqlens_k_new.value().data_ptr()) : nullptr;
+  params.leftpad_k = HasLeftpadK ? static_cast<uint32_t*>(leftpad_k.value().data_ptr()) : nullptr;
+  params.seqused_q = HasSequsedQ ? static_cast<uint32_t*>(seqused_q.value().data_ptr()) : nullptr;
+  params.seqused_k = HasSequsedK ? static_cast<uint32_t*>(seqused_k.value().data_ptr()) : nullptr;
+  params.knew_ptr = IsAppendKV ? static_cast<void*>(k_new.value().data_ptr()) : nullptr;
+  params.vnew_ptr = IsAppendKV ? static_cast<void*>(v_new.value().data_ptr()) : nullptr;
+  params.qv_ptr = HasQv ? static_cast<void*>(q_v.value().data_ptr()) : nullptr;
+  params.rotary_cos_ptr = IsRotary ? static_cast<void*>(rotary_cos.value().data_ptr()) : nullptr;
+  params.rotary_sin_ptr = IsRotary ? static_cast<void*>(rotary_sin.value().data_ptr()) : nullptr;
+  params.seqlens_rotary = IsRotary && HasSeqlensRotary ? static_cast<uint32_t*>(seqlens_rotary.value().data_ptr()) : nullptr;
+  params.kv_batch_idx = HasKvBatchIdx ? static_cast<uint32_t*>(kv_batch_idx.value().data_ptr()) : nullptr;
+  params.learnable_sink_ptr = HasLearnableSink ? static_cast<void*>(learnable_sink.value().data_ptr()) : nullptr;
+  params.page_table = PagedKV ? static_cast<int*>(page_table.value().data_ptr()) : nullptr;
+  params.num_splits_dynamic_ptr = num_splits_dynamic_ptr;
+  params.batch_table_ptr = batch_table_ptr;
 
   // musaMemset(o_accum.data_ptr(), 0x0, 4*o_accum.numel());
   // musaMemset(lse_accum.data_ptr(), 0x0, 4*lse_accum.numel());
@@ -389,7 +432,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
 
     // Rotary
     .ptr_rotary_cos = static_cast<Element const*>(params.rotary_cos_ptr),
-    .shape_rotary = {params.seqlen_k, params.rotary_dim / 2},
+    .shape_rotary = {IsRotary ? static_cast<int>(rotary_cos.value().size(0)) : 0, params.rotary_dim / 2},
     .stride_rotary_cos = {params.rotary_dim / 2, _1{}},
     .ptr_rotary_sin = static_cast<Element const*>(params.rotary_sin_ptr),
     .stride_rotary_sin = {params.rotary_dim / 2, _1{}},

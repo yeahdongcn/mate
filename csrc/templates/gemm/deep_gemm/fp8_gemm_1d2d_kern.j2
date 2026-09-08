@@ -34,10 +34,12 @@ void {{ func_name }}(
   constexpr uint32_t kNumMmaWarpSquads = {{ num_mma_warp_squads }};
   constexpr auto     kScaleMode        = {{ scale_accumulation_mode_cpp }};
   using Epilogue                       = {{ epilogue_type }};
+  constexpr bool     kBMajorN          = {{ b_major_n }};
 
   constexpr bool kIsNormal = kType == mate::deep_gemm::GemmType::Normal;
   constexpr bool kIsBatched = kType == mate::deep_gemm::GemmType::Batched;
   constexpr bool kIsMasked = kType == mate::deep_gemm::GemmType::MGroupedMasked;
+  constexpr bool kIsPerTokenGrouped = kType == mate::deep_gemm::GemmType::MGroupedContiguous;
   constexpr bool kIsGroupedContiguous =
       kType == mate::deep_gemm::GemmType::MGroupedContiguous ||
       kType == mate::deep_gemm::GemmType::MGroupedContiguousWithPsumLayout;
@@ -51,6 +53,7 @@ void {{ func_name }}(
   constexpr int kRankD = kGroupD ? 3 : 2;
   constexpr int kRankScaleA = kGroupA ? 3 : 2;
   constexpr int kRankScaleB = kGroupB ? 3 : 2;
+  static_assert(!kBMajorN || kIsPerTokenGrouped, "N-major B requires M-grouped contiguous GEMM");
 
   CHECK_MUSA(a);
   CHECK_MUSA(scale_a);
@@ -69,7 +72,9 @@ void {{ func_name }}(
   CHECK_LAST_DIM_CONTIGUOUS(a);
   CHECK_LAST_DIM_CONTIGUOUS(scale_a);
   CHECK_LAST_DIM_CONTIGUOUS(b);
-  CHECK_LAST_DIM_CONTIGUOUS(scale_b);
+  if constexpr (!kBMajorN) {
+    CHECK_LAST_DIM_CONTIGUOUS(scale_b);
+  }
   CHECK_LAST_DIM_CONTIGUOUS(d);
 
   CHECK_DIM(kRankA, a);
@@ -108,7 +113,7 @@ void {{ func_name }}(
   }();
   const int64_t M = kGroupA ? a.size(1) : a.size(0);
   const int64_t K = kGroupA ? a.size(2) : a.size(1);
-  const int64_t N = kGroupB ? b.size(1) : b.size(0);
+  const int64_t N = kGroupB ? (kBMajorN ? b.size(2) : b.size(1)) : b.size(0);
   const int64_t KTiles = ceil_div(K, static_cast<int64_t>(kQuantTile));
   const int64_t NTiles = ceil_div(N, static_cast<int64_t>(kQuantTile));
 {% if epilogue == "head_splits" %}
@@ -126,7 +131,13 @@ void {{ func_name }}(
 
   if constexpr (kGroupB) {
     TVM_FFI_ICHECK(b.size(0) == G) << "b.shape[0] must match logical group count";
-    TVM_FFI_ICHECK(b.size(2) == K) << "b.shape[2] must match logical K";
+    if constexpr (kBMajorN) {
+      TVM_FFI_ICHECK(b.size(1) == K) << "b.shape[1] must match logical K";
+      TVM_FFI_ICHECK(b.stride(2) == 1 && b.stride(1) == N && b.stride(0) == K * N)
+          << "N-major b must be contiguous [G, K, N]";
+    } else {
+      TVM_FFI_ICHECK(b.size(2) == K) << "b.shape[2] must match logical K";
+    }
   } else {
     TVM_FFI_ICHECK(b.size(1) == K) << "b.shape[1] must match logical K";
   }
@@ -148,8 +159,18 @@ void {{ func_name }}(
   }
   if constexpr (kGroupB) {
     TVM_FFI_ICHECK(scale_b.size(0) == G) << "scale_b.shape[0] must match logical group count";
-    TVM_FFI_ICHECK(scale_b.size(1) == NTiles) << "scale_b.shape[1] must match ceil_div(N, quant_tile)";
-    TVM_FFI_ICHECK(scale_b.size(2) == KTiles) << "scale_b.shape[2] must match ceil_div(K, quant_tile)";
+    if constexpr (kBMajorN) {
+      TVM_FFI_ICHECK(scale_b.size(1) == KTiles)
+          << "scale_b.shape[1] must match ceil_div(K, quant_tile)";
+      TVM_FFI_ICHECK(scale_b.size(2) == NTiles)
+          << "scale_b.shape[2] must match ceil_div(N, quant_tile)";
+      TVM_FFI_ICHECK(scale_b.stride(1) == 1 && scale_b.stride(2) == KTiles &&
+                     scale_b.stride(0) == KTiles * NTiles)
+          << "N-major scale_b must be a transpose-contiguous [G, KTiles, NTiles] view";
+    } else {
+      TVM_FFI_ICHECK(scale_b.size(1) == NTiles) << "scale_b.shape[1] must match ceil_div(N, quant_tile)";
+      TVM_FFI_ICHECK(scale_b.size(2) == KTiles) << "scale_b.shape[2] must match ceil_div(K, quant_tile)";
+    }
   } else {
     TVM_FFI_ICHECK(scale_b.size(0) == NTiles) << "scale_b.shape[0] must match ceil_div(N, quant_tile)";
     TVM_FFI_ICHECK(scale_b.size(1) == KTiles) << "scale_b.shape[1] must match ceil_div(K, quant_tile)";
@@ -173,9 +194,14 @@ void {{ func_name }}(
 
   auto stride_b = [&]() {
     if constexpr (kGroupB) {
-      return make_stride(b.stride(1), _1{}, b.stride(0));
+      if constexpr (kBMajorN) {
+        return make_stride(_1{}, b.stride(1), b.stride(0));
+      } else {
+        return make_stride(b.stride(1), _1{}, b.stride(0));
+      }
+    } else {
+      return make_stride(b.stride(0), _1{}, N * K);
     }
-    return make_stride(b.stride(0), _1{}, N * K);
   }();
 
   auto stride_d = [&]() {
@@ -194,9 +220,14 @@ void {{ func_name }}(
 
   auto stride_sfb = [&]() {
     if constexpr (kGroupB) {
-      return make_stride(scale_b.stride(1), _1{}, scale_b.stride(0));
+      if constexpr (kBMajorN) {
+        return make_stride(scale_b.stride(2), _1{}, scale_b.stride(0));
+      } else {
+        return make_stride(scale_b.stride(1), _1{}, scale_b.stride(0));
+      }
+    } else {
+      return make_stride(scale_b.stride(0), _1{}, NTiles * KTiles);
     }
-    return make_stride(scale_b.stride(0), _1{}, NTiles * KTiles);
   }();
 
   auto* gl_ptr = [&]() -> int32_t const* {

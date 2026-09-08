@@ -1,14 +1,12 @@
 import torch
 
 from mate.execution_context import (
-    is_dry_run_enabled,
     is_fake_mode,
-    maybe_fake_tensor_mode,
+    raise_complete_if_dry_run,
 )
 from mate.kda import gated_delta_rule_decode
 
 TEST_SEED = 20262423
-USE_FAKE_MODE = is_dry_run_enabled()
 
 
 def _exp2_f32_ref(x: torch.Tensor) -> torch.Tensor:
@@ -722,6 +720,7 @@ def _kda_reference_from_case(case: dict):
 
 def kda_test_with_reference(case: dict, *, rtol: float = 1e-2, atol: float = 1e-2):
     out, final_state = kda_test(case)
+    raise_complete_if_dry_run()
     ref_out, ref_final_state = _kda_reference_from_case(case)
 
     meta = case["meta"]
@@ -754,7 +753,6 @@ def kda_test_with_reference(case: dict, *, rtol: float = 1e-2, atol: float = 1e-
     return out, final_state, ref_out, ref_final_state
 
 
-@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 def test_kda_decode_bf16_state():
     smoke_cases = (
         {
@@ -891,7 +889,6 @@ def test_kda_decode_bf16_state():
     assert final_state is state
 
 
-@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 def test_kda_decode_fp32_varlen_large_batch_config():
     case = generate_kda_case(
         IS_VARLEN=True,

@@ -5,10 +5,16 @@ from __future__ import annotations
 import torch
 
 from mate.api_logging import mate_api
+from mate.mate_runtime import get_physical_num_mps
 from mate.jit.kda_ops import (
-    get_kda_fused_ops_function_name,
-    get_kda_fused_ops_module,
-    make_kda_fused_ops_config,
+    KDA_MP31_PREPARE_CTAS_PER_MP,
+    KDA_PREFILL_CHUNK_SIZE,
+    KDA_PREFILL_HEAD_DIM,
+    get_kda_recurrence_ops_function_name,
+    get_kda_recurrence_ops_module,
+    get_kda_prepare_ops_function_name,
+    get_kda_prepare_ops_module,
+    make_kda_ops_config,
 )
 from mate.kda_kernels.tilelang import kda_decode as kda_decode_tilelang
 
@@ -64,8 +70,9 @@ def chunk_kda(
     use_qk_l2norm_in_kernel: bool = True,
     output: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
+    initial_state_indices: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Run the fused chunk KDA kernel.
+    """Run chunk KDA as a chunk-parallel prepare kernel and a recurrence kernel.
 
     Args:
         q: Query tensor with shape ``[B, T, Hqk, 128]`` for dense mode or
@@ -75,8 +82,10 @@ def chunk_kda(
         g: Gate input tensor with the same shape as ``v``.
         beta: Beta logits tensor with shape ``[B, T, Hv]`` or varlen equivalent.
         scale: Optional QK scaling factor. Defaults to ``128**-0.5``.
-        initial_state: Optional recurrent state tensor.
-        output_final_state: Whether to return the final recurrent state.
+        initial_state: Optional dense recurrent state or recurrent state pool.
+        output_final_state: Whether to return the final recurrent state. In
+            pool mode, selected rows are updated regardless of this flag; the
+            flag only controls whether the pool is also returned.
         cu_seqlens: Optional cumulative sequence lengths for varlen mode.
         A_log: Optional per-head gate parameter tensor.
         dt_bias: Optional per-head, per-channel gate bias tensor.
@@ -84,7 +93,12 @@ def chunk_kda(
             ``dt_bias`` are enabled. Defaults to ``-5.0``.
         use_qk_l2norm_in_kernel: Whether to normalize Q/K in the kernel.
         output: Optional preallocated output tensor.
-        final_state: Optional preallocated final-state tensor.
+        final_state: Optional preallocated dense final-state tensor. Pool mode
+            writes ``initial_state`` directly and accepts only an alias here.
+        initial_state_indices: Optional contiguous int32 mapping from input
+            sequences to rows of ``initial_state``. When provided, the selected
+            pool rows are read and written in place. Concurrent sequences must
+            refer to distinct valid pool rows.
     """
 
     q, squeeze_varlen = _as_4d_varlen_input(q, name="q", cu_seqlens=cu_seqlens)
@@ -141,18 +155,93 @@ def chunk_kda(
     if output.dtype != q.dtype:
         raise TypeError("output must have the same dtype as q.")
 
-    if output_final_state and final_state is None:
-        nseq = int(cu_seqlens.numel() - 1) if cu_seqlens is not None else q.shape[0]
-        state_dtype = initial_state.dtype if initial_state is not None else q.dtype
-        final_state = torch.empty(
-            (nseq, v.shape[2], 128, 128),
-            device=q.device,
-            dtype=state_dtype,
-        )
-    elif not output_final_state:
-        final_state = None
-    elif final_state is not None:
+    nseq = int(cu_seqlens.numel() - 1) if cu_seqlens is not None else q.shape[0]
+    expected_state_tail = (v.shape[2], 128, 128)
+    if initial_state is not None:
+        if (
+            initial_state.dim() != 4
+            or tuple(initial_state.shape[1:]) != expected_state_tail
+        ):
+            raise ValueError(
+                "initial_state must have shape [N_or_pool, H, Dv, D], got "
+                f"{tuple(initial_state.shape)}."
+            )
+        if initial_state.device != q.device:
+            raise ValueError(
+                f"initial_state must be on device {q.device}, got {initial_state.device}."
+            )
+
+    if initial_state_indices is None:
+        if initial_state is not None and initial_state.shape[0] != nseq:
+            raise ValueError(
+                "Dense initial_state must have one row per sequence: expected "
+                f"{nseq}, got {initial_state.shape[0]}."
+            )
+        state_indices = torch.arange(nseq, device=q.device, dtype=torch.int32)
+        if output_final_state and final_state is None:
+            if initial_state is not None:
+                final_state = torch.empty_like(initial_state)
+            else:
+                final_state = torch.empty(
+                    (nseq, *expected_state_tail),
+                    device=q.device,
+                    dtype=q.dtype,
+                )
+        elif not output_final_state:
+            final_state = None
+    else:
+        if initial_state is None:
+            raise ValueError(
+                "initial_state must be provided when initial_state_indices is set."
+            )
+        if initial_state_indices.dim() != 1 or initial_state_indices.numel() != nseq:
+            raise ValueError(
+                "initial_state_indices must have shape [N], where N is the number "
+                f"of sequences ({nseq}); got {tuple(initial_state_indices.shape)}."
+            )
+        if initial_state_indices.dtype != torch.int32:
+            raise TypeError(
+                "initial_state_indices must have dtype torch.int32, got "
+                f"{initial_state_indices.dtype}."
+            )
+        if initial_state_indices.device != q.device:
+            raise ValueError(
+                "initial_state_indices must be on the same device as q, got "
+                f"{initial_state_indices.device} and {q.device}."
+            )
+        if not initial_state_indices.is_contiguous():
+            raise ValueError("initial_state_indices must be contiguous.")
+        if (
+            final_state is not None
+            and final_state.data_ptr() != initial_state.data_ptr()
+        ):
+            raise ValueError(
+                "Pool mode writes initial_state in place; final_state must be None "
+                "or alias initial_state."
+            )
+        # Avoid a device-to-host value-range check, which would synchronize the stream.
+        state_indices = initial_state_indices
+        final_state = initial_state
+
+    if final_state is not None:
         _check_state_dtype(final_state, name="final_state", value_dtype=q.dtype)
+        if (
+            final_state.dim() != 4
+            or tuple(final_state.shape[1:]) != expected_state_tail
+        ):
+            raise ValueError(
+                "final_state must have shape [N_or_pool, H, Dv, D], got "
+                f"{tuple(final_state.shape)}."
+            )
+        if initial_state_indices is None and final_state.shape[0] != nseq:
+            raise ValueError(
+                "Dense final_state must have one row per sequence: expected "
+                f"{nseq}, got {final_state.shape[0]}."
+            )
+        if final_state.device != q.device:
+            raise ValueError(
+                f"final_state must be on device {q.device}, got {final_state.device}."
+            )
 
     if (
         initial_state is not None
@@ -171,7 +260,7 @@ def chunk_kda(
         if final_state is not None
         else q.dtype
     )
-    kda_config = make_kda_fused_ops_config(
+    kda_config = make_kda_ops_config(
         q.dtype,
         state_dtype=state_dtype,
         cu_seqlens_dtype=cu_seqlens.dtype if cu_seqlens is not None else None,
@@ -182,23 +271,78 @@ def chunk_kda(
         is_varlen=cu_seqlens is not None,
         normalize_qk=bool(use_qk_l2norm_in_kernel),
     )
-    kda_func_name = get_kda_fused_ops_function_name(kda_config)
+    chunks = (q.shape[1] + KDA_PREFILL_CHUNK_SIZE - 1) // KDA_PREFILL_CHUNK_SIZE
+    workspace_records = chunks + nseq if cu_seqlens is not None else nseq * chunks
+    workspace_tile_shape = (workspace_records, v.shape[2])
+    workspace_decayed = torch.empty(
+        (*workspace_tile_shape, 2 * KDA_PREFILL_CHUNK_SIZE, KDA_PREFILL_HEAD_DIM),
+        device=q.device,
+        dtype=q.dtype,
+    )
+    workspace_k_restored = torch.empty(
+        (*workspace_tile_shape, KDA_PREFILL_CHUNK_SIZE, KDA_PREFILL_HEAD_DIM),
+        device=q.device,
+        dtype=q.dtype,
+    )
+    workspace_inverse = torch.empty(
+        (*workspace_tile_shape, KDA_PREFILL_CHUNK_SIZE, KDA_PREFILL_CHUNK_SIZE),
+        device=q.device,
+        dtype=q.dtype,
+    )
+    workspace_p = torch.empty_like(workspace_inverse)
+    workspace_total = torch.empty(
+        (*workspace_tile_shape, KDA_PREFILL_HEAD_DIM),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    # Persistent K1 uses one int4 range descriptor per launched partition.
+    # The MP31 launch policy consumes at most one descriptor per resident
+    # prepare CTA.  MP32 can supply a different policy without changing the
+    # workspace record ABI above.
+    num_seqs = cu_seqlens.numel() - 1 if cu_seqlens is not None else 1
+    metadata_capacity = (
+        KDA_MP31_PREPARE_CTAS_PER_MP * get_physical_num_mps(q.device)
+        if cu_seqlens is not None and num_seqs > 1
+        else 1
+    )
+    workspace_metadata = torch.empty(
+        (metadata_capacity, 4), device=q.device, dtype=torch.int32
+    )
 
-    get_kda_fused_ops_module(kda_config).get_function(kda_func_name)(
+    get_kda_prepare_ops_module(kda_config).get_function(
+        get_kda_prepare_ops_function_name(kda_config)
+    )(
         q,
         k,
-        v,
         g,
         beta,
-        output,
-        initial_state,
-        final_state,
+        workspace_decayed,
+        workspace_k_restored,
+        workspace_inverse,
+        workspace_p,
+        workspace_total,
+        workspace_metadata,
         cu_seqlens,
         A_log,
         dt_bias,
         float(scale),
         float(lower_bound),
         bool(use_qk_l2norm_in_kernel),
+    )
+    get_kda_recurrence_ops_module(kda_config).get_function(
+        get_kda_recurrence_ops_function_name(kda_config)
+    )(
+        v,
+        output,
+        workspace_decayed,
+        workspace_k_restored,
+        workspace_inverse,
+        workspace_p,
+        workspace_total,
+        state_indices,
+        initial_state,
+        final_state,
+        cu_seqlens,
     )
 
     if squeeze_varlen:

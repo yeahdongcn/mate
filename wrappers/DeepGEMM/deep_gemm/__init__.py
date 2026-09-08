@@ -7,6 +7,10 @@ from .interface import (
     bf16_gemm_nt,
     bf16_gemm_tn,
     bf16_gemm_tt,
+    cublaslt_gemm_nn,
+    cublaslt_gemm_nt,
+    cublaslt_gemm_tn,
+    cublaslt_gemm_tt,
     einsum,
     # legacy aliases
     fp8_einsum,
@@ -23,11 +27,13 @@ from .interface import (
     fp8_mqa_logits,
     fp8_paged_mqa_logits,
     get_paged_mqa_logits_metadata,
+    k_grouped_fp8_gemm_nt_contiguous,
     k_grouped_fp8_gemm_tn_contiguous,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_fp8_fp4_gemm_nt_contiguous,
     m_grouped_fp8_fp4_gemm_nt_masked,
+    m_grouped_fp8_gemm_nn_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_masked,
     k_grouped_bf16_gemm_tn_contiguous,
@@ -39,13 +45,23 @@ from .utils import (
     get_col_major_tma_aligned_tensor as get_col_major_tma_aligned_tensor,
 )
 from .utils import (
+    get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor as get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor,
+)
+from .utils import (
     get_mk_alignment_for_contiguous_layout as get_mk_alignment_for_contiguous_layout,
+)
+from .utils import (
+    get_mn_major_tma_aligned_packed_ue8m0_tensor as get_mn_major_tma_aligned_packed_ue8m0_tensor,
 )
 from .utils import get_mn_major_tma_aligned_tensor as get_mn_major_tma_aligned_tensor
 from .utils import get_num_sms as get_num_sms
 from .utils import get_tc_util as get_tc_util
+from .utils import get_tma_aligned_size as get_tma_aligned_size
 from .utils import set_num_sms as set_num_sms
 from .utils import set_tc_util as set_tc_util
+from .utils import (
+    transform_sf_into_required_layout as transform_sf_into_required_layout,
+)
 
 try:
     from ._build_meta import __git_version__ as __git_version__
@@ -91,19 +107,29 @@ __all__ = [
     "__version__",
     "testing",
     "utils",
+    "get_tma_aligned_size",
+    "get_mn_major_tma_aligned_packed_ue8m0_tensor",
+    "get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor",
+    "transform_sf_into_required_layout",
     # GEMM
     "bf16_gemm_nt",
     "bf16_gemm_nn",
     "bf16_gemm_tn",
     "bf16_gemm_tt",
+    "cublaslt_gemm_nt",
+    "cublaslt_gemm_nn",
+    "cublaslt_gemm_tn",
+    "cublaslt_gemm_tt",
     "einsum",
     "m_grouped_bf16_gemm_nt_contiguous",
     "m_grouped_bf16_gemm_nt_masked",
     "m_grouped_fp8_fp4_gemm_nt_contiguous",
     "m_grouped_fp8_fp4_gemm_nt_masked",
+    "m_grouped_fp8_gemm_nn_contiguous",
     "m_grouped_fp8_gemm_nt_contiguous",
     "m_grouped_fp8_gemm_nt_masked",
     "k_grouped_bf16_gemm_tn_contiguous",
+    "k_grouped_fp8_gemm_nt_contiguous",
     "k_grouped_fp8_gemm_tn_contiguous",
     "fp8_fp4_gemm_nt",
     "fp8_gemm_nt",

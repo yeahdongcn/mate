@@ -19,6 +19,26 @@ GEMM
 .. autofunction:: group_deepgemm_fp8_nt_groupwise
 .. autofunction:: batch_deepgemm_fp8_nt_groupwise
 
+Norm
+----
+
+.. currentmodule:: flashinfer.norm
+
+.. autofunction:: rmsnorm
+.. autofunction:: gemma_rmsnorm
+.. autofunction:: rmsnorm_quant
+.. autofunction:: fused_add_rmsnorm
+.. autofunction:: gemma_fused_add_rmsnorm
+.. autofunction:: fused_add_rmsnorm_fp8_block_quant
+.. autofunction:: fused_add_rmsnorm_quant
+.. autofunction:: layernorm
+.. autofunction:: layernorm_quant
+.. autofunction:: fused_rmsnorm_silu
+.. autofunction:: fused_dit_gate_residual_layernorm_gamma_beta
+.. autofunction:: fused_dit_gate_residual_layernorm_scale_shift
+.. autofunction:: fused_dit_residual_layernorm_scale_shift
+.. autofunction:: fused_qk_rmsnorm_rope
+
 FP8 MLA RoPE quantization
 -------------------------
 

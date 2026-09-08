@@ -738,6 +738,7 @@ def attention_ref(
     reorder_ops=False,
     intermediate_dtype=None,
     only_qv=False,
+    softmax_scale=None,
 ):
     """
     Adapted from FlashAttention
@@ -762,7 +763,8 @@ def attention_ref(
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]
     dv = v.shape[-1]
-    softmax_scale = 1.0 / math.sqrt(dv if only_qv else d if qv is None else d + dv)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(dv if only_qv else d if qv is None else d + dv)
     if only_qv:
         assert qv is not None
         scores = torch.einsum("bthd,bshd->bhts", qv * softmax_scale, v)
@@ -809,6 +811,7 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
+    fully_masked_rows = torch.isneginf(scores).all(dim=-1, keepdim=True)
     if learnable_sink is None:
         attention = torch.softmax(scores, dim=-1).to(v.dtype)
     else:
@@ -829,10 +832,9 @@ def attention_ref(
         attention = attention.masked_fill(
             rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0.0
         )
-    if local_mask is not None:
-        attention = attention.masked_fill(
-            torch.all(local_mask, dim=-1, keepdim=True), 0.0
-        )
+    # Softmax returns NaN when every key in a row is masked. Treat that row as
+    # contributing no attention, including when masks and bias combine to hide it.
+    attention = attention.masked_fill(fully_masked_rows, 0.0)
     dropout_scaling = 1.0 / (1 - dropout_p)
     if dropout_mask is not None:
         attention_drop = attention.masked_fill(~dropout_mask, 0.0)

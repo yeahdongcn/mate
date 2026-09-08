@@ -3,6 +3,8 @@
 #include <musa_runtime.h>
 #include <mutlass/mutlass.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <mute/algorithm/prefetch.hpp>
@@ -31,34 +33,46 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   static constexpr bool IsPagedKV = find_option_t<Tag::IsPagedKV, std::false_type, Options_...>::value;
   static constexpr bool IsCausal  = find_option_t<Tag::IsCausal, std::false_type, Options_...>::value;
   static constexpr int  HeadRatio = HeadRatio_;
-  static constexpr int  QStages   = 1;
-  static constexpr int  KStages   = 1;
 
-  static constexpr int  TileQ              = get<0>(TileShape{});
-  static constexpr int  TileKV             = get<1>(TileShape{});
-  static constexpr int  HeadDim            = get<2>(TileShape{});
+  static constexpr int TileQ    = get<0>(TileShape{});
+  static constexpr int TileKV   = get<1>(TileShape{});
+  static constexpr int HeadDim  = get<2>(TileShape{});
+  static constexpr int PageSize = find_option_t<Tag::PageSize, std::integral_constant<int, TileKV>, Options_...>::value;
+  static constexpr PageTableKind PageTableMode =
+      find_option_t<Tag::PageTable,
+                    std::integral_constant<PageTableKind, IsPagedKV ? PageTableKind::Batched2D : PageTableKind::Dense>,
+                    Options_...>::value;
+  static constexpr int QStages = find_option_t<Tag::QStages, std::integral_constant<int, 1>, Options_...>::value;
+  static constexpr int KStages =
+      find_option_t<Tag::KStages,
+                    std::integral_constant<int, is_same_v<Element, mutlass::float_e4m3_t> ? 2 : 1>,
+                    Options_...>::value;
   static constexpr int  QTokensPerTile     = TileQ / HeadRatio;
   static constexpr int  SmemAlignmentBytes = 256;
-  static constexpr bool EnableKPrefetch    = TileQ > 16;
+  static constexpr bool EnableKPrefetch =
+      find_option_t<Tag::EnableKPrefetch,
+                    std::bool_constant<(TileQ > 16 && !is_same_v<Element, mutlass::bfloat16_t>)>,
+                    Options_...>::value;
 
   static constexpr int MmaAlignment = 32 / sizeof_bits_v<Element>;
-  static constexpr int MmaTileQ     = 16;
-  using BuilderTileShape            = Shape<Int<MmaTileQ>, Int<TileKV>, Int<HeadDim>>;
+  static constexpr int MmaTileQ =
+      find_option_t<Tag::MmaTileQ, std::integral_constant<int, (TileQ >= 32 ? 32 : 16)>, Options_...>::value;
+  using BuilderTileShape = Shape<Int<MmaTileQ>, Int<TileKV>, Int<HeadDim>>;
 
-  using BuilderCollective =
-      typename mutlass::gemm::collective::CollectiveBuilder<mutlass::arch::Mp31,
-                                                            mutlass::arch::OpClassTensorOp,
-                                                            Element,
-                                                            mutlass::layout::RowMajor,
-                                                            MmaAlignment,
-                                                            Element,
-                                                            mutlass::layout::ColumnMajor,
-                                                            MmaAlignment,
-                                                            ElementAccumulator,
-                                                            BuilderTileShape,
-                                                            Shape<_1, _1, _1>,
-                                                            mutlass::gemm::collective::StageCount<2>,
-                                                            mutlass::gemm::KernelTmeWarpSpecialized>::CollectiveOp;
+  using BuilderCollective = typename mutlass::gemm::collective::CollectiveBuilder<
+      mutlass::arch::Mp31,
+      mutlass::arch::OpClassTensorOp,
+      Element,
+      mutlass::layout::RowMajor,
+      MmaAlignment,
+      Element,
+      mutlass::layout::ColumnMajor,
+      MmaAlignment,
+      ElementAccumulator,
+      BuilderTileShape,
+      Shape<_1, _1, _1>,
+      mutlass::gemm::collective::StageCount<(KStages < 2 ? 2 : KStages)>,
+      mutlass::gemm::KernelTmeWarpSpecialized>::CollectiveOp;
 
   using BuilderTiledMma = typename BuilderCollective::TiledMma;
   using BuilderMmaOp    = typename BuilderTiledMma::Atom::MMA_Op;
@@ -79,10 +93,13 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   static constexpr int KLoadWarpInProducer    = 1;
 
   static_assert(HeadRatio > 0);
-  static_assert(TileQ > 0 && TileKV == 128 && HeadDim > 0);
+  static_assert(TileQ > 0 && TileKV > 0 && HeadDim > 0);
+  static_assert(PageSize == TileKV, "max-score currently requires one K tile per KV page");
+  static_assert(IsPagedKV == (PageTableMode != PageTableKind::Dense));
   static_assert(TileQ % HeadRatio == 0);
   static_assert(TileQ % MmaTileQ == 0);
   static_assert(TileQ % NumMmaWarpSquads == 0);
+  static_assert(QTokensPerTile <= TileKV, "one Q work must not span more than one K tile");
   static_assert(QStages > 0 && KStages > 0);
   static_assert(HeadDim % 8 == 0);
 
@@ -122,14 +139,38 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
       make_tensor(
           make_gmem_ptr(static_cast<Element const*>(nullptr)), repeat_like(StrideKTme{}, int32_t(0)), StrideKTme{}),
       take<0, 2>(SmemLayoutK{})));
-  using PagedKvManager = mate::attention::msa::KVManager<IsPagedKV, TileKV>;
+  using PagedKvManager = mate::attention::msa::KVManager<IsPagedKV, PageSize, PageTableMode>;
 
-  using MainloopPipelineQ = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<QStages>;
-  using MainloopPipelineK = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<KStages>;
-  using PipelineQParams   = typename MainloopPipelineQ::Params;
-  using PipelineKParams   = typename MainloopPipelineK::Params;
-  using PipelineQState    = typename MainloopPipelineQ::PipelineState;
-  using PipelineKState    = typename MainloopPipelineK::PipelineState;
+  // A metadata-scheduled persistent CTA may consume hundreds of K pages for
+  // multiple Q works. Keep the one-stage K shared-memory pipeline, but rotate
+  // its async barrier pairs to extend the lifetime between physical-barrier
+  // reuse. PH1 also shares the deschedule mask between the two phases of one
+  // physical async barrier. Rendezvous all K consumers on a phase-specific
+  // barrier before the K ring wraps so a late waiter from the prior phase
+  // cannot reschedule a waiter from the next phase.
+  static constexpr bool UseKPipelinePhaseGuard  = IsPagedKV && is_same_v<Element, mutlass::bfloat16_t>;
+  static constexpr int  NumKPipelinePhaseGuards = UseKPipelinePhaseGuard ? 2 : 0;
+  static constexpr int  MaxKBarPerStageRatio    = UseKPipelinePhaseGuard ? 16 : 1;
+  using MainloopPipelineQ                       = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<QStages>;
+  static constexpr int KPipelineAdditionalBarriers =
+      static_cast<int>(mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount) +
+      static_cast<int>(MainloopPipelineQ::NumBarriers) + NumKPipelinePhaseGuards;
+  using KBarPerStageRatioHelper =
+      mutlass::Mp31PipelineWarpSpecializedBarrierRatio<MaxKBarPerStageRatio, KPipelineAdditionalBarriers, KStages>;
+  static constexpr int KBarPerStageRatio = KBarPerStageRatioHelper::value;
+  static_assert(KBarPerStageRatio > 0,
+                "MSA max-score K pipeline exceeds the MP31 async barrier budget even with one barrier pair per stage");
+  using MainloopPipelineK                = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<KStages, KBarPerStageRatio>;
+  static constexpr int AsyncBarrierCount = static_cast<int>(mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount) +
+                                           static_cast<int>(MainloopPipelineQ::NumBarriers) +
+                                           static_cast<int>(MainloopPipelineK::NumBarriers) + NumKPipelinePhaseGuards;
+  static_assert(AsyncBarrierCount <=
+                    static_cast<int>(mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers),
+                "MSA max-score async barrier configuration exceeds the MP31 hardware limit");
+  using PipelineQParams = typename MainloopPipelineQ::Params;
+  using PipelineKParams = typename MainloopPipelineK::Params;
+  using PipelineQState  = typename MainloopPipelineQ::PipelineState;
+  using PipelineKState  = typename MainloopPipelineK::PipelineState;
 
   static constexpr int TmeTransactionBytesQ =
       mutlass::bits_to_bytes(size(take<0, 3>(SmemLayoutQTme{})) * sizeof_bits_v<Element>);
@@ -144,7 +185,16 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   struct MUTE_ALIGNAS(1) BarrierStorage {
     uint8_t pipeline_q[MainloopPipelineQ::NumBarriers];
     uint8_t pipeline_k[MainloopPipelineK::NumBarriers];
+    // These trailing IDs are allocated only when UseKPipelinePhaseGuard is
+    // true. Keeping the members present preserves compile-time offsets without
+    // changing the barrier count of FP8, FP16, or contiguous BF16 kernels.
+    uint8_t k_pipeline_phase_guard[2];
   };
+
+  static constexpr uint32_t KPipelinePhaseGuardBase = static_cast<uint32_t>(
+      offsetof(BarrierStorage, k_pipeline_phase_guard) + mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount);
+  static constexpr uint32_t KPipelinePhase0GuardId = KPipelinePhaseGuardBase;
+  static constexpr uint32_t KPipelinePhase1GuardId = KPipelinePhaseGuardBase + 1;
 
   struct Arguments {
     Element const* ptr_q;
@@ -194,6 +244,11 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
     TmeLoadKParams load_k;
   };
 
+  static constexpr int MaxStoreRowsPerThread = 2;
+  struct RowmaxStoreParams {
+    int64_t output_row_base[MaxStoreRowsPerThread];
+  };
+
   struct Pipeline {
     MainloopPipelineQ q;
     MainloopPipelineK k;
@@ -223,13 +278,19 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
           q_write(mutlass::make_producer_start_state_warpspecialized<MainloopPipelineQ>()),
           k_read{},
           k_write(mutlass::make_producer_start_state_warpspecialized<MainloopPipelineK>()) {
+      if constexpr (UseKPipelinePhaseGuard) {
+        if (mutlass::canonical_warp_idx() == 0) {
+          mutlass::arch::AsyncBarrier::init(KPipelinePhase0GuardId, NumConsumerWarps, 0);
+          mutlass::arch::AsyncBarrier::init(KPipelinePhase1GuardId, NumConsumerWarps, 0);
+        }
+      }
     }
   };
 
   template <class ProblemSize>
   static Params to_underlying_arguments(ProblemSize const& problem_size, Arguments const& args) {
-    int max_pages_per_batch = mutlass::ceil_div(problem_size.max_seqlen_k, TileKV);
-    int page_extent         = IsPagedKV ? mutlass::ceil_div(problem_size.total_k, TileKV) : 1;
+    int max_pages_per_batch = mutlass::ceil_div(problem_size.max_seqlen_k, PageSize);
+    int page_extent         = IsPagedKV ? mutlass::ceil_div(problem_size.total_k, PageSize) : 1;
 
     ShapeQTme  shape_q = make_shape(HeadRatio, problem_size.total_q, HeadDim, problem_size.num_kv_heads);
     StrideQTme stride_q =
@@ -242,7 +303,7 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
       stride_k = make_stride(int64_t(problem_size.num_kv_heads) * HeadDim,
                              _1{},
                              int64_t(HeadDim),
-                             int64_t(TileKV) * problem_size.num_kv_heads * HeadDim);
+                             int64_t(PageSize) * problem_size.num_kv_heads * HeadDim);
     } else {
       shape_k  = make_shape(problem_size.total_k, HeadDim, problem_size.num_kv_heads, 1);
       stride_k = make_stride(int64_t(problem_size.num_kv_heads) * HeadDim, _1{}, int64_t(HeadDim), int64_t(0));
@@ -339,6 +400,28 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   }
 
   template <class WorkTile>
+  static MUTLASS_DEVICE int first_masked_k_tile(Params const& params, WorkTile const& work_tile) {
+    // A partial KV tail starts at floor(kv_len / TileKV).  When kv_len is
+    // aligned there is no tail tile, so begin after the final valid tile.
+    int first_masked = work_tile.valid_k_tiles;
+    if (work_tile.kv_len % TileKV != 0) {
+      first_masked = work_tile.kv_len / TileKV;
+    }
+    if constexpr (IsCausal) {
+      // Count the keys visible to the first Q row. Any K tile starting at or
+      // after this quotient needs the per-row causal predicate. A Q work spans
+      // at most TileKV rows, so this covers at most two boundary tiles.
+      int visible_to_first = work_tile.q_local_begin + params.args.ptr_qo_offset[work_tile.batch_idx] + 1;
+      visible_to_first     = visible_to_first > 0 ? visible_to_first : 0;
+      int first_causal     = visible_to_first / TileKV;
+      if (first_causal < first_masked) {
+        first_masked = first_causal;
+      }
+    }
+    return first_masked;
+  }
+
+  template <class WorkTile>
   MUTLASS_DEVICE void load_q(Params const&   params,
                              Pipeline&       pipeline,
                              SharedStorage&  shared_storage,
@@ -357,8 +440,8 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   MUTLASS_DEVICE void load_k(Params const&   params,
                              Pipeline&       pipeline,
                              SharedStorage&  shared_storage,
-                             WorkTile const& work_tile) const {
-    int page_idx = safe_page_idx(params, work_tile);
+                             WorkTile const& work_tile,
+                             int             page_idx) const {
     pipeline.k.producer_acquire(pipeline.k_write);
     uint32_t bar_id  = pipeline.k.producer_get_barrier_id(pipeline.k_write);
     auto     cta_tme = params.load_k.tme_load.get_slice(0);
@@ -371,10 +454,9 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   }
 
   template <class WorkTile>
-  MUTLASS_DEVICE void prefetch_k(Params const& params, WorkTile const& work_tile) const {
-    int    page_idx = safe_page_idx(params, work_tile);
-    Tensor gK       = make_tme_k_gmem(params.load_k, work_tile, page_idx);
-    auto   cta_tme  = params.load_k.tme_load.get_slice(0);
+  MUTLASS_DEVICE void prefetch_k(Params const& params, WorkTile const& work_tile, int page_idx) const {
+    Tensor gK      = make_tme_k_gmem(params.load_k, work_tile, page_idx);
+    auto   cta_tme = params.load_k.tme_load.get_slice(0);
     mute::prefetch(params.load_k.tme_load, cta_tme.partition_S(gK));
   }
 
@@ -396,6 +478,12 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   }
 
   MUTLASS_DEVICE void wait_k(Pipeline& pipeline, int consumer_thread_idx) const {
+    if constexpr (UseKPipelinePhaseGuard) {
+      if (pipeline.k_read.barrier_index() == 0) {
+        uint32_t const guard_id = pipeline.k_read.phase() == 0 ? KPipelinePhase0GuardId : KPipelinePhase1GuardId;
+        mutlass::arch::AsyncBarrier::sync(guard_id);
+      }
+    }
     int lane_idx = consumer_thread_idx % NumThreadsPerWarp;
     if (lane_idx == 0) {
       pipeline.k.consumer_wait(pipeline.k_read);
@@ -412,115 +500,160 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
     ++pipeline.k_read;
   }
 
-  template <bool ApplyMask, class AccQK, class WorkTile>
-  MUTLASS_DEVICE void store_rowmax_impl(Params const&   params,
-                                        AccQK&          acc_qk,
-                                        WorkTile const& work_tile,
-                                        int             consumer_thread_idx) const {
+  template <class WorkTile>
+  MUTLASS_DEVICE RowmaxStoreParams make_rowmax_store_params(Params const&   params,
+                                                            WorkTile const& work_tile,
+                                                            int             consumer_thread_idx) const {
     TiledMmaQK tiled_mma_qk;
     auto       thr_mma_qk = tiled_mma_qk.get_thread_slice(consumer_thread_idx);
+    Tensor     cQK        = make_identity_tensor(make_shape(Int<TileQ>{}, Int<TileKV>{}));
+    Tensor     tCcQK      = thr_mma_qk.partition_C(cQK);
+    Tensor     tCcQK_mn = make_tensor(tCcQK.data(), mate::attention::fmha::layout_acc_mn(tiled_mma_qk, tCcQK.layout()));
+    static_assert(size<0>(tCcQK_mn) <= MaxStoreRowsPerThread, "unexpected max-score rows per thread");
 
-    auto          reduction_target_qk = mate::attention::fmha::reduction_target_n(tiled_mma_qk);
-    constexpr int red_rank            = decltype(rank(reduction_target_qk))::value;
-    constexpr int reduction_size      = size(mate::attention::fmha::reduction_target_n(TiledMmaQK{}));
+    RowmaxStoreParams store_params{{-1, -1}};
+    constexpr int     reduction_size = size(mate::attention::fmha::reduction_target_n(TiledMmaQK{}));
+    int               lane_idx       = consumer_thread_idx % NumThreadsPerWarp;
+    if ((lane_idx % reduction_size) == 0) {
+      MUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < size<0>(tCcQK_mn); ++m) {
+        int row             = int(get<0>(tCcQK_mn(m, 0)));
+        int token_row_local = row / HeadRatio;
+        if (token_row_local < work_tile.q_count) {
+          int head_local = row - token_row_local * HeadRatio;
+          int q_abs      = work_tile.q_abs_begin + token_row_local;
+          int head_q     = work_tile.head_kv * HeadRatio + head_local;
+          store_params.output_row_base[m] =
+              (int64_t(q_abs) * params.args.num_qo_heads + head_q) * params.args.max_k_tiles;
+        }
+      }
+    }
+    return store_params;
+  }
 
+  template <class AccQK, class WorkTile>
+  MUTLASS_DEVICE void apply_score_mask(Params const&   params,
+                                       AccQK&          acc_qk,
+                                       WorkTile const& work_tile,
+                                       int             consumer_thread_idx) const {
+    TiledMmaQK tiled_mma_qk;
+    auto       thr_mma_qk = tiled_mma_qk.get_thread_slice(consumer_thread_idx);
     Tensor acc_qk_mn = make_tensor(acc_qk.data(), mate::attention::fmha::layout_acc_mn(tiled_mma_qk, acc_qk.layout()));
     Tensor cQK       = make_identity_tensor(make_shape(Int<TileQ>{}, Int<TileKV>{}));
     Tensor tCcQK     = thr_mma_qk.partition_C(cQK);
     Tensor tCcQK_mn  = make_tensor(tCcQK.data(), mate::attention::fmha::layout_acc_mn(tiled_mma_qk, tCcQK.layout()));
 
-    static_assert(size<1>(acc_qk_mn) % 4 == 0, "N must be a multiple of 4");
+    int q_token_begin = work_tile.q_local_begin;
+    int k_begin       = work_tile.k_tile_begin;
+    int causal_offset = IsCausal ? params.args.ptr_qo_offset[work_tile.batch_idx] : 0;
 
-    int  q_token_begin  = work_tile.q_local_begin;
-    int  k_begin        = work_tile.k_tile_begin;
-    int  causal_offset  = IsCausal ? params.args.ptr_qo_offset[work_tile.batch_idx] : 0;
-    int  lane_idx       = consumer_thread_idx % NumThreadsPerWarp;
-    bool reduction_head = (lane_idx % reduction_size) == 0;
-
-    ShapeMaxScore  shape_max_score = make_shape(params.args.total_q, params.args.num_qo_heads, params.args.max_k_tiles);
-    StrideMaxScore stride_max_score = make_stride(
-        int64_t(params.args.num_qo_heads) * params.args.max_k_tiles, int64_t(params.args.max_k_tiles), _1{});
-    Tensor mMaxScore = make_tensor(make_gmem_ptr(params.args.ptr_max_score), shape_max_score, stride_max_score);
-    Tensor gMaxScore = mMaxScore(_, _, work_tile.k_tile_idx);
-
+    // Consume each column predicate immediately for every accumulator row.
+    // This keeps the causal/tail predicate live range short after the fully
+    // unrolled loops, matching the source structure of the TileLang kernel.
     MUTLASS_PRAGMA_UNROLL
-    for (int m = 0; m < size<0>(acc_qk_mn); ++m) {
-      int    row       = int(get<0>(tCcQK_mn(m, 0)));
-      int    token_row = row / HeadRatio;
-      bool   row_valid = token_row < work_tile.q_count;
-      float4 row_max_cur;
-
+    for (int n = 0; n < size<1>(acc_qk_mn); ++n) {
+      int col     = int(get<1>(tCcQK_mn(0, n)));
+      int k_local = k_begin + col;
       MUTLASS_PRAGMA_UNROLL
-      for (int n = 0; n < size<1>(acc_qk_mn); n += 4) {
-        auto masked_acc = [&](int ni) {
-          if constexpr (!ApplyMask) {
-            return float(acc_qk_mn(m, n + ni));
-          } else {
-            int  col     = int(get<1>(tCcQK_mn(m, n + ni)));
-            int  k_local = k_begin + col;
-            bool valid   = row_valid && k_local < work_tile.kv_len;
-            if constexpr (IsCausal) {
-              int q_local = q_token_begin + token_row;
-              valid       = valid && k_local <= q_local + causal_offset;
-            }
-            return valid ? float(acc_qk_mn(m, n + ni)) : -std::numeric_limits<float>::infinity();
+      for (int m = 0; m < size<0>(acc_qk_mn); ++m) {
+        if constexpr (IsCausal) {
+          int row        = int(get<0>(tCcQK_mn(m, n)));
+          int token_row  = row / HeadRatio;
+          int q_local    = q_token_begin + token_row;
+          int last_valid = std::min(work_tile.kv_len - 1, q_local + causal_offset);
+          if (k_local > last_valid) {
+            acc_qk_mn(m, n) = -std::numeric_limits<float>::infinity();
           }
-        };
-
-        float4 vec_acc = make_float4(masked_acc(0), masked_acc(1), masked_acc(2), masked_acc(3));
-        if (n == 0) {
-          row_max_cur = vec_acc;
-        } else {
-          mute::max(row_max_cur, vec_acc, row_max_cur);
+        } else if (k_local >= work_tile.kv_len) {
+          acc_qk_mn(m, n) = -std::numeric_limits<float>::infinity();
         }
-      }
-
-      float2 row_max_pair;
-      mute::max(row_max_pair, make_float2(row_max_cur.x, row_max_cur.y), make_float2(row_max_cur.z, row_max_cur.w));
-      float row_max = max(row_max_pair.x, row_max_pair.y);
-
-      for_each(make_seq<red_rank>{}, [&](auto r) {
-        MUTLASS_PRAGMA_UNROLL
-        for (int j = 1; j < shape<r>(reduction_target_qk); j *= 2) {
-          row_max = max(row_max, __shfl_xor_sync(uint32_t(-1), row_max, stride<r>(reduction_target_qk) * j));
-        }
-      });
-
-      if (row_valid && reduction_head) {
-        int token_row_local      = row / HeadRatio;
-        int head_local           = row - token_row_local * HeadRatio;
-        int q_abs                = work_tile.q_abs_begin + token_row_local;
-        int head_q               = work_tile.head_kv * HeadRatio + head_local;
-        gMaxScore(q_abs, head_q) = row_max;
       }
     }
   }
 
   template <class AccQK, class WorkTile>
-  MUTLASS_DEVICE void store_rowmax(Params const&   params,
-                                   AccQK&          acc_qk,
-                                   WorkTile const& work_tile,
-                                   int             consumer_thread_idx) const {
-    int  q_token_begin    = work_tile.q_local_begin;
-    int  k_begin          = work_tile.k_tile_begin;
-    int  causal_offset    = IsCausal ? params.args.ptr_qo_offset[work_tile.batch_idx] : 0;
-    bool tile_fully_valid = k_begin + TileKV <= work_tile.kv_len;
-    if constexpr (IsCausal) {
-      tile_fully_valid = tile_fully_valid && k_begin + TileKV - 1 <= q_token_begin + causal_offset;
+  MUTLASS_DEVICE void store_rowmax(Params const&            params,
+                                   AccQK&                   acc_qk,
+                                   WorkTile const&          work_tile,
+                                   RowmaxStoreParams const& store_params) const {
+    TiledMmaQK tiled_mma_qk;
+
+    auto          reduction_target_qk = mate::attention::fmha::reduction_target_n(tiled_mma_qk);
+    constexpr int red_rank            = decltype(rank(reduction_target_qk))::value;
+    Tensor acc_qk_mn = make_tensor(acc_qk.data(), mate::attention::fmha::layout_acc_mn(tiled_mma_qk, acc_qk.layout()));
+
+    static_assert(size<1>(acc_qk_mn) % 4 == 0, "N must be a multiple of 4");
+    static_assert(size<0>(acc_qk_mn) <= MaxStoreRowsPerThread, "unexpected max-score rows per thread");
+
+    float4 row_max_cur[MaxStoreRowsPerThread];
+    float  row_max[MaxStoreRowsPerThread];
+
+    MUTLASS_PRAGMA_UNROLL
+    for (int n = 0; n < size<1>(acc_qk_mn); n += 4) {
+      MUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < size<0>(acc_qk_mn); ++m) {
+        float4 vec_acc = make_float4(
+            float(acc_qk_mn(m, n)), float(acc_qk_mn(m, n + 1)), float(acc_qk_mn(m, n + 2)), float(acc_qk_mn(m, n + 3)));
+        if (n == 0) {
+          row_max_cur[m] = vec_acc;
+        } else {
+          mute::max(row_max_cur[m], vec_acc, row_max_cur[m]);
+        }
+      }
     }
-    if (tile_fully_valid) {
-      store_rowmax_impl<false>(params, acc_qk, work_tile, consumer_thread_idx);
-    } else {
-      store_rowmax_impl<true>(params, acc_qk, work_tile, consumer_thread_idx);
+
+    MUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < size<0>(acc_qk_mn); ++m) {
+      float2 row_max_pair;
+      mute::max(row_max_pair,
+                make_float2(row_max_cur[m].x, row_max_cur[m].y),
+                make_float2(row_max_cur[m].z, row_max_cur[m].w));
+      row_max[m] = max(row_max_pair.x, row_max_pair.y);
+    }
+
+    for_each(make_seq<red_rank>{}, [&](auto r) {
+      MUTLASS_PRAGMA_UNROLL
+      for (int j = 1; j < shape<r>(reduction_target_qk); j *= 2) {
+        MUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < size<0>(acc_qk_mn); ++m) {
+          row_max[m] = max(row_max[m], __shfl_xor_sync(uint32_t(-1), row_max[m], stride<r>(reduction_target_qk) * j));
+        }
+      }
+    });
+
+    MUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < size<0>(acc_qk_mn); ++m) {
+      int64_t output_row_base = store_params.output_row_base[m];
+      if (output_row_base >= 0) {
+        params.args.ptr_max_score[output_row_base + work_tile.k_tile_idx] = row_max[m];
+      }
     }
   }
 
+  template <class AccQK, class WorkTile>
+  MUTLASS_DEVICE void mask_and_store_rowmax(Params const&            params,
+                                            AccQK&                   acc_qk,
+                                            WorkTile const&          work_tile,
+                                            int                      first_masked_k_tile,
+                                            RowmaxStoreParams const& store_params,
+                                            int                      consumer_thread_idx) const {
+    // The Q-work prologue has already found the first possible causal/length
+    // boundary. Keep the common path to one comparison and evaluate the full
+    // per-score predicate only for the one or two boundary tiles.
+    if (work_tile.k_tile_idx >= first_masked_k_tile) {
+      apply_score_mask(params, acc_qk, work_tile, consumer_thread_idx);
+    }
+    store_rowmax(params, acc_qk, work_tile, store_params);
+  }
+
   template <class WorkTile>
-  MUTLASS_DEVICE void compute_k_tile(Params const&   params,
-                                     Pipeline&       pipeline,
-                                     SharedStorage&  shared_storage,
-                                     WorkTile const& work_tile,
-                                     int             consumer_thread_idx) const {
+  MUTLASS_DEVICE void compute_k_tile(Params const&            params,
+                                     Pipeline&                pipeline,
+                                     SharedStorage&           shared_storage,
+                                     WorkTile const&          work_tile,
+                                     int                      first_masked_k_tile,
+                                     RowmaxStoreParams const& store_params,
+                                     int                      consumer_thread_idx) const {
     wait_k(pipeline, consumer_thread_idx);
 
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{})(_, _, pipeline.q_read.index());
@@ -538,7 +671,7 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
     mate::warpsquad_wait();
     release_k(pipeline, consumer_thread_idx);
 
-    store_rowmax(params, acc_qk, work_tile, consumer_thread_idx);
+    mask_and_store_rowmax(params, acc_qk, work_tile, first_masked_k_tile, store_params, consumer_thread_idx);
   }
 };
 

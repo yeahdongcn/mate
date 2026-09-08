@@ -6,18 +6,14 @@ import torch
 import torch_musa  # noqa: F401
 from mate import flash_attn_varlen_func
 from mate.execution_context import (
-    MateDryRunComplete,
     is_dry_run_enabled,
-    maybe_fake_tensor_mode,
+    raise_complete_if_dry_run,
 )
 from mate.flash_attention.tilelang.flash_attention_varlen_bwd import (
     flashattn_varlen_bwd_interface,
 )
 from typing import NamedTuple, Optional  # noqa: F401
 from mate.testing import supported_musa_compute_capability
-
-
-USE_FAKE_MODE = is_dry_run_enabled()
 
 
 def ref_attn(
@@ -314,18 +310,17 @@ def _dry_run_fmha_forward_backward(
     is_causal: bool,
     deterministic: bool,
 ) -> None:
-    with pytest.raises(MateDryRunComplete):
-        flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            causal=is_causal,
-            deterministic=deterministic,
-        )
+    flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=is_causal,
+        deterministic=deterministic,
+    )
 
     out = torch.empty((*q.shape[:-1], v.shape[-1]), dtype=q.dtype, device=q.device)
     if q.ndim == 3:
@@ -339,28 +334,27 @@ def _dry_run_fmha_forward_backward(
             device=q.device,
         )
 
-    with pytest.raises(MateDryRunComplete):
-        flashattn_varlen_bwd_interface(
-            q,
-            k,
-            v,
-            out,
-            torch.empty_like(out),
-            softmax_lse,
-            max_seqlen_q,
-            max_seqlen_k,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            is_causal=is_causal,
-            smscale=q.shape[-1] ** -0.5,
-            dtype=None,
-            is_bhsd=False,
-            deterministic=deterministic,
-        )
+    flashattn_varlen_bwd_interface(
+        q,
+        k,
+        v,
+        out,
+        torch.empty_like(out),
+        softmax_lse,
+        max_seqlen_q,
+        max_seqlen_k,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        is_causal=is_causal,
+        smscale=q.shape[-1] ** -0.5,
+        dtype=None,
+        is_bhsd=False,
+        deterministic=deterministic,
+    )
+    raise_complete_if_dry_run()
 
 
 @supported_musa_compute_capability([31])
-@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -444,7 +438,7 @@ def test_varlen_fast_attn(
         dim=0, dtype=torch.int32
     )
 
-    if USE_FAKE_MODE:
+    if is_dry_run_enabled():
         _dry_run_fmha_forward_backward(
             q_fa,
             k_fa,
@@ -537,7 +531,6 @@ def test_varlen_fast_attn(
 
 
 @supported_musa_compute_capability([31])
-@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("seq_lens", [[(511, 511)], [(63, 63)]])
 @pytest.mark.parametrize("num_heads", [(6, 1), (6, 6)])
 @pytest.mark.parametrize(
@@ -596,7 +589,7 @@ def test_bshd_fast_attn(
 
     q_fa, k_fa, v_fa = map(clone_with_grad, (query, key_cache, value_cache))
 
-    if USE_FAKE_MODE:
+    if is_dry_run_enabled():
         _dry_run_fmha_forward_backward(
             q_fa,
             k_fa,

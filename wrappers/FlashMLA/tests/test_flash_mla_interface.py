@@ -823,6 +823,9 @@ MODEL1_DECODE_CASES = [
     "case",
     [
         ("no_extra", 4, 64, None, 0, None),
+        # This is just above the 192 KiB metadata-kernel shared-memory limit
+        # on S5000 and exercises the compact shared-memory fallback path.
+        ("large_batch_fallback", 9831, 128, None, 0, None),
         ("extra_static", 4, 64, None, 64, None),
         (
             "dynamic_length",

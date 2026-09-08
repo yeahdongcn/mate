@@ -15,30 +15,30 @@ using namespace mute;
 // Store a physical M16 tile as two adjacent TP8 query tokens:
 //   rows  0..7  -> q_abs + 0
 //   rows  8..15 -> q_abs + 1
-template <class Element_>
+template <class ElementOutput_>
 struct MsaFwdPairEpilogue {
-  using Element = Element_;
+  using ElementOutput = ElementOutput_;
 
   static constexpr int HeadRatio      = 8;
   static constexpr int QueriesPerTile = 2;
   static constexpr int HeadDim        = 128;
 
-  static constexpr bool IsSupportedElement = std::is_same_v<Element, mutlass::float_e4m3_t> ||
-                                             std::is_same_v<Element, mutlass::half_t> ||
-                                             std::is_same_v<Element, mutlass::bfloat16_t>;
-  static_assert(IsSupportedElement, "MSA forward supports FP8 E4M3, FP16, and BF16 outputs.");
+  static constexpr bool IsSupportedOutput = std::is_same_v<ElementOutput, mutlass::float_e4m3_t> ||
+                                            std::is_same_v<ElementOutput, mutlass::half_t> ||
+                                            std::is_same_v<ElementOutput, mutlass::bfloat16_t>;
+  static_assert(IsSupportedOutput, "MSA forward supports FP8 E4M3, FP16, and BF16 outputs.");
 
   struct Arguments {
-    Element* ptr_o   = nullptr;
-    float*   ptr_lse = nullptr;
+    ElementOutput* ptr_o   = nullptr;
+    float*         ptr_lse = nullptr;
   };
 
   struct Params {
-    Element* ptr_o;
-    float*   ptr_lse;
-    int      total_q;
-    int      num_qo_heads;
-    int      head_ratio;
+    ElementOutput* ptr_o;
+    float*         ptr_lse;
+    int            total_q;
+    int            num_qo_heads;
+    int            head_ratio;
   };
 
   template <class ProblemSize>
@@ -99,7 +99,7 @@ struct MsaFwdPairEpilogue {
       for (int n = 0; n < size<1>(acc_pv_mn); ++n) {
         int     col                 = static_cast<int>(get<1>(tCcOutput_mn(m, n)));
         int64_t output_offset       = (int64_t(q_abs) * params.num_qo_heads + int64_t(head_q)) * HeadDim + int64_t(col);
-        params.ptr_o[output_offset] = Element(acc_pv_mn(m, n));
+        params.ptr_o[output_offset] = ElementOutput(acc_pv_mn(m, n));
       }
 
       if (get<1>(tCcOutput_mn(m, 0)) == 0) {

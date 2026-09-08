@@ -15,7 +15,15 @@ import torch
 # Add parent directory to path for importing sageattention
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sageattention import sageattn, sageattn_qk_int8_pv_fp8_cuda_sm90
+import sageattention.interface as sageattention_interface  # noqa: F401
+from sageattention import (
+    sageattn,
+    sageattn_varlen,  # noqa: F401
+    sageattn_qk_int8_pv_fp16_cuda,  # noqa: F401
+    sageattn_qk_int8_pv_fp16_triton,  # noqa: F401
+    sageattn_qk_int8_pv_fp8_cuda,  # noqa: F401
+    sageattn_qk_int8_pv_fp8_cuda_sm90,
+)
 from mate.testing import quantize_sage_attention_tensor
 from mate.testing.flash_attn import attention_ref
 

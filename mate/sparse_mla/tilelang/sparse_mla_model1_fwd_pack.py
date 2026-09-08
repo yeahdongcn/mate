@@ -17,15 +17,14 @@ import torch
 import tilelang
 from tilelang import language as T
 
-from ...utils import cosize
 from .sparse_mla_prefill_common import (
     SPARSE_PREFILL_COMPILE_FLAGS,
     SPARSE_PREFILL_PASS_CONFIGS,
     validate_prefill_attn_sink,
     validate_token_lengths,
 )
-from .sparse_mla_index_type import jit_for_tensor_addressing
-from ...execution_context import raise_complete_if_dry_run
+from .sparse_mla_index_type import jit_for_tensor_addressing, tensor_byte_span
+from ...execution_context import skip_kernel_launch_if_dry_run
 
 
 # tilelang.disable_cache()
@@ -69,9 +68,6 @@ def sparse_attention_fwd_kernel_model1_pack(
     indices_dtype = "int32"
     dtype = "bfloat16"
     accum_dtype = "float"
-    dtype_bytes = 2
-    q_cosize = cosize(q_shape)
-    kv_cosize = cosize(kv_shape)
     padded_head_kv = max(tilelang.math.next_power_of_2(head_kv), 64)
     if padded_head_kv != head_kv:
         assert kv_group == 1
@@ -103,6 +99,8 @@ def sparse_attention_fwd_kernel_model1_pack(
         causal_window,
         compressed_kv_len,
         compress_ratio,
+        q_span_bytes,
+        kv_span_bytes,
     ):
         with T.Kernel(seq_len * head_repeats, kv_group, threads=threads) as (bx, by):
             q_shared_l = T.alloc_shared([heads_per_block, dim_qk // 2], dtype)
@@ -143,11 +141,11 @@ def sparse_attention_fwd_kernel_model1_pack(
 
             q_robust_desc = T.make_robust_desc(
                 T.address_of(q[0, 0, 0]),
-                q_cosize * dtype_bytes,
+                q_span_bytes,
             )
             kv_robust_desc = T.make_robust_desc(
                 T.address_of(kv[0, 0, 0]),
-                kv_cosize * dtype_bytes,
+                kv_span_bytes,
             )
             T.sync_threads()
 
@@ -734,6 +732,8 @@ def sparse_attention_fwd_kernel_model1_pack(
             causal_window: T.int32,
             compressed_kv_len: T.int32,
             compress_ratio: T.int32,
+            q_span_bytes: T.int64,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -749,6 +749,8 @@ def sparse_attention_fwd_kernel_model1_pack(
                 causal_window,
                 compressed_kv_len,
                 compress_ratio,
+                q_span_bytes,
+                kv_span_bytes,
             )
 
     elif has_topk_length and has_row_mask:
@@ -767,6 +769,8 @@ def sparse_attention_fwd_kernel_model1_pack(
             causal_window: T.int32,
             compressed_kv_len: T.int32,
             compress_ratio: T.int32,
+            q_span_bytes: T.int64,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -782,6 +786,8 @@ def sparse_attention_fwd_kernel_model1_pack(
                 causal_window,
                 compressed_kv_len,
                 compress_ratio,
+                q_span_bytes,
+                kv_span_bytes,
             )
 
     elif has_topk_length and has_attn_sink:
@@ -800,6 +806,8 @@ def sparse_attention_fwd_kernel_model1_pack(
             causal_window: T.int32,
             compressed_kv_len: T.int32,
             compress_ratio: T.int32,
+            q_span_bytes: T.int64,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -815,6 +823,8 @@ def sparse_attention_fwd_kernel_model1_pack(
                 causal_window,
                 compressed_kv_len,
                 compress_ratio,
+                q_span_bytes,
+                kv_span_bytes,
             )
 
     elif has_topk_length:
@@ -832,6 +842,8 @@ def sparse_attention_fwd_kernel_model1_pack(
             causal_window: T.int32,
             compressed_kv_len: T.int32,
             compress_ratio: T.int32,
+            q_span_bytes: T.int64,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -847,6 +859,8 @@ def sparse_attention_fwd_kernel_model1_pack(
                 causal_window,
                 compressed_kv_len,
                 compress_ratio,
+                q_span_bytes,
+                kv_span_bytes,
             )
 
     elif has_row_mask and has_attn_sink:
@@ -865,6 +879,8 @@ def sparse_attention_fwd_kernel_model1_pack(
             causal_window: T.int32,
             compressed_kv_len: T.int32,
             compress_ratio: T.int32,
+            q_span_bytes: T.int64,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -880,6 +896,8 @@ def sparse_attention_fwd_kernel_model1_pack(
                 causal_window,
                 compressed_kv_len,
                 compress_ratio,
+                q_span_bytes,
+                kv_span_bytes,
             )
 
     elif has_row_mask:
@@ -897,6 +915,8 @@ def sparse_attention_fwd_kernel_model1_pack(
             causal_window: T.int32,
             compressed_kv_len: T.int32,
             compress_ratio: T.int32,
+            q_span_bytes: T.int64,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -912,6 +932,8 @@ def sparse_attention_fwd_kernel_model1_pack(
                 causal_window,
                 compressed_kv_len,
                 compress_ratio,
+                q_span_bytes,
+                kv_span_bytes,
             )
 
     elif has_attn_sink:
@@ -929,6 +951,8 @@ def sparse_attention_fwd_kernel_model1_pack(
             causal_window: T.int32,
             compressed_kv_len: T.int32,
             compress_ratio: T.int32,
+            q_span_bytes: T.int64,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -944,6 +968,8 @@ def sparse_attention_fwd_kernel_model1_pack(
                 causal_window,
                 compressed_kv_len,
                 compress_ratio,
+                q_span_bytes,
+                kv_span_bytes,
             )
 
     else:
@@ -960,6 +986,8 @@ def sparse_attention_fwd_kernel_model1_pack(
             causal_window: T.int32,
             compressed_kv_len: T.int32,
             compress_ratio: T.int32,
+            q_span_bytes: T.int64,
+            kv_span_bytes: T.int64,
         ):
             dsa_prefill_body(
                 q,
@@ -975,6 +1003,8 @@ def sparse_attention_fwd_kernel_model1_pack(
                 causal_window,
                 compressed_kv_len,
                 compress_ratio,
+                q_span_bytes,
+                kv_span_bytes,
             )
 
     return dsa_prefill
@@ -1120,7 +1150,7 @@ def sparse_mla_fwd_interface_model1_pack(
         "has_topk_length": topk_length is not None,
         "has_row_mask": row_masks is not None,
     }
-    # These inputs dominate the contiguous output and auxiliary tensor spans.
+    # Tensor byte spans belong to the runtime PrimFunc ABI, not the JIT key.
     kernel_factory = jit_for_tensor_addressing(
         sparse_attention_fwd_kernel_model1_pack,
         q_pack,
@@ -1132,8 +1162,6 @@ def sparse_mla_fwd_interface_model1_pack(
     kernel = kernel_factory(packed_heads, dim, pack_s, **kernel_kwargs)
     if verbose:
         kernel.show_source()
-    raise_complete_if_dry_run()
-
     args = [q_pack, kv, indices]
     if topk_length is not None:
         args.append(topk_length)
@@ -1143,11 +1171,17 @@ def sparse_mla_fwd_interface_model1_pack(
         args.append(attn_sink_pack)
     args.append(runtime_sm_scale)
     args.extend((int(causal_window), int(compressed_kv_len), int(compress_ratio)))
-    out = kernel(*args)
-    out_tensor, max_logits, lse_tensor = out
-    out_tensor = out_tensor.view(seq_len, heads, dim)
-    lse_tensor = lse_tensor.view(seq_len, heads)
-    max_logits = max_logits.view(seq_len, heads)
+    args.extend((tensor_byte_span(q_pack), tensor_byte_span(kv)))
+    if skip_kernel_launch_if_dry_run():
+        out_tensor = torch.empty((seq_len, heads, dim), dtype=q.dtype, device=q.device)
+        max_logits = torch.empty((seq_len, heads), dtype=torch.float32, device=q.device)
+        lse_tensor = torch.empty_like(max_logits)
+    else:
+        out = kernel(*args)
+        out_tensor, max_logits, lse_tensor = out
+        out_tensor = out_tensor.view(seq_len, heads, dim)
+        lse_tensor = lse_tensor.view(seq_len, heads)
+        max_logits = max_logits.view(seq_len, heads)
     if return_max_logits:
         return out_tensor, max_logits, lse_tensor
     return out_tensor, lse_tensor

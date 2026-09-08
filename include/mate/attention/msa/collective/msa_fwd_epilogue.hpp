@@ -12,32 +12,32 @@ namespace mate::attention::msa::collective {
 
 using namespace mute;
 
-template <class Element_>
+template <class ElementOutput_>
 struct MsaFwdEpilogue {
-  using Element = Element_;
+  using ElementOutput = ElementOutput_;
 
   static constexpr int HeadRatio = 16;
   static constexpr int HeadDim   = 128;
 
-  static constexpr bool IsSupportedElement = std::is_same_v<Element, mutlass::float_e4m3_t> ||
-                                             std::is_same_v<Element, mutlass::half_t> ||
-                                             std::is_same_v<Element, mutlass::bfloat16_t>;
-  static_assert(IsSupportedElement, "MSA forward supports FP8 E4M3, FP16, and BF16 outputs.");
+  static constexpr bool IsSupportedOutput = std::is_same_v<ElementOutput, mutlass::float_e4m3_t> ||
+                                            std::is_same_v<ElementOutput, mutlass::half_t> ||
+                                            std::is_same_v<ElementOutput, mutlass::bfloat16_t>;
+  static_assert(IsSupportedOutput, "MSA forward supports FP8 E4M3, FP16, and BF16 outputs.");
 
   // ABI expected by the generated binding:
-  //   O:   [total_q, Hq, 128], contiguous Element
+  //   O:   [total_q, Hq, 128], contiguous ElementOutput
   //   LSE: [total_q, Hq], contiguous float
   struct Arguments {
-    Element* ptr_o   = nullptr;
-    float*   ptr_lse = nullptr;
+    ElementOutput* ptr_o   = nullptr;
+    float*         ptr_lse = nullptr;
   };
 
   struct Params {
-    Element* ptr_o;
-    float*   ptr_lse;
-    int      total_q;
-    int      num_qo_heads;
-    int      head_ratio;
+    ElementOutput* ptr_o;
+    float*         ptr_lse;
+    int            total_q;
+    int            num_qo_heads;
+    int            head_ratio;
   };
 
   template <class ProblemSize>
@@ -98,7 +98,7 @@ struct MsaFwdEpilogue {
         int     col = static_cast<int>(get<1>(tCcOutput_mn(m, n)));
         int64_t output_offset =
             (int64_t(work_tile.q_abs) * params.num_qo_heads + int64_t(head_q)) * HeadDim + int64_t(col);
-        params.ptr_o[output_offset] = Element(acc_pv_mn(m, n));
+        params.ptr_o[output_offset] = ElementOutput(acc_pv_mn(m, n));
       }
 
       // The softmax row is replicated across the MMA N-reduction lanes.

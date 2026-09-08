@@ -93,10 +93,8 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
   using SmemLayoutB =
       decltype(tile_to_shape(SmemLayoutAtomB{}, make_shape(Int<BlockN>{}, Int<BlockK>{}, Int<Stages>{})));
 
-  using SmemLayoutAtomA = Layout<Shape<Int<BlockM>, Int<BlockK>, _2>, Stride<Int<BlockK>, _1, Int<BlockM * BlockK>>>;
-  using SmemLayoutAStorage =
-      decltype(tile_to_shape(SmemLayoutAtomA{}, make_shape(Int<BlockM>{}, Int<BlockK>{}, _2{}, Int<Stages>{})));
-  using SmemLayoutA = decltype(SmemLayoutAStorage{}(_, _, _0{}, _));
+  using SmemLayoutA =
+      Layout<Shape<Int<BlockM>, Int<BlockK>, Int<Stages>>, Stride<Int<BlockK>, _1, Int<BlockM * BlockK>>>;
 
   static constexpr TME::CacheHint TmeAInnerHint      = TME::CacheHint::CACHE_NORMAL;
   static constexpr TME::CacheHint TmeAOuterHint      = TME::CacheHint::CACHE_PERSIST;
@@ -137,7 +135,7 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
 
   static constexpr int MaxBarriersPerStage = 2;
   using PipelineBarrierRatio =
-      mutlass::Mp31PipelineWarpSpecializedBarrierRatio<MaxBarriersPerStage, 1, Stages, Stages, Stages>;
+      mutlass::Mp31PipelineWarpSpecializedBarrierRatio<MaxBarriersPerStage, 0, Stages, Stages, Stages>;
   static constexpr int BarriersPerStage = PipelineBarrierRatio::value;
   static_assert(BarriersPerStage > 0, "A, B, cast, and Scale-B pipelines exceed the MP31 async-barrier budget");
 
@@ -150,7 +148,6 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
   using PipelineLoadAState  = typename PipelineLoadA::PipelineState;
   using PipelineLoadBState  = typename PipelineLoadB::PipelineState;
   using PipelineCastAState  = typename PipelineCastA::PipelineState;
-  using CasterSyncBarrier   = mutlass::arch::AsyncBarrier;
 
   static constexpr int TmeTransactionBytesA =
       mutlass::bits_to_bytes(size(take<0, 2>(SmemLayoutA{})) * sizeof_bits_v<ElementA>);
@@ -193,20 +190,17 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
     uint8_t PipelineLoadA[PipelineLoadA::NumBarriers];
     uint8_t PipelineLoadB[PipelineLoadB::NumBarriers];
     uint8_t PipelineCastA[PipelineCastA::NumBarriers];
-    uint8_t CasterSync[1];
   };
   static_assert(sizeof(BarrierStorage) + mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount <=
                     mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers,
                 "Async barrier storage exceeds the MP31 hardware limit");
 
   struct SharedStorage {
-    union {
-      MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementA, cosize_v<SmemLayoutA>> smem_a;
-      MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementMmaA, cosize_v<SmemLayoutMmaA>> smem_mma_a;
-    };
+    MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementMmaA, cosize_v<SmemLayoutMmaA>> smem_mma_a;
     MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementB, cosize_v<SmemLayoutB>> smem_b;
     MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementScaleA, cosize_v<SmemLayoutScaleA>> smem_scale_a;
     MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementScaleB, cosize_v<SmemLayoutScaleB>> smem_scale_b;
+    MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementA, cosize_v<SmemLayoutA>> smem_a;
   };
 
   struct Arguments {
@@ -386,14 +380,13 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
   }
 
   MUTLASS_DEVICE
-  static void cast(Params const&            params,
-                   SharedStorage&           shared_storage,
-                   PipelineLoadA&           pipeline_load_a,
-                   PipelineCastA&           pipeline_cast_a,
-                   PipelineLoadAState&      pipe_a_read,
-                   PipelineCastAState&      pipe_cast_a_write,
-                   CasterSyncBarrier const& caster_sync,
-                   int                      caster_thread_idx) {
+  static void cast(Params const&       params,
+                   SharedStorage&      shared_storage,
+                   PipelineLoadA&      pipeline_load_a,
+                   PipelineCastA&      pipeline_cast_a,
+                   PipelineLoadAState& pipe_a_read,
+                   PipelineCastAState& pipe_cast_a_write,
+                   int                 caster_thread_idx) {
     Tensor sA    = make_tensor(make_smem_ptr(shared_storage.smem_a.begin()), SmemLayoutA{});
     Tensor sMmaA = make_tensor(make_smem_ptr(shared_storage.smem_mma_a.begin()), SmemLayoutMmaA{});
 
@@ -448,15 +441,14 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
         UniversalCopy<uint32_t>::copy(sAVec(m_idx, first_vector_in_row + vector_idx), rA(vector_idx));
       }
 
+      __syncwarp();
+      pipeline_load_a.consumer_release(pipe_a_read);
       ++pipe_a_read;
 
       MUTE_UNROLL
       for (int vector_idx = 0; vector_idx < VectorsPerThread; ++vector_idx) {
         rMmaAArray(vector_idx) = converter(rAArray(vector_idx));
       }
-
-      const uint32_t caster_phase = caster_sync.arrive</* return_phase = */ true>();
-      caster_sync.wait(caster_phase);
 
       pipeline_cast_a.producer_acquire(pipe_cast_a_write);
 
@@ -550,10 +542,8 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
   MUTLASS_DEVICE
   static auto compute(Params const&       params,
                       SharedStorage&      shared_storage,
-                      PipelineLoadA&      pipeline_load_a,
                       PipelineLoadB&      pipeline_load_b,
                       PipelineCastA&      pipeline_cast_a,
-                      PipelineLoadAState& pipe_a_release,
                       PipelineLoadBState& pipe_b_read,
                       PipelineLoadBState& pipe_b_prefetch,
                       PipelineCastAState& pipe_cast_a_read,
@@ -709,10 +699,8 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
       ::mate::warpsquad_wait<0>();
       scale_accumulate_bst4(rAcc, rAccTempSecond, rScaleSecond);
 
-      pipeline_load_a.consumer_release(pipe_a_release);
       pipeline_cast_a.consumer_release(pipe_cast_a_read);
       pipeline_load_b.consumer_release(pipe_b_read);
-      ++pipe_a_release;
       ++pipe_cast_a_read;
       ++pipe_b_read;
     }
@@ -731,7 +719,7 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
 
     PipelineLoadAParams pipeline_a_params;
     pipeline_a_params.transaction_bytes = TmeTransactionBytesA;
-    pipeline_a_params.num_consumers     = NumConsumerWarpSquads * WarpsPerWarpSquad;
+    pipeline_a_params.num_consumers     = NumCasterWarpSquads * WarpsPerWarpSquad;
     pipeline_a_params.num_producers     = 1;
     PipelineLoadA pipeline_load_a(pipeline_a_params, reinterpret_cast<uint64_t>(&barrier_storage->PipelineLoadA));
 
@@ -745,11 +733,6 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
     pipeline_cast_a_params.producer_arv_count = NumCasterWarpSquads * WarpsPerWarpSquad;
     pipeline_cast_a_params.consumer_arv_count = NumConsumerWarpSquads * WarpsPerWarpSquad;
     PipelineCastA pipeline_cast_a(pipeline_cast_a_params, reinterpret_cast<uint64_t>(&barrier_storage->PipelineCastA));
-
-    CasterSyncBarrier caster_sync(reinterpret_cast<uint64_t>(&barrier_storage->CasterSync));
-    if (threadIdx.x == 0) {
-      caster_sync.init(WarpsPerWarpSquad, 0);
-    }
 
     const int squad_idx           = mutlass::canonical_warp_squad_idx();
     const int warp_idx_in_squad   = mutlass::canonical_warp_idx_sync() % int(WarpsPerWarpSquad);
@@ -801,7 +784,6 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
     }
 
     PipelineLoadAState pipe_a_read;
-    PipelineLoadAState pipe_a_release;
     PipelineLoadBState pipe_b_read;
     PipelineLoadBState pipe_b_prefetch;
     PipelineCastAState pipe_cast_a_read;
@@ -818,7 +800,6 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
              pipeline_cast_a,
              pipe_a_read,
              pipe_cast_a_write,
-             caster_sync,
              caster_thread_idx);
         scheduler.advance_to_next_work();
         work_tile = scheduler.get_work_tile_info();
@@ -834,10 +815,8 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
 #endif
         auto rAcc = compute(params,
                             shared_storage,
-                            pipeline_load_a,
                             pipeline_load_b,
                             pipeline_cast_a,
-                            pipe_a_release,
                             pipe_b_read,
                             pipe_b_prefetch,
                             pipe_cast_a_read,

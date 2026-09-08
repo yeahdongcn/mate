@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import statistics
 import sys
 import warnings
+from itertools import product
 from pathlib import Path
 from typing import Callable
 
@@ -22,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from mate.flash_attention.tilelang.flash_attention_varlen_bwd import (  # noqa: E402
+    _select_bwd_plan,
     flashattn_varlen_bwd_interface,
 )
 
@@ -48,16 +51,7 @@ class InterfaceCase:
 
     @property
     def plan(self) -> str:
-        heads_q_eq_heads_kv = self.heads == self.heads_kv
-        if self.dim == 256:
-            return "split_separate" if self.deterministic else "split"
-        if self.dim == 128:
-            return (
-                "unsplit_separate"
-                if self.deterministic or not heads_q_eq_heads_kv
-                else "unsplit"
-            )
-        raise ValueError(f"unsupported dim: {self.dim}")
+        return _select_bwd_plan(self.dim, self.deterministic)
 
     @property
     def uses_separate_kernels(self) -> bool:
@@ -138,6 +132,118 @@ def _dtype_from_name(name: str) -> torch.dtype:
     if name in ("fp16", "float16", "half"):
         return torch.float16
     raise ValueError(f"unsupported dtype: {name}")
+
+
+def _case_id(case: InterfaceCase) -> str:
+    dtype = str(case.dtype).removeprefix("torch.")
+    causal = "causal" if case.causal else "noncausal"
+    deterministic = "det" if case.deterministic else "nondet"
+    return (
+        f"h{case.heads}-hkv{case.heads_kv}-s{case.total_seq_q}-d{case.dim}-"
+        f"{dtype}-{causal}-{deterministic}"
+    )
+
+
+def _shape_axis(payload: dict[str, object], name: str, expected_type: type) -> list:
+    values = payload.get(name)
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"shape list field {name!r} must be a non-empty list")
+    if any(type(value) is not expected_type for value in values):
+        raise ValueError(
+            f"shape list field {name!r} must contain only {expected_type.__name__}"
+        )
+    if len(values) != len(set(values)):
+        raise ValueError(f"shape list field {name!r} contains duplicates")
+    return values
+
+
+def _load_shape_list(path: Path) -> list[InterfaceCase]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError("shape list must be a JSON object")
+    expected_fields = {
+        "schema_version",
+        "name",
+        "batch",
+        "head_configs",
+        "sequences",
+        "dims",
+        "dtypes",
+        "causal",
+        "deterministic",
+    }
+    unknown = set(payload) - expected_fields
+    missing = expected_fields - set(payload)
+    if unknown or missing:
+        raise ValueError(
+            f"shape list fields mismatch: missing={sorted(missing)}, "
+            f"unknown={sorted(unknown)}"
+        )
+    if payload["schema_version"] != 1:
+        raise ValueError(
+            f"unsupported shape list schema: {payload['schema_version']!r}"
+        )
+    if not isinstance(payload["name"], str) or not payload["name"]:
+        raise ValueError("shape list name must be a non-empty string")
+    batch = payload["batch"]
+    if type(batch) is not int or batch <= 0:
+        raise ValueError("shape list batch must be a positive integer")
+
+    raw_head_configs = payload["head_configs"]
+    if not isinstance(raw_head_configs, list) or not raw_head_configs:
+        raise ValueError("shape list head_configs must be a non-empty list")
+    head_configs: list[tuple[int, int]] = []
+    for index, config in enumerate(raw_head_configs):
+        if not isinstance(config, dict) or set(config) != {"heads", "heads_kv"}:
+            raise ValueError(f"head_configs[{index}] must define heads and heads_kv")
+        heads, heads_kv = config["heads"], config["heads_kv"]
+        if type(heads) is not int or type(heads_kv) is not int:
+            raise ValueError(f"head_configs[{index}] values must be integers")
+        if heads <= 0 or heads_kv <= 0 or heads % heads_kv:
+            raise ValueError(
+                f"head_configs[{index}] must use positive, divisible head counts"
+            )
+        head_configs.append((heads, heads_kv))
+    if len(head_configs) != len(set(head_configs)):
+        raise ValueError("shape list head_configs contains duplicates")
+
+    sequences = _shape_axis(payload, "sequences", int)
+    dims = _shape_axis(payload, "dims", int)
+    dtype_names = _shape_axis(payload, "dtypes", str)
+    causal_values = _shape_axis(payload, "causal", bool)
+    deterministic_values = _shape_axis(payload, "deterministic", bool)
+    if any(sequence <= 0 or sequence % batch for sequence in sequences):
+        raise ValueError("shape list sequences must be positive and divisible by batch")
+    if any(dim not in (128, 256) for dim in dims):
+        raise ValueError("shape list supports only D128 and D256")
+    dtypes = [_dtype_from_name(name) for name in dtype_names]
+
+    # Sequence is innermost so each compiled signature is reused for all lengths.
+    cases = [
+        InterfaceCase(
+            batch=batch,
+            heads=heads,
+            heads_kv=heads_kv,
+            total_seq_q=sequence,
+            total_seq_kv=sequence,
+            dim=dim,
+            dtype=dtype,
+            causal=causal,
+            deterministic=deterministic,
+        )
+        for dim, (heads, heads_kv), dtype, causal, deterministic, sequence in product(
+            dims,
+            head_configs,
+            dtypes,
+            causal_values,
+            deterministic_values,
+            sequences,
+        )
+    ]
+    case_ids = [_case_id(case) for case in cases]
+    if len(case_ids) != len(set(case_ids)):
+        raise ValueError("shape list expands to duplicate cases")
+    return cases
 
 
 def _make_cu_seqlens(total_seq: int, batch: int, device: str) -> torch.Tensor:
@@ -318,14 +424,18 @@ def _bench_event_us(fn: Callable[[], object], warmup: int, repeat: int) -> float
 
 def _kernel_role(name: str, case: InterfaceCase) -> str:
     low = name.lower()
+    if "compute_delta" in low:
+        return "delta"
     if "dkdv" in low:
         return "dkdv"
-    if "_dq_kernel" in low or "unsplit_dq" in low or "split_dq" in low:
-        return "dq"
     if "pack_dq" in low:
         return "pack_dq"
+    if "_dq_kernel" in low or "unsplit_dq" in low or "split_dq" in low:
+        return "dq"
     if "reduce" in low and ("kv" in low or "grad" in low):
         return "reduce_kv"
+    if "kernel_unary" in low and "castop" in low:
+        return "cast_kv"
     if "flashattn_bwd" in low or "bwd_ws_kernel" in low:
         return "bwd"
     if name == "main_kernel":
@@ -392,11 +502,12 @@ def _tflops(flops: float, us: float) -> float:
 
 
 def _validate_correctness(case: InterfaceCase) -> None:
+    head_groups = case.heads // case.heads_kv
     check_case = dataclasses.replace(
         case,
         batch=1,
-        heads=2,
-        heads_kv=2,
+        heads=head_groups,
+        heads_kv=1,
         total_seq_q=256,
         total_seq_kv=256,
         dtype=torch.bfloat16,
@@ -471,6 +582,7 @@ def _run_case(args: argparse.Namespace, case: InterfaceCase) -> None:
         "dq",
         "pack_dq",
         "reduce_kv",
+        "cast_kv",
         "zero_workspace",
         "fill_aux",
         "main_kernel",
@@ -585,6 +697,11 @@ def _parse_args() -> argparse.Namespace:
         default="single",
     )
     parser.add_argument(
+        "--shape-list",
+        type=Path,
+        help="Run every case expanded from a benchmark shape-list JSON file.",
+    )
+    parser.add_argument(
         "--branch-gqa-heads-kv",
         type=int,
         default=1,
@@ -608,11 +725,11 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if not torch.musa.is_available():
-        raise RuntimeError("MUSA is required for this benchmark")
-    torch.set_default_device("musa")
-
-    if args.suite == "compile-branches":
+    if args.shape_list is not None:
+        if args.suite != "single":
+            raise ValueError("--shape-list cannot be combined with a non-single suite")
+        cases = _load_shape_list(args.shape_list)
+    elif args.suite == "compile-branches":
         cases = _compile_branch_cases(args)
     elif args.suite == "deterministic":
         variants = ("deterministic-split", "deterministic-unsplit")
@@ -623,6 +740,9 @@ def main() -> None:
     else:
         variants = (args.variant,)
         cases = [_variant_to_case(args, variant) for variant in variants]
+
+    if not torch.musa.is_available():
+        raise RuntimeError("MUSA is required for this benchmark")
 
     for idx, case in enumerate(cases):
         if idx:

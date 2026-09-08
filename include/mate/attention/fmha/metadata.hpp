@@ -490,18 +490,10 @@ inline int num_splits_heuristic(int  total_mblocks,
   constexpr float kMinWaveOccupancy = 0.8f;
   constexpr float kEfficiencySlack  = 0.85f;
 
-  // If we have enough to almost fill the SMs, then just use 1 split
-  // However, in the case of super long seqlen where each head of KV doesn't even fit into
-  // L2 (we assume that L2 size is 50MB), we want to split.
+  // If M blocks can already fill the SMs, SplitKV adds accumulator/combine
+  // overhead without increasing parallelism; do not apply the L2-residency exception.
   if (total_mblocks >= kMinWaveOccupancy * num_mp) {
-    int const size_l2 = 1.5 * 1024 * 1024;  // 1.5 MB
-    // Only split if there are enough queries to go over the KV at least twice
-    // Don't split if causal
-    if (size_one_kv_head > size_l2 && num_m_blocks >= num_mp * 2 && !is_causal_or_local) {
-      return std::min((size_one_kv_head + size_l2 - 1) / size_l2, max_splits);
-    } else {
-      return 1;
-    }
+    return 1;
   }
   // If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
   if (num_n_blocks <= 4) {

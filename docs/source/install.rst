@@ -32,7 +32,7 @@ MATE 0.2.6 uses the following baseline:
    * - Python
      - 3.10 recommended
    * - Build and compilation
-     - MUSA SDK 4.3.8 or later recommended
+     - MUSA SDK 5.2.0 or later recommended for best performance
    * - TorchMUSA
      - 2.7 or later
 

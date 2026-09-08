@@ -6,7 +6,6 @@ import tilelang
 from tilelang import language as T
 import math
 
-from ...utils import cosize
 from .sparse_mla_decode_scheduled_common import (
     SCHEDULED_DECODE_COMPILE_FLAGS,
     SCHEDULED_DECODE_PASS_CONFIGS,
@@ -19,8 +18,10 @@ from .sparse_mla_decode_scheduled_common import (
     prepare_scheduled_decode_runtime,
     prepare_sparse_mla_decode_strided_tensor,
 )
-from .sparse_mla_index_type import jit_for_tensor_addressing
-from ...execution_context import raise_complete_if_dry_run
+from .sparse_mla_index_type import (
+    jit_for_tensor_addressing,
+)
+from ...execution_context import skip_kernel_launch_if_dry_run
 
 
 @tilelang.jit(
@@ -42,7 +43,6 @@ def sparse_attention_fwd_kernel(
     has_attn_sink=False,
     has_topk_length=False,
     support_split=True,
-    use_int64_cosize=False,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
@@ -88,16 +88,6 @@ def sparse_attention_fwd_kernel(
         1,
     )
     indices_strides = (indices_stride_b, indices_stride_s, indices_stride_g, 1)
-    if use_int64_cosize:
-        q_cosize = cosize(
-            q_shape, tuple(T.cast(stride, "int64") for stride in q_strides)
-        )
-        kv_cosize = cosize(
-            kv_shape, tuple(T.cast(stride, "int64") for stride in kv_strides)
-        )
-    else:
-        q_cosize = cosize(q_shape, q_strides)
-        kv_cosize = cosize(kv_shape, kv_strides)
     q_type: Any = T.StridedTensor(q_shape, q_strides, dtype)
     kv_type: Any = T.StridedTensor(kv_shape, kv_strides, "float8_e4m3")
     k_pe_type: Any = T.StridedTensor(k_pe_shape, k_pe_strides, dtype)
@@ -175,6 +165,7 @@ def sparse_attention_fwd_kernel(
         output,
         lse,
         sm_scale,
+        kv_span_bytes,
     ):
         with T.Kernel(
             seq_len * head_repeats, kv_group, num_mp_parts, threads=threads
@@ -246,11 +237,10 @@ def sparse_attention_fwd_kernel(
             sched_end_block_idx = tile_scheduler_metadata[bz, 3]
             begin_n_split_idx = tile_scheduler_metadata[bz, 4]
 
-            q_robust_desc = T.make_robust_desc(
-                T.address_of(q[0, 0, 0, 0]),
-                q_cosize * dtype_bytes,
+            kv_robust_desc = T.make_robust_desc(
+                T.address_of(kv[0, 0, 0]),
+                kv_span_bytes,
             )
-            kv_robust_desc = T.make_robust_desc(T.address_of(kv[0, 0, 0]), kv_cosize)
 
             g_i = by
             s_i = bx if head_repeats == 1 else (bx // head_repeats)
@@ -909,6 +899,7 @@ def sparse_attention_fwd_kernel(
         output,
         lse,
         sm_scale,
+        kv_span_bytes,
     ):
         dsa_decode_split(
             q,
@@ -925,6 +916,7 @@ def sparse_attention_fwd_kernel(
             output,
             lse,
             sm_scale,
+            kv_span_bytes,
         )
         if support_split:
             dsa_combine(
@@ -960,6 +952,7 @@ def sparse_attention_fwd_kernel(
                 output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
                 lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
                 sm_scale: T.float32,
+                kv_span_bytes: T.int64,
             ):
                 run_decode(
                     q,
@@ -976,6 +969,7 @@ def sparse_attention_fwd_kernel(
                     output,
                     lse,
                     sm_scale,
+                    kv_span_bytes,
                 )
 
         elif has_topk_length:
@@ -995,6 +989,7 @@ def sparse_attention_fwd_kernel(
                 output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
                 lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
                 sm_scale: T.float32,
+                kv_span_bytes: T.int64,
             ):
                 run_decode(
                     q,
@@ -1011,6 +1006,7 @@ def sparse_attention_fwd_kernel(
                     output,
                     lse,
                     sm_scale,
+                    kv_span_bytes,
                 )
 
         elif has_attn_sink:
@@ -1030,6 +1026,7 @@ def sparse_attention_fwd_kernel(
                 output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
                 lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
                 sm_scale: T.float32,
+                kv_span_bytes: T.int64,
             ):
                 run_decode(
                     q,
@@ -1046,6 +1043,7 @@ def sparse_attention_fwd_kernel(
                     output,
                     lse,
                     sm_scale,
+                    kv_span_bytes,
                 )
 
         else:
@@ -1064,6 +1062,7 @@ def sparse_attention_fwd_kernel(
                 output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
                 lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
                 sm_scale: T.float32,
+                kv_span_bytes: T.int64,
             ):
                 run_decode(
                     q,
@@ -1080,6 +1079,7 @@ def sparse_attention_fwd_kernel(
                     output,
                     lse,
                     sm_scale,
+                    kv_span_bytes,
                 )
     elif has_topk_length and has_attn_sink:
 
@@ -1097,6 +1097,7 @@ def sparse_attention_fwd_kernel(
             output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
             lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
             sm_scale: T.float32,
+            kv_span_bytes: T.int64,
         ):
             run_decode(
                 q,
@@ -1113,6 +1114,7 @@ def sparse_attention_fwd_kernel(
                 output,
                 lse,
                 sm_scale,
+                kv_span_bytes,
             )
 
     elif has_topk_length:
@@ -1130,6 +1132,7 @@ def sparse_attention_fwd_kernel(
             output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
             lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
             sm_scale: T.float32,
+            kv_span_bytes: T.int64,
         ):
             run_decode(
                 q,
@@ -1146,6 +1149,7 @@ def sparse_attention_fwd_kernel(
                 output,
                 lse,
                 sm_scale,
+                kv_span_bytes,
             )
 
     elif has_attn_sink:
@@ -1163,6 +1167,7 @@ def sparse_attention_fwd_kernel(
             output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
             lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
             sm_scale: T.float32,
+            kv_span_bytes: T.int64,
         ):
             run_decode(
                 q,
@@ -1179,6 +1184,7 @@ def sparse_attention_fwd_kernel(
                 output,
                 lse,
                 sm_scale,
+                kv_span_bytes,
             )
 
     else:
@@ -1195,6 +1201,7 @@ def sparse_attention_fwd_kernel(
             output: T.Tensor([batch, seq_len, num_heads, dim], dtype),
             lse: T.Tensor([batch, num_heads, seq_len], accum_dtype),
             sm_scale: T.float32,
+            kv_span_bytes: T.int64,
         ):
             run_decode(
                 q,
@@ -1211,6 +1218,7 @@ def sparse_attention_fwd_kernel(
                 output,
                 lse,
                 sm_scale,
+                kv_span_bytes,
             )
 
     return dsa_decode
@@ -1280,8 +1288,14 @@ def tilelang_flashmla_interface(
     kernel_factory = jit_for_tensor_addressing(
         sparse_attention_fwd_kernel, *address_tensors
     )
+    kv_span_bytes = (
+        0
+        if seq_len_kv == 0 or kv_group == 0
+        else (seq_len_kv - 1) * kv.stride(0) + (kv_group - 1) * kv.stride(1) + dim_bytes
+    )
     # kernel = sparse_attention_fwd_kernel_v1(
     threads = 640
+    # Tensor byte spans belong to the runtime PrimFunc ABI, not the JIT key.
     kernel = kernel_factory(
         heads,
         dim,
@@ -1295,11 +1309,9 @@ def tilelang_flashmla_interface(
         has_attn_sink=runtime.has_attn_sink,
         has_topk_length=runtime.topk_length is not None,
         support_split=support_split,
-        use_int64_cosize=kernel_factory is not sparse_attention_fwd_kernel,
     )
     if verbose:
         kernel.show_source()
-    raise_complete_if_dry_run()
     args = [q, kv_latent_f8, k_rope, scales, indices]
     if runtime.topk_length is not None:
         args.append(runtime.topk_length)
@@ -1315,5 +1327,7 @@ def tilelang_flashmla_interface(
     )
     runtime_sm_scale *= 1.44269504
     args.append(runtime_sm_scale)
-    kernel(*args)
+    args.append(int(kv_span_bytes))
+    if not skip_kernel_launch_if_dry_run():
+        kernel(*args)
     return runtime.out, runtime.lse

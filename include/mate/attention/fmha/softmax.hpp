@@ -29,13 +29,7 @@ struct Softmax {
 
     Tensor acc_qk_mn = make_tensor(acc_qk.data(), layout_acc_mn(tiled_mma_qk, acc_qk.layout()));
 
-    static_assert(size<0>(acc_qk_mn) % 2 == 0, "M must be a multiple of 2");
     static_assert(size<1>(acc_qk_mn) % 4 == 0, "N must be a multiple of 4");
-
-    static constexpr int BurstGranularityM = size<0>(acc_qk_mn) % 4 == 0 ? 4 : 2;
-    static constexpr int BurstGranularityN = 4;
-
-    using MVecType = vector_type<Element, BurstGranularityM>;
 
     TensorT correction_scales;
     Tensor  row_max_prev = make_fragment_like(row_max);

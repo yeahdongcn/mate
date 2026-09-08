@@ -3,6 +3,7 @@
 from typing import Any
 
 import torch
+from tvm import tirx
 
 if not hasattr(torch, "uint16"):
     torch.uint16 = torch.int16
@@ -13,7 +14,6 @@ if not hasattr(torch, "uint64"):
 import tilelang
 from tilelang import language as T
 
-from ...utils import cosize
 from .sparse_mla_decode_scheduled_common import (
     SCHEDULED_DECODE_COMPILE_FLAGS,
     SCHEDULED_DECODE_PASS_CONFIGS,
@@ -27,9 +27,11 @@ from .sparse_mla_decode_scheduled_common import (
     prepare_sparse_mla_decode_strided_tensor,
     validate_batch_lengths,
 )
-from .sparse_mla_index_type import jit_for_tensor_addressing
+from .sparse_mla_index_type import (
+    jit_for_tensor_addressing,
+)
 
-from ...execution_context import raise_complete_if_dry_run
+from ...execution_context import skip_kernel_launch_if_dry_run
 
 
 MODEL1_DECODE_COMPILE_FLAGS = [
@@ -45,6 +47,19 @@ MODEL1_DECODE_COMPILE_FLAGS = [
     "-mllvm",
     "-mtgpu-load-store-2d=1",
 ]
+
+
+def _fast_divmod_magic(divisor: int) -> tuple[int, int]:
+    """Return the uint32 multiply/shift pair used by MUSA fast-divmod."""
+    divisor = int(divisor)
+    if divisor <= 0:
+        raise ValueError(f"fast-divmod divisor must be positive, got {divisor}")
+    if divisor == 1:
+        return 0, 0
+    ceil_log2 = (divisor - 1).bit_length()
+    p = 31 + ceil_log2
+    multiplier = ((1 << p) + divisor - 1) // divisor
+    return multiplier & 0xFFFFFFFF, p - 32
 
 
 @tilelang.jit(
@@ -69,7 +84,6 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
     has_topk_length=False,
     has_extra_topk_length=False,
     support_split=True,
-    use_int64_cosize=False,
     use_8byte_kv_loads=False,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), (
@@ -182,47 +196,6 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
             extra_indices_stride_g,
             1,
         )
-    if use_int64_cosize:
-        q_cosize = cosize(
-            q_shape, tuple(T.cast(stride, "int64") for stride in q_strides)
-        )
-        kv_nope_cosize = cosize(
-            kv_nope_shape,
-            tuple(T.cast(stride, "int64") for stride in kv_nope_strides),
-        )
-        kv_rope_cosize = cosize(
-            kv_rope_shape,
-            tuple(T.cast(stride, "int64") for stride in kv_rope_strides),
-        )
-        quant_scales_cosize = cosize(
-            quant_scales_shape,
-            tuple(T.cast(stride, "int64") for stride in quant_scales_strides),
-        )
-        if has_extra:
-            extra_kv_nope_cosize = cosize(
-                extra_kv_nope_shape,
-                tuple(T.cast(stride, "int64") for stride in extra_kv_nope_strides),
-            )
-            extra_kv_rope_cosize = cosize(
-                extra_kv_rope_shape,
-                tuple(T.cast(stride, "int64") for stride in extra_kv_rope_strides),
-            )
-            extra_quant_scales_cosize = cosize(
-                extra_quant_scales_shape,
-                tuple(T.cast(stride, "int64") for stride in extra_quant_scales_strides),
-            )
-    else:
-        q_cosize = cosize(q_shape, q_strides)
-        kv_nope_cosize = cosize(kv_nope_shape, kv_nope_strides)
-        kv_rope_cosize = cosize(kv_rope_shape, kv_rope_strides)
-        quant_scales_cosize = cosize(quant_scales_shape, quant_scales_strides)
-        if has_extra:
-            extra_kv_nope_cosize = cosize(extra_kv_nope_shape, extra_kv_nope_strides)
-            extra_kv_rope_cosize = cosize(extra_kv_rope_shape, extra_kv_rope_strides)
-            extra_quant_scales_cosize = cosize(
-                extra_quant_scales_shape, extra_quant_scales_strides
-            )
-
     q_type: Any = T.StridedTensor(q_shape, q_strides, dtype)
     kv_nope_type: Any = T.StridedTensor(kv_nope_shape, kv_nope_strides, kv_latent_dtype)
     kv_rope_type: Any = T.StridedTensor(kv_rope_shape, kv_rope_strides, dtype)
@@ -379,6 +352,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         rope_robust_desc_arg,
         scale_robust_desc_arg,
         page_size,
+        page_fast_div_multiplier,
+        page_fast_div_shift,
         kperm_indices_local,
         kperm_mask_local,
         is_kv_valid,
@@ -398,6 +373,22 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         bar_kv1_free,
         bar_kv1_ready,
     ):
+        # Main and extra loads are sequential; reuse one local quotient/remainder
+        # pair while each call supplies magic values for its own page size.
+        page_ids_local = T.alloc_local([4], "int32")
+        page_offsets_local = T.alloc_local([4], "int32")
+        for r in T.unroll(4):
+            page_ids_local[r] = T.call_intrin(
+                "int32",
+                tirx.op.Op.get("tl.musa_fast_div"),
+                kperm_indices_local[r],
+                page_size,
+                page_fast_div_multiplier,
+                page_fast_div_shift,
+            )
+            page_offsets_local[r] = (
+                kperm_indices_local[r] - page_ids_local[r] * page_size
+            )
         T.barrier_wait(bar_kv0_free, (phase & 1) ^ 1)
         if pipelined_producer:
             T.barrier_arrive(bar_indices_ready)
@@ -406,9 +397,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 for v in T.vectorized(4):
                     T.copy(
                         kv_rope[
-                            kperm_indices_local[r] // page_size,
-                            (kperm_indices_local[r] % page_size)
-                            * (scale_bytes_offset // 2)
+                            page_ids_local[r],
+                            page_offsets_local[r] * (scale_bytes_offset // 2)
                             + 32 * u
                             + ldg_tx * 4
                             + v,
@@ -423,12 +413,23 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
             T.barrier_arrive(bar_indices_ready)
         T.barrier_wait(bar_indices_ready, phase & 1)
 
+        scale_page_id = T.alloc_var("int32")
+        scale_page_offset = T.alloc_var("int32")
+        scale_page_id = T.call_intrin(
+            "int32",
+            tirx.op.Op.get("tl.musa_fast_div"),
+            kv_indices[ldg_scale_ty],
+            page_size,
+            page_fast_div_multiplier,
+            page_fast_div_shift,
+        )
+        scale_page_offset = kv_indices[ldg_scale_ty] - scale_page_id * page_size
         for c in T.vectorized(4):
             T.copy(
                 quant_scales[
-                    kv_indices[ldg_scale_ty] // page_size,
+                    scale_page_id,
                     page_size * scale_bytes_offset
-                    + (kv_indices[ldg_scale_ty] % page_size) * 8
+                    + scale_page_offset * 8
                     + ldg_scale_tx * 4
                     + c,
                 ],
@@ -456,9 +457,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 for v in T.vectorized(4):
                     T.copy(
                         kv_rope[
-                            kperm_indices_local[r] // page_size,
-                            (kperm_indices_local[r] % page_size)
-                            * (scale_bytes_offset // 2)
+                            page_ids_local[r],
+                            page_offsets_local[r] * (scale_bytes_offset // 2)
                             + dim // 4
                             + 32 * u
                             + ldg_tx * 4
@@ -474,9 +474,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 for v in T.vectorized(4):
                     T.copy(
                         kv_rope[
-                            kperm_indices_local[r] // page_size,
-                            (kperm_indices_local[r] % page_size)
-                            * (scale_bytes_offset // 2)
+                            page_ids_local[r],
+                            page_offsets_local[r] * (scale_bytes_offset // 2)
                             + rope_bytes_offset // 2
                             + ldg_tx * 8
                             + v,
@@ -488,9 +487,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 for v in T.vectorized(4):
                     T.copy(
                         kv_rope[
-                            kperm_indices_local[r] // page_size,
-                            (kperm_indices_local[r] % page_size)
-                            * (scale_bytes_offset // 2)
+                            page_ids_local[r],
+                            page_offsets_local[r] * (scale_bytes_offset // 2)
                             + rope_bytes_offset // 2
                             + ldg_tx * 8
                             + 4
@@ -505,9 +503,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 for v in T.vectorized(8):
                     T.copy(
                         kv_rope[
-                            kperm_indices_local[r] // page_size,
-                            (kperm_indices_local[r] % page_size)
-                            * (scale_bytes_offset // 2)
+                            page_ids_local[r],
+                            page_offsets_local[r] * (scale_bytes_offset // 2)
                             + rope_bytes_offset // 2
                             + ldg_tx * 8
                             + v,
@@ -548,6 +545,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         output,
         lse,
         sm_scale,
+        kv_rope_span_bytes,
+        kv_scales_span_bytes,
+        extra_kv_rope_span_bytes,
+        extra_kv_scales_span_bytes,
+        page_fast_div_multiplier,
+        page_fast_div_shift,
+        extra_page_fast_div_multiplier,
+        extra_page_fast_div_shift,
     ):
         # MODEL1 scheduled split main kernel. It follows the FlashMLA scheduler
         # contract: each program consumes one metadata part and either writes the
@@ -614,34 +619,22 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
             bar_p_ready = T.alloc_barrier(arrive_count=consumer0_gemm_threads)
             bar_final = T.alloc_barrier(arrive_count=consumer0_gemm_threads)
 
-            q_robust_desc = T.make_robust_desc(
-                T.address_of(q[0, 0, 0, 0]),
-                q_cosize * dtype_bytes,
-            )
-            nope_robust_desc = T.make_robust_desc(
-                T.address_of(kv_nope[0, 0]),
-                kv_nope_cosize,
-            )
             rope_robust_desc = T.make_robust_desc(
                 T.address_of(kv_rope[0, 0]),
-                kv_rope_cosize * dtype_bytes,
+                kv_rope_span_bytes,
             )
             scale_robust_desc = T.make_robust_desc(
                 T.address_of(quant_scales[0, 0]),
-                quant_scales_cosize,
+                kv_scales_span_bytes,
             )
             if has_extra:
-                extra_nope_robust_desc = T.make_robust_desc(
-                    T.address_of(extra_kv_nope[0, 0]),
-                    extra_kv_nope_cosize,
-                )
                 extra_rope_robust_desc = T.make_robust_desc(
                     T.address_of(extra_kv_rope[0, 0]),
-                    extra_kv_rope_cosize * dtype_bytes,
+                    extra_kv_rope_span_bytes,
                 )
                 extra_scale_robust_desc = T.make_robust_desc(
                     T.address_of(extra_quant_scales[0, 0]),
-                    extra_quant_scales_cosize,
+                    extra_kv_scales_span_bytes,
                 )
 
             T.sync_threads()
@@ -1244,7 +1237,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                         for h_i, d_i in T.Parallel(heads_per_block, 128):
                             acc_o_r_0[h_i, d_i] *= alpha_r[h_i]
                         if pipelined_producer:
-                            T.sched_boundary()
+                            # T.sched_boundary()  # B baseline: intentionally disabled
+                            pass
 
                         T.gemm(
                             scores_shared,
@@ -1266,7 +1260,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                         T.barrier_wait(bar_vr1_ready, (phase_count[0] & 1))
 
                         if pipelined_producer:
-                            T.sched_boundary()
+                            # T.sched_boundary()  # B baseline: intentionally disabled
+                            pass
                         for h_i, d_i in T.Parallel(heads_per_block, 128):
                             acc_o_r_1[h_i, d_i] *= alpha_r[h_i]
                         if pipelined_producer:
@@ -1364,6 +1359,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                                 rope_robust_desc,
                                 scale_robust_desc,
                                 page_block_size,
+                                page_fast_div_multiplier,
+                                page_fast_div_shift,
                                 kperm_indices_local,
                                 kperm_mask_local,
                                 is_kv_valid,
@@ -1416,6 +1413,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                                     extra_rope_robust_desc,
                                     extra_scale_robust_desc,
                                     page_block_size_extra,
+                                    extra_page_fast_div_multiplier,
+                                    extra_page_fast_div_shift,
                                     kperm_indices_local,
                                     kperm_mask_local,
                                     is_kv_valid,
@@ -1461,6 +1460,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                                     rope_robust_desc,
                                     scale_robust_desc,
                                     page_block_size,
+                                    page_fast_div_multiplier,
+                                    page_fast_div_shift,
                                     kperm_indices_local,
                                     kperm_mask_local,
                                     is_kv_valid,
@@ -1509,6 +1510,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                                 rope_robust_desc,
                                 scale_robust_desc,
                                 page_block_size,
+                                page_fast_div_multiplier,
+                                page_fast_div_shift,
                                 kperm_indices_local,
                                 kperm_mask_local,
                                 is_kv_valid,
@@ -1557,6 +1560,8 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                                     rope_robust_desc,
                                     scale_robust_desc,
                                     page_block_size,
+                                    page_fast_div_multiplier,
+                                    page_fast_div_shift,
                                     kperm_indices_local,
                                     kperm_mask_local,
                                     is_kv_valid,
@@ -1607,6 +1612,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         output,
         lse,
         sm_scale,
+        page_fast_div_multiplier,
+        page_fast_div_shift,
+        kv_rope_span_bytes,
+        kv_scales_span_bytes,
     ):
         dsa_decode_body(
             q,
@@ -1628,6 +1637,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
             output,
             lse,
             sm_scale,
+            kv_rope_span_bytes,
+            kv_scales_span_bytes,
+            None,
+            None,
+            page_fast_div_multiplier,
+            page_fast_div_shift,
+            None,
+            None,
         )
 
     @T.macro
@@ -1651,6 +1668,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
         output,
         lse,
         sm_scale,
+        kv_rope_span_bytes,
+        kv_scales_span_bytes,
+        extra_kv_rope_span_bytes,
+        extra_kv_scales_span_bytes,
+        page_fast_div_multiplier,
+        page_fast_div_shift,
+        extra_page_fast_div_multiplier,
+        extra_page_fast_div_shift,
     ):
         dsa_decode_body(
             q,
@@ -1672,6 +1697,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
             output,
             lse,
             sm_scale,
+            kv_rope_span_bytes,
+            kv_scales_span_bytes,
+            extra_kv_rope_span_bytes,
+            extra_kv_scales_span_bytes,
+            page_fast_div_multiplier,
+            page_fast_div_shift,
+            extra_page_fast_div_multiplier,
+            extra_page_fast_div_shift,
         )
 
     topk_length_type: Any = T.Tensor([batch], indices_dtype)
@@ -1707,6 +1740,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
             ):
                 run_no_extra(
                     q,
@@ -1723,6 +1760,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
                 )
 
         elif has_topk_length:
@@ -1742,6 +1783,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
             ):
                 run_no_extra(
                     q,
@@ -1758,6 +1803,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
                 )
 
         elif has_attn_sink:
@@ -1777,6 +1826,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
             ):
                 run_no_extra(
                     q,
@@ -1793,6 +1846,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
                 )
 
         else:
@@ -1811,6 +1868,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
             ):
                 run_no_extra(
                     q,
@@ -1827,6 +1888,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
                 )
 
     elif not has_extra:
@@ -1846,6 +1911,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
             ):
                 run_no_extra(
                     q,
@@ -1862,6 +1931,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
                 )
 
         elif has_topk_length:
@@ -1879,6 +1952,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
             ):
                 run_no_extra(
                     q,
@@ -1895,6 +1972,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
                 )
 
         elif has_attn_sink:
@@ -1912,6 +1993,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
             ):
                 run_no_extra(
                     q,
@@ -1928,6 +2013,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
                 )
 
         else:
@@ -1944,6 +2033,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
             ):
                 run_no_extra(
                     q,
@@ -1960,6 +2053,10 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
                 )
 
     elif support_split:
@@ -1992,6 +2089,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2013,6 +2118,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_topk_length and has_extra_topk_length:
@@ -2037,6 +2150,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2058,6 +2179,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_topk_length and has_attn_sink:
@@ -2082,6 +2211,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2103,6 +2240,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_topk_length:
@@ -2126,6 +2271,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2147,6 +2300,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_extra_topk_length and has_attn_sink:
@@ -2171,6 +2332,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2192,6 +2361,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_extra_topk_length:
@@ -2215,6 +2392,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2236,6 +2421,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_attn_sink:
@@ -2259,6 +2452,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2280,6 +2481,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         else:
@@ -2302,6 +2511,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2323,6 +2540,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
     else:
@@ -2347,6 +2572,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2368,6 +2601,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_topk_length and has_extra_topk_length:
@@ -2390,6 +2631,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2411,6 +2660,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_topk_length and has_attn_sink:
@@ -2433,6 +2690,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2454,6 +2719,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_topk_length:
@@ -2475,6 +2748,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2496,6 +2777,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_extra_topk_length and has_attn_sink:
@@ -2518,6 +2807,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2539,6 +2836,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_extra_topk_length:
@@ -2560,6 +2865,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2581,6 +2894,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         elif has_attn_sink:
@@ -2602,6 +2923,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2623,6 +2952,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
         else:
@@ -2643,6 +2980,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 output: output_type,
                 lse: lse_type,
                 sm_scale: T.float32,
+                kv_rope_span_bytes: T.int64,
+                kv_scales_span_bytes: T.int64,
+                extra_kv_rope_span_bytes: T.int64,
+                extra_kv_scales_span_bytes: T.int64,
+                page_fast_div_multiplier: T.uint32,
+                page_fast_div_shift: T.uint32,
+                extra_page_fast_div_multiplier: T.uint32,
+                extra_page_fast_div_shift: T.uint32,
             ):
                 run_extra(
                     q,
@@ -2664,6 +3009,14 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     output,
                     lse,
                     sm_scale,
+                    kv_rope_span_bytes,
+                    kv_scales_span_bytes,
+                    extra_kv_rope_span_bytes,
+                    extra_kv_scales_span_bytes,
+                    page_fast_div_multiplier,
+                    page_fast_div_shift,
+                    extra_page_fast_div_multiplier,
+                    extra_page_fast_div_shift,
                 )
 
     return dsa_decode
@@ -2818,7 +3171,9 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
             address_tensors.extend((extra_kv_rope, extra_kv_scales))
         address_tensors.append(extra_indices)
 
-    use_8byte_kv_loads = kv_rope.stride(0) % 8 != 0
+    kv_rope_stride_block = kv_rope.stride(0)
+    kv_scales_stride_block = kv_scales.stride(0)
+    use_8byte_kv_loads = kv_rope_stride_block % 8 != 0
     if extra_kv_rope is not None:
         use_8byte_kv_loads = use_8byte_kv_loads or extra_kv_rope.stride(0) % 8 != 0
 
@@ -2827,6 +3182,41 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
         sparse_attention_decode_fwd_scheduled_kernel_model1,
         *address_tensors,
     )
+    kv_rope_span_bytes = (
+        0
+        if num_blocks == 0
+        else ((num_blocks - 1) * kv_rope_stride_block + page_block_bytes // 2) * 2
+    )
+    kv_scales_span_bytes = (
+        0
+        if num_blocks == 0
+        else (num_blocks - 1) * kv_scales_stride_block + page_block_bytes
+    )
+    page_fast_div_multiplier, page_fast_div_shift = _fast_divmod_magic(page_block_size)
+    if has_extra:
+        extra_kv_rope_stride_block = extra_kv_rope.stride(0)
+        extra_kv_scales_stride_block = extra_kv_scales.stride(0)
+        extra_kv_rope_span_bytes = (
+            0
+            if extra_num_blocks == 0
+            else (
+                (extra_num_blocks - 1) * extra_kv_rope_stride_block
+                + extra_page_block_bytes // 2
+            )
+            * 2
+        )
+        extra_kv_scales_span_bytes = (
+            0
+            if extra_num_blocks == 0
+            else (extra_num_blocks - 1) * extra_kv_scales_stride_block
+            + extra_page_block_bytes
+        )
+        extra_page_fast_div_multiplier, extra_page_fast_div_shift = _fast_divmod_magic(
+            extra_page_block_size
+        )
+    # These values describe the current launch buffers/page size.  Keep them
+    # in the PrimFunc ABI; arguments to the outer JIT factory specialize/cache
+    # the generated module and must remain shape/schedule configuration only.
     kernel = kernel_factory(
         heads,
         d_v,
@@ -2848,13 +3238,9 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
         has_extra_topk_length=extra_topk_length is not None,
         support_split=support_split,
         use_8byte_kv_loads=use_8byte_kv_loads,
-        use_int64_cosize=(
-            kernel_factory is not sparse_attention_decode_fwd_scheduled_kernel_model1
-        ),
     )
     if verbose:
         kernel.show_source()
-    raise_complete_if_dry_run()
     args = [q, kv_nope, kv_rope, kv_scales, indices]
     if runtime.topk_length is not None:
         args.append(runtime.topk_length)
@@ -2872,6 +3258,20 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
     runtime_sm_scale = (1.0 / d_v) ** 0.5 if sm_scale is None else float(sm_scale)
     runtime_sm_scale *= 1.44269504
     args.append(runtime_sm_scale)
-    kernel(*args)
+    if not has_extra:
+        args.extend((int(page_fast_div_multiplier), int(page_fast_div_shift)))
+    args.extend((int(kv_rope_span_bytes), int(kv_scales_span_bytes)))
+    if has_extra:
+        args.extend((int(extra_kv_rope_span_bytes), int(extra_kv_scales_span_bytes)))
+        args.extend(
+            (
+                int(page_fast_div_multiplier),
+                int(page_fast_div_shift),
+                int(extra_page_fast_div_multiplier),
+                int(extra_page_fast_div_shift),
+            )
+        )
+    if not skip_kernel_launch_if_dry_run():
+        kernel(*args)
 
     return runtime.out, runtime.lse

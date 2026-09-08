@@ -17,9 +17,9 @@ MATE (**M**USA **A**I **T**ensor **E**ngine) is a centralized library for Genera
 | Component | Requirement |
 | --- | --- |
 | GPU | `S5000` |
-| Toolkit / platform | MUSA SDK `4.3.5` or later (driver `3.3.5` or later) |
+| Driver | `3.3.5` or later |
 | Python | `3.10` recommended |
-| Build and compilation | MUSA SDK `4.3.8` or later recommended |
+| Build and compilation | MUSA SDK `5.2.0` or later recommended for best performance |
 | TorchMUSA | `2.7` or later |
 
 The current external delivery source mainly covers `x86_64` and Python `3.10`

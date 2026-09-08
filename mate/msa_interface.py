@@ -42,6 +42,7 @@ class MsaPrefillPlan:
     total_seqlen_k: int
     max_seqlen_q: int
     max_seqlen_k: int
+    is_varlen: bool
 
 
 @dataclass
@@ -68,7 +69,13 @@ class MsaRuntimeMetadata:
     is the preferred representation for paged MSA: it has a fixed
     ``[batch, max_pages]`` shape and can therefore be captured safely.  The
     flat ``kv_page_indptr`` representation remains available for legacy
-    callers.
+    callers.  ``maxscore_schedule`` is an optional fixed-address ``int32``
+    workspace with shape ``[num_mps, 2]``.  Its rows contain the Q-work range
+    assigned to each logical MP slot; the CTA's 1-D grid coordinate derives
+    the K partition.  By default the device metadata kernel refreshes it on
+    the same stream before the persistent max-score launch.  Callers may set
+    ``maxscore_schedule_ready`` when that exact workspace has already been
+    prepared for the current sequence metadata on the same stream.
     """
 
     qo_lens: torch.Tensor
@@ -79,6 +86,15 @@ class MsaRuntimeMetadata:
     kv_page_indptr: Optional[torch.Tensor] = None
     page_table: Optional[torch.Tensor] = None
     seqused_k: Optional[torch.Tensor] = None
+    # Optional device-resident [num_mps, 2] workspace.  The metadata entrypoint
+    # fills {q_work_begin, q_work_length} on the same stream immediately before
+    # the persistent maxscore kernel.  Supplying it keeps graph replay at a
+    # fixed address; eager callers may leave it None.
+    maxscore_schedule: Optional[torch.Tensor] = None
+    # Skip only the max-score schedule builder. The max-score, top-k, and
+    # sparse-attention kernels still run normally. This is intentionally false
+    # by default so existing callers retain rebuild-every-call behavior.
+    maxscore_schedule_ready: bool = False
 
 
 @dataclass
@@ -463,7 +479,7 @@ def _resolve_runtime_metadata(
         page_table = _require_runtime_page_table(
             runtime_metadata.page_table,
             batch_size=batch_size,
-            max_pages=_ceil_div(plan.prefill_plan.max_seqlen_k, _SPARSE_BLOCK_SIZE),
+            max_pages=_ceil_div(plan.prefill_plan.max_seqlen_k, plan.page_size),
             device=device,
         )
         if kv_page_indptr is not None:
@@ -549,6 +565,7 @@ def _build_single_plan(
         total_seqlen_k=sum(kv_lengths),
         max_seqlen_q=max(qo_lengths, default=0),
         max_seqlen_k=max(kv_lengths, default=0),
+        is_varlen=len(set(qo_lengths)) > 1 or len(set(kv_lengths)) > 1,
     )
     mode = _resolve_plan_mode(
         max_qo_len=prefill_plan.max_seqlen_q,
@@ -704,6 +721,7 @@ def _build_static_plan(
         total_seqlen_k=total_seqlen_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        is_varlen=True,
     )
     decode_plan = None
     if mode in {"paged", "sparse_decode"}:
@@ -1213,6 +1231,8 @@ def _run_maxscore_plan(
             "MSA maxscore is implemented for dense/paged KV; run the dense/proxy "
             "pass before sparse_topk_select instead of using a sparse execution plan"
         )
+    has_runtime_metadata_override = runtime_metadata is not None
+    has_explicit_seqlens_override = cu_seqlens_q is not None or cu_seqlens_k is not None
     if runtime_metadata is not None:
         (
             _runtime_qo_lens,
@@ -1273,7 +1293,7 @@ def _run_maxscore_plan(
             page_indices = _require_runtime_page_table(
                 page_table,
                 batch_size=plan.batch_size,
-                max_pages=_ceil_div(plan.prefill_plan.max_seqlen_k, _SPARSE_BLOCK_SIZE),
+                max_pages=_ceil_div(plan.prefill_plan.max_seqlen_k, plan.page_size),
                 device=q.device,
             )
             if runtime_kv_page_indptr is not None:
@@ -1310,8 +1330,22 @@ def _run_maxscore_plan(
         max_seqlen_q=plan.prefill_plan.max_seqlen_q,
         max_seqlen_k=plan.prefill_plan.max_seqlen_k,
         causal=plan.causal,
+        page_size=plan.page_size if plan.mode == "paged" else 128,
+        is_varlen=(
+            plan.prefill_plan.is_varlen
+            or has_runtime_metadata_override
+            or has_explicit_seqlens_override
+        ),
         page_table=page_indices,
         kv_page_indptr=kv_page_indptr,
+        schedule_metadata=(
+            runtime_metadata.maxscore_schedule if runtime_metadata is not None else None
+        ),
+        schedule_metadata_ready=(
+            runtime_metadata.maxscore_schedule_ready
+            if runtime_metadata is not None
+            else False
+        ),
         max_score=max_score,
     )
 
@@ -1560,7 +1594,11 @@ def msa(
     max_score: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Run the initial MATE-side implementation of MSA."""
+    """Run the initial MATE-side implementation of MSA.
+
+    Sparse MSA accepts a preallocated ``out`` whose supported dtype may differ
+    from Q/K/V. Omitting ``out`` preserves the Q dtype.
+    """
 
     has_mixed_prefill, split, _, decode_plan, prefill_plan = _unpack_plan_info(
         plan_info

@@ -69,6 +69,8 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   static constexpr bool IsSupportedElement = std::is_same_v<Element, mutlass::float_e4m3_t> ||
                                              std::is_same_v<Element, mutlass::half_t> ||
                                              std::is_same_v<Element, mutlass::bfloat16_t>;
+  static constexpr bool IsFP8     = std::is_same_v<Element, mutlass::float_e4m3_t>;
+  static constexpr int  MaxOffset = IsFP8 ? 8 : 0;
   static_assert(IsSupportedElement, "MSA forward supports FP8 E4M3, FP16, and BF16.");
   static_assert(QStages == 1, "Q is resident for one MSA forward work item and uses one stage.");
   static_assert(KStages >= 1 && VStages >= 1, "K/V TME pipelines require at least one stage.");
@@ -916,12 +918,16 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
     Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
     clear(acc_pv);
     auto acc_pv_mn = make_tensor(acc_pv.data(), ::mate::attention::fmha::layout_acc_mn(tiled_mma_pv, acc_pv.layout()));
-    constexpr int              SoftmaxRows = decltype(size<0>(acc_pv_mn))::value;
-    MsaFwdSoftmax<SoftmaxRows> softmax{params.args.softmax_scale, params.args.softmax_scale_log2};
+    constexpr int                         SoftmaxRows = decltype(size<0>(acc_pv_mn))::value;
+    MsaFwdSoftmax<SoftmaxRows, MaxOffset> softmax{params.args.softmax_scale, params.args.softmax_scale_log2};
 
     R2STiledCopy tiled_copy_r2s;
     auto         thr_copy_r2s = tiled_copy_r2s.get_thread_slice(consumer_thread_idx);
-    Tensor       tPsP         = thr_copy_r2s.partition_D(mute::as_position_independent_swizzle_tensor(sP));
+    // Preserve the position-dependent swizzle pointer so partition_D uses the
+    // PV operand's logical MxN layout. Moving the swizzle into the layout here
+    // changes the 128-bit R2S thread/value mapping and no longer matches the
+    // original sP view consumed by the PV SQMMA.
+    Tensor tPsP = thr_copy_r2s.partition_D(sP);
 
     auto get_logical_block = [&](int topk_slot) {
       int lane_idx      = consumer_thread_idx % NumThreadsPerWarp;

@@ -426,6 +426,11 @@ def ragged_m_moe_gemm_8bit(
         Literal["auto", "mubin", "mutlass"],
         resolve_backend(backend, supported=("mubin", "mutlass"), default="auto"),
     )
+    if gemm_mode == "per_token" and major_b_mode == "N":
+        if backend == "auto":
+            backend = "mutlass"
+        elif backend != "mutlass":
+            raise ValueError('N-major B requires backend="mutlass"')
 
     if gemm_mode == "per_token":
         if backend == "mutlass":
@@ -436,6 +441,7 @@ def ragged_m_moe_gemm_8bit(
                 gemm_type=GEMM_TYPE_M_GROUPED_CONTIGUOUS,
                 config_m=a_fp8.shape[0],
                 alignment_m=alignment_m,
+                major_b_mode=major_b_mode or "K",
             )
             mod.get_function(dispatch_name)(
                 a_fp8,
@@ -1158,10 +1164,14 @@ def _run_bmm_mudnn(
     fixed_scale_layout: Optional[bool],
 ) -> None:
     is_fp8 = a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    if is_fp8 and (recipe_a is None or recipe_b is None):
-        raise ValueError("FP8 inputs require recipe_a and recipe_b")
-    if is_fp8 and fixed_scale_layout is None:
-        fixed_scale_layout = trans_a or not trans_b
+    if is_fp8 and scale_a is None:
+        recipe_a = recipe_b = (-1, -1)
+        fixed_scale_layout = False
+    elif is_fp8:
+        if recipe_a is None or recipe_b is None:
+            raise ValueError("scaled FP8 inputs require recipe_a and recipe_b")
+        if fixed_scale_layout is None:
+            fixed_scale_layout = trans_a or not trans_b
     elif not is_fp8:
         scale_a = scale_b = None
         recipe_a = recipe_b = (-1, -1)
@@ -1266,8 +1276,7 @@ def bmm(
 
     This function computes the batched matrix product of A and B, optionally
     adds C, and stores the result in the requested output dtype. It supports
-    unscaled FP16/BF16 inputs and FP8 inputs with tensorwise, channelwise, or
-    groupwise scaling.
+    unscaled FP16/BF16 inputs and raw or scaled FP8 inputs.
 
     Parameters
     ----------
@@ -1279,8 +1288,8 @@ def bmm(
     b : torch.Tensor
         Input B. Its physical shape is ``(batch, n, k)`` when
         ``trans_b=True`` or ``(batch, k, n)`` when ``trans_b=False``.
-        It must use the same 16-bit dtype as A for unscaled BMM, or an FP8
-        dtype for scaled BMM. The final physical dimension must have stride 1.
+        It must use the same 16-bit dtype as A for unscaled BMM, or an FP8 dtype
+        for raw or scaled BMM. The final physical dimension must have stride 1.
     out : Optional[torch.Tensor]
         Preallocated output D with shape ``(batch, m, n)``. When omitted, a
         tensor is allocated using ``out_dtype``. The default dtype is the input
@@ -1292,24 +1301,22 @@ def bmm(
         Whether to transpose the final two dimensions of physical B before
         multiplication. Default is True.
     scale_a : Optional[torch.Tensor]
-        FP32 scaling factors for A. Required for FP8 inputs and ignored for
-        16-bit inputs. Its logical granularity is specified by ``recipe_a``.
+        Optional FP32 scaling factors for A. Omit both input scales for raw FP8
+        muDNN BMM. Ignored for 16-bit inputs.
     scale_b : Optional[torch.Tensor]
-        FP32 scaling factors for B. Required for FP8 inputs and ignored for
-        16-bit inputs. Its logical granularity is specified by ``recipe_b``.
+        Optional FP32 scaling factors for B. It must be present exactly when
+        ``scale_a`` is present. Ignored for 16-bit inputs.
     scale_out : Optional[torch.Tensor]
         FP32 output scales for FP8 E4M3 output. Providing this tensor selects
         the MUBIN backend; its shape is ``(batch, m, ceil(n / 128))``.
         Ignored for 16-bit inputs.
     recipe_a : Optional[Tuple[int, int]]
-        Required FP8 quantization recipe ``(m_granularity, k_granularity)``
-        for A. ``(-1, -1)``, ``(1, -1)``, and ``(1, 128)`` represent
-        tensorwise, channelwise, and K-grouped scaling, respectively.
+        Required when FP8 scales are present. ``(-1, -1)``, ``(1, -1)``, and
+        ``(1, 128)`` represent tensorwise, channelwise, and K-grouped scaling.
     recipe_b : Optional[Tuple[int, int]]
-        Required FP8 quantization recipe ``(n_granularity, k_granularity)``
-        for B. In addition to tensorwise, channelwise, and grouped scaling,
-        ``(128, 128)`` represents block scaling. Its K granularity must match
-        ``recipe_a``.
+        Required when FP8 scales are present. In addition to tensorwise,
+        channelwise, and grouped scaling, ``(128, 128)`` represents block
+        scaling. Its K granularity must match ``recipe_a``.
     c : Optional[torch.Tensor]
         Optional accumulation tensor with shape ``(batch, m, n)``. It must
         match the output dtype. FP8 BMM with C requires FP32 output. The MUBIN
@@ -1327,7 +1334,7 @@ def bmm(
         Backend selector. ``"auto"`` uses muDNN unless ``scale_out`` selects
         MUBIN. Explicitly supported backends are ``"mudnn"``, ``"mubin"``, and
         ``"mutlass"``. MUTLASS supports NT BF16 or group/block FP8 E4M3 BMM
-        with BF16 output.
+        with BF16 output. Raw FP8 without scales uses muDNN.
 
     Returns
     -------
@@ -1340,39 +1347,51 @@ def bmm(
         torch.float8_e5m2,
     )
     if is_fp8:
-        if scale_a is None or scale_b is None:
-            raise ValueError("FP8 inputs require scale_a and scale_b")
-        if recipe_a is None or recipe_b is None:
-            raise ValueError("FP8 inputs require recipe_a and recipe_b")
-        group_or_block_scaled = (
-            recipe_a[0] == 1
-            and recipe_a[1] == 128
-            and recipe_b[0] in (1, 128)
-            and recipe_b[1] == 128
-        )
-        if (
-            group_or_block_scaled
-            and a.dtype == torch.float8_e4m3fn
-            and b.dtype == torch.float8_e5m2
-        ):
-            raise ValueError(
-                "FP8 bmm group/block scaling does not support E4M3 a with E5M2 b"
+        if (scale_a is None) != (scale_b is None):
+            raise ValueError("scale_a and scale_b must be both present or both absent")
+        if scale_a is None:
+            if scale_out is not None:
+                raise ValueError("scale-free FP8 bmm does not support scale_out")
+            backend = resolve_backend(
+                backend,
+                supported=("mudnn",),
+                allow_auto=True,
+                default="mudnn",
             )
-        backend = resolve_backend(
-            backend,
-            supported=("mudnn", "mubin", "mutlass"),
-            allow_auto=True,
-            default="auto",
-        )
-        if scale_out is not None:
             if backend == "auto":
-                backend = "mubin"
-            elif backend != "mubin":
-                raise ValueError("scale_out requires the mubin backend")
-        elif backend == "mubin":
-            raise ValueError('backend="mubin" requires scale_out')
-        elif backend == "auto":
-            backend = "mudnn"
+                backend = "mudnn"
+        else:
+            if recipe_a is None or recipe_b is None:
+                raise ValueError("scaled FP8 inputs require recipe_a and recipe_b")
+            group_or_block_scaled = (
+                recipe_a[0] == 1
+                and recipe_a[1] == 128
+                and recipe_b[0] in (1, 128)
+                and recipe_b[1] == 128
+            )
+            if (
+                group_or_block_scaled
+                and a.dtype == torch.float8_e4m3fn
+                and b.dtype == torch.float8_e5m2
+            ):
+                raise ValueError(
+                    "FP8 bmm group/block scaling does not support E4M3 a with E5M2 b"
+                )
+            backend = resolve_backend(
+                backend,
+                supported=("mudnn", "mubin", "mutlass"),
+                allow_auto=True,
+                default="auto",
+            )
+            if scale_out is not None:
+                if backend == "auto":
+                    backend = "mubin"
+                elif backend != "mubin":
+                    raise ValueError("scale_out requires the mubin backend")
+            elif backend == "mubin":
+                raise ValueError('backend="mubin" requires scale_out')
+            elif backend == "auto":
+                backend = "mudnn"
     else:
         if a.dtype not in (torch.float16, torch.bfloat16) or b.dtype not in (
             torch.float16,

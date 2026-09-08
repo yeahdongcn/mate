@@ -12,9 +12,19 @@ from .layout import (
     get_col_major_tma_aligned_tensor as get_col_major_tma_aligned_tensor,
 )
 from .layout import (
+    get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor as get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor,
+)
+from .layout import (
     get_mk_alignment_for_contiguous_layout as get_mk_alignment_for_contiguous_layout,
 )
+from .layout import (
+    get_mn_major_tma_aligned_packed_ue8m0_tensor as get_mn_major_tma_aligned_packed_ue8m0_tensor,
+)
 from .layout import get_mn_major_tma_aligned_tensor as get_mn_major_tma_aligned_tensor
+from .layout import get_tma_aligned_size as get_tma_aligned_size
+from .layout import (
+    transform_sf_into_required_layout as transform_sf_into_required_layout,
+)
 
 __all__ = [
     "impl",
@@ -27,6 +37,10 @@ __all__ = [
     "set_num_sms",
     "get_tc_util",
     "set_tc_util",
+    "get_tma_aligned_size",
+    "get_mn_major_tma_aligned_packed_ue8m0_tensor",
+    "get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor",
+    "transform_sf_into_required_layout",
     "get_mk_alignment_for_contiguous_layout",
     "get_col_major_tma_aligned_tensor",
     "get_mn_major_tma_aligned_tensor",

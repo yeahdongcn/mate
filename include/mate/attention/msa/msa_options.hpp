@@ -25,6 +25,12 @@ struct Option {
   using option_value        = Value;
 };
 
+enum class PageTableKind {
+  Dense,
+  Batched2D,
+  Flat,
+};
+
 enum class Tag {
   HasMetadata,
   HasSeqUsedK,
@@ -39,6 +45,12 @@ enum class Tag {
   UseLSULoadV,
   PackQueryPair,
   ParallelKTiles,
+  PageSize,
+  PageTable,
+  MmaTileQ,
+  QStages,
+  KStages,
+  EnableKPrefetch,
 };
 
 template <class Value>
@@ -79,5 +91,23 @@ using PackQueryPair = Option<Tag::PackQueryPair, Value>;
 
 template <class Value>
 using ParallelKTiles = Option<Tag::ParallelKTiles, Value>;
+
+template <int Value>
+using PageSize = Option<Tag::PageSize, std::integral_constant<int, Value>>;
+
+template <PageTableKind Value>
+using PageTable = Option<Tag::PageTable, std::integral_constant<PageTableKind, Value>>;
+
+template <int Value>
+using MmaTileQ = Option<Tag::MmaTileQ, std::integral_constant<int, Value>>;
+
+template <int Value>
+using QStages = Option<Tag::QStages, std::integral_constant<int, Value>>;
+
+template <int Value>
+using KStages = Option<Tag::KStages, std::integral_constant<int, Value>>;
+
+template <bool Value>
+using EnableKPrefetch = Option<Tag::EnableKPrefetch, std::bool_constant<Value>>;
 
 }  // namespace mate::attention::msa

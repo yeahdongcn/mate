@@ -5,11 +5,12 @@ the operations on MUSA through MATE.
 
 ## Overview
 
-The wrapper currently covers three integration areas:
+The wrapper currently covers four integration areas:
 
 | Area | Public surface |
 | --- | --- |
 | GEMM | BF16/FP16 BMM, FP8 BMM, groupwise FP8 GEMM, and grouped FP8 GEMM |
+| Norm | RMSNorm, LayerNorm, fused add RMSNorm, quantized outputs, and diffusion-model fused norms |
 | MLA RoPE | Fused RoPE and FP8 quantization for 512-value NoPE and 64-value RoPE components |
 | Sparse MLA decode | FP8 sparse decode with optional reusable scheduler metadata |
 
@@ -31,6 +32,7 @@ native package.
 import flashinfer
 import flashinfer.decode
 import flashinfer.gemm
+import flashinfer.norm
 import flashinfer.rope
 ```
 
@@ -95,6 +97,39 @@ returns that tensor.
 For `gemm_fp8_nt_groupwise`, `auto` selects `mudnn` for BF16 or FP16 output.
 Supplying `output_scale` selects FP8 E4M3 output and makes `auto` select
 `mubin`.
+
+## Norm APIs
+
+```python
+from flashinfer.norm import (
+    fused_add_rmsnorm,
+    fused_add_rmsnorm_fp8_block_quant,
+    fused_add_rmsnorm_quant,
+    gemma_fused_add_rmsnorm,
+    gemma_rmsnorm,
+    layernorm,
+    layernorm_quant,
+    rmsnorm,
+    rmsnorm_quant,
+)
+```
+
+The wrapper also exports the fused DiT LayerNorm, fused QK RMSNorm/RoPE, and
+fused RMSNorm/SiLU APIs implemented by MATE. All supported Norm functions are
+available both from `flashinfer.norm` and the `flashinfer` package root.
+
+Quantized RMSNorm and LayerNorm functions follow FlashInfer's output-first
+signatures and write into the supplied FP8 tensor. Python float scales are
+converted to device-local FP32 scalar tensors. Fused add RMSNorm updates the
+residual in place; its non-quantized variant also replaces the input with the
+normalized output. The `enable_pdl` argument is accepted for compatibility and
+has no effect on MUSA.
+
+`fused_add_rmsnorm_fp8_block_quant` produces FP8 E4M3 activations together
+with dynamic FP32 scales for groups of 128 consecutive hidden elements. MATE
+uses a contiguous row-major scale tensor with shape
+`[rows, hidden_size // 128]`; this intentionally differs from FlashInfer's
+swizzled DeepGEMM scale layout.
 
 ## FP8 MLA APIs
 

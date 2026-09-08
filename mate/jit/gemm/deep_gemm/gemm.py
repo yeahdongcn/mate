@@ -52,6 +52,7 @@ _SUPPORTED_GEMM_TYPES = (
     GEMM_TYPE_M_GROUPED_CONTIGUOUS_PSUM,
     GEMM_TYPE_M_GROUPED_MASKED,
 )
+_SUPPORTED_MAJOR_B_MODES = ("K", "N")
 
 FP8_SCALE_ACCUMULATION_MODE_AUTO = "auto"
 FP8_SCALE_ACCUMULATION_MODE_ITERATIVE = "iterative"
@@ -104,6 +105,7 @@ class DeepGemmGemmKernelConfig:
     scale_accumulation_mode: str = FP8_SCALE_ACCUMULATION_MODE_ITERATIVE
     epilogue: str = DEEP_GEMM_EPILOGUE_GEMM
     head_splits: tuple[int, int, int] = (0, 0, 0)
+    major_b_mode: str = "K"
 
 
 DEEP_GEMM_CONFIGS = [
@@ -187,6 +189,8 @@ def deep_gemm_gemm_dispatch_name(config: DeepGemmGemmKernelConfig) -> str:
         suffix += f"_quant1x{config.quant_tile}x{config.quant_tile}"
         if config.scale_accumulation_mode == FP8_SCALE_ACCUMULATION_MODE_DUAL_BUFFER:
             suffix += "_dualbuffer"
+    if config.major_b_mode == "N":
+        suffix += "_bmajor_n"
     return f"mate_jit_{_deep_gemm_gemm_func_name(config)}_{suffix}"
 
 
@@ -203,6 +207,8 @@ def _deep_gemm_gemm_config_dict(
         "stages": config.stages,
         "num_mma_warp_squads": config.num_mma_warp_squads,
         "epilogue": config.epilogue,
+        "major_b_mode": config.major_b_mode,
+        "b_major_n": "true" if config.major_b_mode == "N" else "false",
     }
     if config.epilogue == DEEP_GEMM_EPILOGUE_HEAD_SPLITS:
         left, mid, right = config.head_splits
@@ -257,6 +263,17 @@ def _validate_deep_gemm_gemm_kernel_config(config: DeepGemmGemmKernelConfig) -> 
         raise ValueError(
             f"Unsupported DeepGEMM GEMM type: {config.gemm_type}. "
             f"Expected one of {_SUPPORTED_GEMM_TYPES}"
+        )
+    if config.major_b_mode not in _SUPPORTED_MAJOR_B_MODES:
+        raise ValueError(
+            f"Unsupported DeepGEMM B major mode: {config.major_b_mode}. "
+            f"Expected one of {_SUPPORTED_MAJOR_B_MODES}"
+        )
+    if config.major_b_mode == "N" and not (
+        config.kind == "fp8" and config.gemm_type == GEMM_TYPE_M_GROUPED_CONTIGUOUS
+    ):
+        raise ValueError(
+            "N-major B is only supported for FP8 M-grouped contiguous GEMM"
         )
     if config.kind == "fp8" and config.scale_accumulation_mode not in (
         _FP8_SCALE_ACCUMULATION_MODES
@@ -352,6 +369,7 @@ def _normalize_deep_gemm_gemm_config(
         scale_accumulation_mode=scale_accumulation_mode,
         epilogue=str(config.get("epilogue", DEEP_GEMM_EPILOGUE_GEMM)),
         head_splits=head_splits,
+        major_b_mode=str(config.get("major_b_mode", "K")).upper(),
     )
 
 
@@ -374,7 +392,7 @@ def _render_deep_gemm_gemm_source(
 
 def _freeze_deep_gemm_gemm_config(
     config: DeepGemmGemmKernelConfig,
-) -> tuple[str, str, int, int, int, int, int, int, str, str, tuple[int, int, int]]:
+) -> tuple[str, str, int, int, int, int, int, int, str, str, tuple[int, int, int], str]:
     return (
         config.kind,
         config.gemm_type,
@@ -387,13 +405,25 @@ def _freeze_deep_gemm_gemm_config(
         config.scale_accumulation_mode,
         config.epilogue,
         config.head_splits,
+        config.major_b_mode,
     )
 
 
 @functools.cache
 def _load_deep_gemm_gemm_module(
     frozen_config: tuple[
-        str, str, int, int, int, int, int, int, str, str, tuple[int, int, int]
+        str,
+        str,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        str,
+        str,
+        tuple[int, int, int],
+        str,
     ],
 ):
     config = DeepGemmGemmKernelConfig(*frozen_config)
@@ -409,6 +439,7 @@ def get_deep_gemm_gemm_module(
     scale_accumulation_mode: Optional[str] = None,
     epilogue: str = DEEP_GEMM_EPILOGUE_GEMM,
     head_splits: tuple[int, int, int] = (0, 0, 0),
+    major_b_mode: str = "K",
 ):
     kernel_config = _resolve_deep_gemm_gemm_kernel_config(
         kind=kind,
@@ -419,6 +450,7 @@ def get_deep_gemm_gemm_module(
         scale_accumulation_mode=scale_accumulation_mode,
         epilogue=epilogue,
         head_splits=head_splits,
+        major_b_mode=major_b_mode,
     )
     return (
         deep_gemm_gemm_dispatch_name(kernel_config),
@@ -459,6 +491,7 @@ def _make_kernel_config(
     scale_accumulation_mode: Optional[str] = None,
     epilogue: str = DEEP_GEMM_EPILOGUE_GEMM,
     head_splits: tuple[int, int, int] = (0, 0, 0),
+    major_b_mode: str = "K",
 ) -> DeepGemmGemmKernelConfig:
     if kind not in _SUPPORTED_KINDS:
         raise ValueError(f"Unsupported DeepGEMM GEMM kind: {kind}")
@@ -475,6 +508,7 @@ def _make_kernel_config(
             num_mma_warp_squads=config.num_mma_warp_squads,
             epilogue=epilogue,
             head_splits=head_splits,
+            major_b_mode=major_b_mode,
         )
     return DeepGemmGemmKernelConfig(
         kind=kind,
@@ -493,6 +527,7 @@ def _make_kernel_config(
         ),
         epilogue=epilogue,
         head_splits=head_splits,
+        major_b_mode=major_b_mode,
     )
 
 
@@ -506,6 +541,7 @@ def _resolve_deep_gemm_gemm_kernel_config(
     scale_accumulation_mode: Optional[str] = None,
     epilogue: str = DEEP_GEMM_EPILOGUE_GEMM,
     head_splits: tuple[int, int, int] = (0, 0, 0),
+    major_b_mode: str = "K",
 ) -> DeepGemmGemmKernelConfig:
     selected = select_deep_gemm_gemm_config(
         kind=kind,
@@ -521,6 +557,7 @@ def _resolve_deep_gemm_gemm_kernel_config(
         scale_accumulation_mode=scale_accumulation_mode,
         epilogue=epilogue,
         head_splits=head_splits,
+        major_b_mode=major_b_mode.upper(),
     )
 
 
@@ -541,6 +578,15 @@ def get_deep_gemm_gemm_aot_configs() -> list[dict[str, object]]:
             configs.append(
                 _make_kernel_config(kind="fp8", gemm_type=gemm_type, config=jit_config)
             )
+            if gemm_type == GEMM_TYPE_M_GROUPED_CONTIGUOUS:
+                configs.append(
+                    _make_kernel_config(
+                        kind="fp8",
+                        gemm_type=gemm_type,
+                        config=jit_config,
+                        major_b_mode="N",
+                    )
+                )
     deduped = {}
     for kernel_config in configs:
         deduped[deep_gemm_gemm_dispatch_name(kernel_config)] = kernel_config
