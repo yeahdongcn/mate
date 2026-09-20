@@ -234,6 +234,7 @@ def selective_state_update(
     )
 
 
+@mate_api
 def prewarm_selective_state_update(
     *,
     state_dtype: torch.dtype,
