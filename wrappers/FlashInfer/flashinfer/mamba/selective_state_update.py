@@ -53,14 +53,53 @@ def _flat_slots(indices: Any, batch: int) -> Any:
     return indices
 
 
+_FP32_VECTOR_CACHE: dict[tuple, Any] = {}
+_FP32_VECTOR_CACHE_LIMIT = 256
+
+
 def _per_head_fp32(tensor: Any) -> Any:
-    """Return MATE's per-head fp32 view of a vLLM per-head vector."""
-    if tensor is None:
-        return None
+    """Return MATE's per-head fp32 view of a vLLM per-head vector.
+
+    D and dt_bias are loaded model parameters, so the widened copy is made once
+    per tensor and reused. Widening bf16/fp16 to fp32 is exact; doing it on every
+    decode step instead put one cast launch per mixer per step on the critical
+    path, which is measurable at 52 mixers.
+    """
+    if tensor is None or not hasattr(tensor, "dtype"):
+        # Forwarding tests and non-tensor sentinels pass through untouched; MATE
+        # validates whatever it actually receives.
+        return tensor
     if tensor.dim() >= 2 and all(stride == 0 for stride in tensor.stride()[1:]):
         tensor = tensor[:, 0]
-    if tensor.dtype != torch.float32:
-        tensor = tensor.float()
+    if tensor.dtype == torch.float32:
+        return tensor
+    key = (
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        str(tensor.dtype),
+        str(tensor.device),
+    )
+    cached = _FP32_VECTOR_CACHE.get(key)
+    if cached is None:
+        cached = tensor.float().contiguous()
+        if len(_FP32_VECTOR_CACHE) < _FP32_VECTOR_CACHE_LIMIT:
+            _FP32_VECTOR_CACHE[key] = cached
+    return cached
+
+
+def _dt_input(tensor: Any) -> Any:
+    """Return dt in the form MATE reads without a copy.
+
+    vLLM expands dt across head_dim, so it arrives as a zero-stride view in the
+    model dtype. MATE reads one step value per head and widens it inside the
+    kernel, so the broadcast's base -- a contiguous [batch, heads] buffer -- is
+    handed over as [batch, heads, 1]. The values are identical by construction,
+    and the decode path loses a per-layer cast launch.
+    """
+    if tensor is None or not hasattr(tensor, "stride"):
+        return tensor
+    if tensor.dim() == 3 and tensor.stride(-1) == 0:
+        return tensor.select(-1, 0).unsqueeze(-1)
     return tensor
 
 
@@ -137,12 +176,7 @@ def selective_state_update(
     D = _per_head_fp32(D)
     dt_bias = _per_head_fp32(dt_bias)
     x = _materialized(x)
-    # dt is the pre-softplus step in the model dtype; MATE's kernel does the
-    # softplus and the state math in fp32. Widening bf16/fp16 to fp32 is exact,
-    # and `to` also compacts the broadcast view dt arrives as, so one call covers
-    # both the dtype and the contiguity requirement.
-    dt = dt if dt.dtype == torch.float32 else dt.to(torch.float32)
-    dt = _materialized(dt)
+    dt = _dt_input(dt)
     state_batch_indices = _flat_slots(state_batch_indices, x.shape[0])
     dst_state_batch_indices = _flat_slots(dst_state_batch_indices, x.shape[0])
     return implementation(
