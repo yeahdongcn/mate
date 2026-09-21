@@ -137,6 +137,11 @@ def selective_state_update(
     D = _per_head_fp32(D)
     dt_bias = _per_head_fp32(dt_bias)
     x = _materialized(x)
+    # dt is the pre-softplus step in the model dtype; MATE's kernel does the
+    # softplus and the state math in fp32. Widening bf16/fp16 to fp32 is exact,
+    # and `to` also compacts the broadcast view dt arrives as, so one call covers
+    # both the dtype and the contiguity requirement.
+    dt = dt if dt.dtype == torch.float32 else dt.to(torch.float32)
     dt = _materialized(dt)
     state_batch_indices = _flat_slots(state_batch_indices, x.shape[0])
     dst_state_batch_indices = _flat_slots(dst_state_batch_indices, x.shape[0])
