@@ -195,14 +195,19 @@ def ssd_chunk_state_launch(
     chunk_size: int,
     *,
     states: torch.Tensor | None = None,
+    state_dtype: torch.dtype | None = None,
     block_m: int = _DEFAULT_BLOCK_M,
     block_n: int = _DEFAULT_BLOCK_N,
 ) -> torch.Tensor:
     """Run the native intra-chunk state kernel.
 
-    Returns ``states``, ``[nchunks, heads, dim, dstate]`` fp32. Pass ``states``
-    to reuse caller-owned scratch (the orchestration does, so a captured graph
-    allocates nothing).
+    Returns ``states``, ``[nchunks, heads, dim, dstate]``, in ``state_dtype`` when
+    given, else in the dtype of the ``states`` buffer passed in, else fp32. The
+    accumulator is fp32 either way; the dtype only decides where the result is
+    stored, which is the rounding point the production path applies between this
+    stage and the state passing that follows. Pass ``states`` to reuse
+    caller-owned scratch (the orchestration does, so a captured graph allocates
+    nothing).
     """
     if x.dim() != 3:
         raise RuntimeError("x must be [tokens, heads, dim].")
@@ -247,11 +252,13 @@ def ssd_chunk_state_launch(
 
     out_shape = (nchunks, heads, dim, dstate)
     if states is None:
-        states = torch.empty(out_shape, device=x.device, dtype=torch.float32)
+        states = torch.empty(
+            out_shape, device=x.device, dtype=state_dtype or torch.float32
+        )
     if states.shape != out_shape:
         raise RuntimeError(f"states must be {out_shape}, got {tuple(states.shape)}.")
-    if states.dtype != torch.float32:
-        raise RuntimeError("states must be fp32.")
+    if states.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise RuntimeError("states must be fp32, bf16 or fp16.")
     if not states.is_contiguous():
         raise RuntimeError("states must be contiguous.")
 
@@ -262,7 +269,7 @@ def ssd_chunk_state_launch(
         head_ratio,
         x.dtype,
         b.dtype,
-        torch.float32,
+        states.dtype,
         cu_chunk_seqlens.dtype,
         block_m,
         block_n,
