@@ -144,16 +144,22 @@ def tilelang_ssd_chunk_scan(
             acc_shared = T.alloc_shared((block_M, dim), dtype=accum_dtype)
 
             # --- load the two operands of the past-state dot
+            # Statement-level guards, not `T.if_then_else`: the select form only
+            # masks the *value*, so the address is still formed and dereferenced
+            # for the lanes past the chunk's end. On a partial last chunk that
+            # reads up to `block_S` tokens past the packed tensor, which faults
+            # as "misaligned address" *after* the kernel returns, and the async
+            # report then lands on whichever stage runs next.
             for i, n in T.Parallel(block_M, dstate):
-                c_shared[i, n] = T.if_then_else(
-                    row0 + i < limit,
-                    C[chunk_start + row0 + i, head_group, n],
-                    T.cast(0, io_dtype),
-                )
+                if row0 + i < limit:
+                    c_shared[i, n] = C[chunk_start + row0 + i, head_group, n]
+                else:
+                    c_shared[i, n] = T.cast(0, io_dtype)
             for d, n in T.Parallel(dim, dstate):
-                # transposed into (dstate, dim) for the gemm. The first chunk of
-                # the first sequence with no initial states contributes nothing,
-                # so its address is never dereferenced.
+                # transposed into (dstate, dim) for the gemm. Both addresses stay
+                # inside their tensors whichever way the condition goes -- a
+                # sequence id and a chunk index are always in range -- so this is
+                # a genuine value select, unlike the two loads above.
                 s_shared[n, d] = T.if_then_else(
                     takes_initial_state,
                     T.cast(initial_states[seq_idx[bc], bh, d, n], io_dtype),
@@ -199,11 +205,10 @@ def tilelang_ssd_chunk_scan(
                     cb_shared[i, j] = T.cast(0, io_dtype)
 
             for j, d in T.Parallel(block_S, dim):
-                x_shared[j, d] = T.if_then_else(
-                    j < limit,
-                    x[chunk_start + j, bh, d],
-                    T.cast(0, io_dtype),
-                )
+                if j < limit:
+                    x_shared[j, d] = x[chunk_start + j, bh, d]
+                else:
+                    x_shared[j, d] = T.cast(0, io_dtype)
 
             T.sync_threads()
 
