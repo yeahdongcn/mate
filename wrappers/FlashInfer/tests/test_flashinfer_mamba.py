@@ -79,6 +79,12 @@ SSU_PARAMETERS = [
     "cu_seqlens",
     "num_accepted_tokens",
     "backend",
+    # vLLM's MambaSSUBackend.__call__ passes these four by keyword. They are part
+    # of the surface because the dispatch is the only production caller.
+    "null_block_id",
+    "is_blackwell",
+    "enable_stochastic_rounding",
+    "cache_philox_rounds",
 ]
 
 
@@ -95,6 +101,38 @@ def test_selective_state_update_matches_upstream_parameter_order():
     assert parameters["algorithm"].default == "auto"
     assert parameters["backend"].default == "auto"
     assert parameters["philox_rounds"].default == 10
+
+
+def test_selective_state_update_accepts_the_dispatch_keywords():
+    """vLLM's backend dispatch must reach MATE instead of raising TypeError.
+
+    ``ssu_dispatch.FlashInferSSUBackend.__call__`` passes these four by keyword;
+    a wrapper whose parameter list mirrors MATE alone rejects the call before any
+    kernel runs.
+    """
+    parameters = inspect.signature(selective_state_update).parameters
+    for name in (
+        "null_block_id",
+        "is_blackwell",
+        "enable_stochastic_rounding",
+        "cache_philox_rounds",
+    ):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+    assert parameters["null_block_id"].default == 0
+    assert parameters["is_blackwell"].default is False
+    assert parameters["enable_stochastic_rounding"].default is False
+
+
+def test_selective_state_update_refuses_what_it_cannot_honour():
+    """Refuse, do not silently ignore: both cases would change state contents."""
+    with pytest.raises(NotImplementedError, match="is_blackwell"):
+        selective_state_update(
+            None, None, None, None, None, None, None, is_blackwell=True
+        )
+    with pytest.raises(NotImplementedError, match="null_block_id"):
+        selective_state_update(
+            None, None, None, None, None, None, None, null_block_id=7
+        )
 
 
 def test_checkpointing_surface_is_importable():
@@ -196,7 +234,14 @@ def test_selective_state_update_forwards_keyword_capabilities(recording_backend)
     name, forwarded, kwargs = calls[0]
     assert name == "selective_state_update"
     assert list(forwarded[:7]) == args
-    assert len(forwarded) == len(SSU_PARAMETERS)
+    # Forwarding is positional over MATE's own parameter list; the keyword-only
+    # additions are the consumer contract and are consumed here, not forwarded.
+    mate_parameters = [
+        n
+        for n, p in inspect.signature(selective_state_update).parameters.items()
+        if p.kind is not inspect.Parameter.KEYWORD_ONLY
+    ]
+    assert len(forwarded) == len(mate_parameters)
     assert kwargs == {}
     assert result == "selective_state_update:result"
 
