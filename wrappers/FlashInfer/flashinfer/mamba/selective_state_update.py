@@ -27,10 +27,9 @@ import torch
 def _materialized(tensor: Any) -> Any:
     """Return a contiguous tensor, copying only when vLLM passed a view.
 
-    vLLM expands `dt_d` across head_dim, so it arrives as a zero-stride view that
-    MATE's kernel refuses. The copy is tokens x heads x head_dim elements -- a few
-    kilobytes per mixer per step -- and it is captured with the graph, so it does
-    not reallocate at replay.
+    x and dt both arrive as views of the mixer's projected states. dt keeps its
+    broadcast form and is read per head, so this only ever copies x, and only when
+    the reshape vLLM performed did not already leave it contiguous.
     """
     if tensor is None or not hasattr(tensor, "is_contiguous"):
         return tensor
