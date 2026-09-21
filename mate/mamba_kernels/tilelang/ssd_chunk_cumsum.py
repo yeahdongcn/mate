@@ -16,11 +16,12 @@ needed -- only `cu_chunk_seqlens`, the chunk start offsets in token units.
 
 Chunks are padded rows: chunk ``c`` covers tokens
 ``[cu_chunk_seqlens[c], cu_chunk_seqlens[c+1])`` and lives at ``[0:heads, c, 0:]``
-of the output. Row positions past the chunk's end are **never written**, and
-loads past it are masked (the kernel is compiled with bounds checking disabled,
-so every access is masked by hand). Because the mask is always a suffix of a row,
-the arithmetic below needs no partial-chunk special case: garbage after the valid
-prefix can never influence it.
+of the output. The **whole row is written**, and padding is part of the contract
+rather than slack space: ``dt_out`` is exactly zero past the chunk's end, so the
+scan saturates and ``dA_cumsum`` holds the chunk's total decay in the tail --
+which is what the downstream stages read, unconditionally, from the padded row's
+last position ``dA_cumsum[:, c, chunk_size - 1]``. Loads past the chunk's end are
+masked by hand, since the kernel is compiled with bounds checking disabled.
 
 The whole chunk is scanned with ``T.cumsum`` over a ``(heads, chunk_size)`` fp32
 fragment, mirroring the warp-scan in the shipped native implementation but at
@@ -129,15 +130,23 @@ def tilelang_ssd_chunk_cumsum(
                     )
                 value = T.max(value, dt_min)
                 value = T.min(value, dt_max)
-                processed[i, j] = value
-                scaled[i, j] = value * T.cast(A[i], accum_dtype)
+                if chunk_start + j < chunk_end:
+                    processed[i, j] = value
+                    scaled[i, j] = value * T.cast(A[i], accum_dtype)
+                else:
+                    # dt is zero beyond the chunk's end, so the scan saturates at
+                    # the chunk total -- the value the downstream stages read
+                    # from the padded row's last position.
+                    processed[i, j] = T.cast(0.0, accum_dtype)
+                    scaled[i, j] = T.cast(0.0, accum_dtype)
 
             T.cumsum(scaled, dim=1)
 
+            # Every row is written in full: zero dt in the tail, saturated total
+            # of dA_cumsum in the tail.
             for i, j in T.Parallel(heads, block_S):
-                if chunk_start + j < chunk_end:
-                    dA_cumsum[i, bc, j] = T.cast(scaled[i, j], out_dtype)
-                    dt_out[i, bc, j] = T.cast(processed[i, j], out_dtype)
+                dA_cumsum[i, bc, j] = T.cast(scaled[i, j], out_dtype)
+                dt_out[i, bc, j] = T.cast(processed[i, j], out_dtype)
 
     symbol = (
         f"tilelang_ssd_chunk_cumsum_h{heads}_cs{chunk_size}"

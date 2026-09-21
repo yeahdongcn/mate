@@ -241,9 +241,14 @@ def ssd_chunk_cumsum_reference(
     ``dt`` (bias, softplus, clamp) and ``dA_cumsum`` is the *inclusive* prefix
     sum of ``dt_out * A`` over each chunk's tokens.
 
-    Chunks are scanned independently -- never across a sequence boundary -- and a
-    chunk's padded row positions past its end are left untouched, mirroring the
-    kernel and the production contract.
+    Padding is part of the contract, not slack space:
+
+    * ``dt_out`` is **exactly zero** beyond a chunk's end, so the scan saturates;
+    * consequently ``dA_cumsum`` beyond a chunk's end holds the chunk's **total**
+      decay, and downstream stages read the padded row's last position
+      ``dA_cumsum[:, c, chunk_size - 1]`` unconditionally to obtain it.
+
+    Chunks are scanned independently and never across a sequence boundary.
     """
     if dt.dim() != 2:
         raise ValueError("dt must be [tokens, heads].")
@@ -280,8 +285,15 @@ def ssd_chunk_cumsum_reference(
                 torch.log1p(torch.exp(value)),
             )
         value = value.clamp(min=dt_min, max=dt_max)
-        prefix = torch.cumsum(value * a_value.view(1, heads), dim=0)
-        dA_cumsum[:, chunk, :length] = prefix.transpose(0, 1)
-        dt_out[:, chunk, :length] = value.transpose(0, 1)
+        # Zero-pad the chunk's dt to the full row before scanning, so the prefix
+        # sum saturates at the chunk total in the tail -- the value downstream
+        # stages read from the row's last position.
+        padded = torch.zeros(
+            (chunk_size, heads), dtype=torch.float32, device=dt.device
+        )
+        padded[:length] = value
+        prefix = torch.cumsum(padded * a_value.view(1, heads), dim=0)
+        dA_cumsum[:, chunk, :] = prefix.transpose(0, 1)
+        dt_out[:, chunk, :] = padded.transpose(0, 1)
 
     return dA_cumsum, dt_out

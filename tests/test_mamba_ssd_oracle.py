@@ -58,12 +58,29 @@ def test_chunks_are_independent():
         assert torch.allclose(base_dt[:, c], new_dt[:, c], atol=0.0)
 
 
-def test_padding_beyond_a_partial_chunk_is_zero():
-    """The reference returns zeros there; the kernel must leave the rows untouched."""
-    dt, A, bias, cu, chunk = _inputs([0, 8, 11])
+def test_padding_saturates_dt_to_zero_and_da_to_the_chunk_total():
+    """Padding is contractual: dt is 0 past the chunk end, so the scan saturates
+    and the row's last position holds the chunk's total decay -- the value the
+    downstream stages read unconditionally."""
+    offsets = [0, 8, 11]
+    dt, A, bias, cu, chunk = _inputs(offsets)
     dA, dt_out = ssd_chunk_cumsum_reference(dt, A, bias, cu, chunk, True)
-    assert torch.equal(dA[:, 1, 3:], torch.zeros_like(dA[:, 1, 3:]))
+
+    # dt is exactly zero beyond the chunk.
     assert torch.equal(dt_out[:, 1, 3:], torch.zeros_like(dt_out[:, 1, 3:]))
+    assert torch.all(dt_out[:, 1, :3] > 0)
+
+    # dA_cumsum is saturated at the chunk total past the chunk...
+    total = dA[:, 1, 2]  # last valid position of the 3-token chunk
+    assert torch.allclose(
+        dA[:, 1, 3:], total.unsqueeze(1).expand_as(dA[:, 1, 3:]), atol=0.0
+    )
+    # ...and equals the row's last position, which is what callers read.
+    assert torch.equal(dA[:, 1, 2], dA[:, 1, chunk - 1])
+
+    # The total is the fp32 accumulation of processed_dt * A over valid tokens.
+    expected = (dt_out[:, 1, :3] * A.view(-1, 1)).sum(dim=1)
+    assert torch.allclose(total, expected, atol=1e-6)
 
 
 def test_partial_chunk_equals_full_chunk_prefix():
