@@ -178,6 +178,11 @@ def selective_state_update(
     dt_bias = _per_head_fp32(dt_bias)
     x = _materialized(x)
     dt = _dt_input(dt)
+    if hasattr(dt, "is_contiguous") and not dt.is_contiguous():
+        # The zero-stride trick only returns a contiguous view when the head stride is
+        # already 1, which is how vLLM builds it. Any other layout is materialized
+        # instead of handed to a kernel that requires contiguity.
+        dt = dt.contiguous()
     # x can be a non-tensor sentinel on the pure-forwarding path, in which case
     # there is no batch to compare against and the indices pass through.
     batch = x.shape[0] if hasattr(x, "shape") else None
