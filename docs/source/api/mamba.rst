@@ -90,9 +90,34 @@ the TileLang kernel is compiled on first use, and a first-call compile inside a
 captured graph stalls the worker. The operator itself issues a single kernel
 launch and performs no host/device scalar copies.
 
+SSD packed prefill
+-------------------
+
+``ssd_combined_fwd_varlen`` is the prefill-side counterpart of the decode
+entrypoint: one packed call over a variable-length batch, running the five SSD
+stages (chunk-local dt/decay cumsum, intra-chunk states, state passing, the
+``C·Bᵀ`` products, and the chunk scan) as five TileLang launches. It is the
+symbol the FlashInfer-shaped compatibility wrapper dispatches to for
+``--mamba-backend flashinfer`` on MUSA, and it drives the same implementation for
+every Mamba2/Nemotron-H prefill shape.
+
+The per-shape intermediates come from a cached workspace, so a steady-state call
+allocates nothing beyond the returned state tensor. ``cu_chunk_seqlens`` is the
+only authority for the chunk-to-token mapping, and ``seq_idx`` -- not the
+``last_chunk_indices`` arithmetic -- decides which chunks open a sequence and
+therefore where their entering state comes from.
+
+Everything outside the supported contract raises ``NotImplementedError`` or
+``ValueError`` naming the missing capability rather than silently narrowing
+semantics: the ``checkpoint_*`` replay arguments are not implemented.
+
 API reference
 -------------
 
 .. autofunction:: selective_state_update
 
 .. autofunction:: prewarm_selective_state_update
+
+.. autofunction:: ssd_combined_fwd_varlen
+
+.. autofunction:: prewarm_ssd_combined_fwd_varlen

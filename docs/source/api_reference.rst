@@ -134,6 +134,8 @@ FlashInfer-shaped compatibility surface used by serving frameworks.
 - ``mate.selective_state_update``
 - ``mate.mamba.selective_state_update``
 - ``mate.mamba.prewarm_selective_state_update``
+- ``mate.mamba.ssd_combined_fwd_varlen``
+- ``mate.mamba.prewarm_ssd_combined_fwd_varlen``
 
 MSA
 ---

@@ -308,6 +308,7 @@ def ssd_chunk_state_reference(
     dA_cumsum: torch.Tensor,
     cu_chunk_seqlens: torch.Tensor,
     chunk_size: int,
+    round_operands: bool = True,
 ) -> torch.Tensor:
     """Reference intra-chunk states ``S_c[h, d, n]`` for the SSD prefill.
 
@@ -315,6 +316,10 @@ def ssd_chunk_state_reference(
     dstate]``, and ``dt_out``/``dA_cumsum`` are the head-major ``[heads, nchunks,
     chunk_size]`` outputs of the cumsum stage. The result is ``[nchunks, heads,
     dim, dstate]`` fp32.
+
+    ``round_operands=False`` disables the pre-dot rounding: the device path has no
+    such choice, but turning it off is how the cost of that convention gets
+    measured against an fp32 reference instead of asserted.
 
     The arithmetic mirrors the device path exactly, including its two rounding
     points: ``scale = exp(min(last - dA_cumsum[t], 0)) * dt`` stays fp32, and the
@@ -368,9 +373,14 @@ def ssd_chunk_state_reference(
             scaled = (
                 b_fp32[start:end, group, :].unsqueeze(0)
                 * scale[head_slice].unsqueeze(2)
-            ).to(x.dtype)
+            )
+            if round_operands:
+                scaled = scaled.to(x.dtype)
+            # Contract the token axis exactly once: the scaled operand is
+            # [head, token, dstate] and pairs token t with token t, not every
+            # (t, l) pair.
             states[chunk, head_slice] = torch.einsum(
-                "thd,hln->hdn", x_chunk[:, head_slice, :], scaled.to(torch.float32)
+                "thd,htn->hdn", x_chunk[:, head_slice, :], scaled.to(torch.float32)
             )
     return states
 
@@ -389,11 +399,14 @@ def ssd_chunk_scan_reference(
     D_param: torch.Tensor | None = None,
     z: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    CB: torch.Tensor | None = None,
+    round_operands: bool = True,
 ) -> torch.Tensor:
     """Reference SSD chunk scan.
 
-    ``B`` is taken directly (rather than a materialized ``CB``) so this doubles as
-    an independent check of the BMM stage; the device kernel consumes ``CB``.
+    With ``CB`` unset the ``C·Bᵀ`` products are recomputed from ``B``, so this
+    doubles as an independent check of the BMM stage; passing ``CB`` exercises the
+    materialized products the device kernel consumes instead.
     ``out`` is written in place when supplied and returned; positions at or past a
     chunk's logical end are never touched, and rows opened by a sequence take
     their entering state from ``initial_states[seq_idx[chunk]]``.
@@ -401,6 +414,8 @@ def ssd_chunk_scan_reference(
     Rounding points mirror the device path: the past-state product accumulates in
     fp32, the decay ``exp(dA_cs[t])`` scales that term *after* the dot, and the
     scaled ``CB`` is rounded to the activation dtype **before** the diagonal dot.
+    ``round_operands=False`` disables that rounding, which is how its cost is
+    measured rather than asserted.
     """
     tokens, heads, dim = x.shape
     groups, dstate = C.shape[1], C.shape[2]
@@ -452,11 +467,17 @@ def ssd_chunk_scan_reference(
                     dA_head.unsqueeze(1) - dA_head.unsqueeze(0), max=0.0
                 )
             )
-            cb = b_fp32[start:end, group, :]  # (limit, dstate)
-            cb = torch.einsum("in,jn->ij", c_rows, cb)  # (limit, limit)
+            if CB is None:
+                b_rows = b_fp32[start:end, group, :]  # (limit, dstate)
+                cb = torch.einsum("in,jn->ij", c_rows, b_rows)  # (limit, limit)
+            else:
+                cb = CB[chunk, group, :limit, :limit].to(torch.float32)
             cb = cb * decay * dt_head.unsqueeze(0)
             causal = torch.tril(torch.ones(limit, limit, device=x.device, dtype=torch.bool))
-            cb = torch.where(causal, cb, torch.zeros_like(cb)).to(x.dtype).to(torch.float32)
+            cb = torch.where(causal, cb, torch.zeros_like(cb))
+            if round_operands:
+                cb = cb.to(x.dtype)
+            cb = cb.to(torch.float32)
             acc = acc + cb @ x_fp32[start:end, head, :]
             if D_param is not None:
                 acc = acc + x_fp32[start:end, head, :] * D_param[head].to(torch.float32)
