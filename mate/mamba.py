@@ -66,7 +66,9 @@ _DEFAULT_LANES_PER_ROW = 32
 _DEFAULT_ROWS_PER_CTA = 4
 
 
-def _per_head(tensor: torch.Tensor, heads: int, *, name: str) -> torch.Tensor:
+def _per_head(
+    tensor: torch.Tensor, heads: int, *, name: str, dim: int | None = None
+) -> torch.Tensor:
     """Return ``tensor`` as a contiguous per-head vector, or explain the gap."""
     if tensor.dtype != torch.float32:
         raise NotImplementedError(
@@ -85,10 +87,26 @@ def _per_head(tensor: torch.Tensor, heads: int, *, name: str) -> torch.Tensor:
                 f"{name} must have one entry per head, got {tensor.shape}."
             )
         return tensor[:, 0, 0].contiguous()
+    if tensor.dim() == 3 and tensor.stride(2) == 0 and _matches(tensor, heads, dim):
+        # vLLM's decode path passes a per-channel A/D/dt_bias as a [heads, dim,
+        # dstate] view whose last stride is zero, because the value does not vary
+        # along dstate. Reading the first column is exact for that form.
+        return tensor[:, :, 0].contiguous()
+    if tensor.dim() == 2 and _matches(tensor, heads, dim):
+        return tensor.contiguous()
     raise NotImplementedError(
-        f"native mamba SSU implements per-head (tied) {name} only; got shape "
-        f"{tuple(tensor.shape)} with strides {tuple(tensor.stride())}."
+        f"native mamba SSU implements per-head (tied) or per-(head, dim) {name} only; "
+        f"got shape {tuple(tensor.shape)} with strides {tuple(tensor.stride())}."
     )
+
+
+def _matches(tensor: torch.Tensor, heads: int, dim: int | None) -> bool:
+    """Whether a matrix-shaped parameter covers one value per head, or per channel."""
+    if tensor.shape[0] != heads:
+        return False
+    if tensor.shape[1] == 1:
+        return True
+    return dim is None or tensor.shape[1] == dim
 
 
 def _slots(
@@ -243,10 +261,10 @@ def selective_state_update(
         raise ValueError("B and C must share the x dtype for the native SSU kernel.")
     batch = x.shape[0]
 
-    a_head = _per_head(A, heads, name="A")
-    d_head = _per_head(D, heads, name="D") if D is not None else None
+    a_head = _per_head(A, heads, dim=dim, name="A")
+    d_head = _per_head(D, heads, dim=dim, name="D") if D is not None else None
     bias_head = (
-        _per_head(dt_bias, heads, name="dt_bias") if dt_bias is not None else None
+        _per_head(dt_bias, heads, dim=dim, name="dt_bias") if dt_bias is not None else None
     )
     if z is not None and (z.shape != x.shape or z.dtype != x.dtype):
         raise ValueError("z must match x in shape and dtype for the native SSU kernel.")

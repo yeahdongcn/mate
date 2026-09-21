@@ -65,6 +65,9 @@ def tilelang_ssu_one_token(
     lanes_per_row,
     dt_dtype=None,
     dt_dim=None,
+    a_dim=None,
+    d_dim=None,
+    b_dim=None,
 ):
     """Build the one-token SSU kernel for one (dtype, shape, config) tuple.
 
@@ -78,6 +81,16 @@ def tilelang_ssu_one_token(
         dt_dtype = torch.float32
     if dt_dim is None:
         dt_dim = dim
+    # A, D and dt_bias are per-head for a tied model and per-(head, dim) for a
+    # per-channel one. The consumers signal the second form with a [heads, dim,
+    # dstate] view whose last stride is zero, and the first with a [heads] vector,
+    # so a dim of 1 here means "one value per head, broadcast over head_dim".
+    if a_dim is None:
+        a_dim = 1
+    if d_dim is None:
+        d_dim = 1
+    if b_dim is None:
+        b_dim = 1
     batch = T.dynamic("batch")
     heads = T.dynamic("heads")
     groups = T.dynamic("groups")
@@ -93,11 +106,11 @@ def tilelang_ssu_one_token(
         state: T.Tensor((slots, heads, dim, dstate), state_dtype),
         x: T.Tensor((batch, heads, dim), io_dtype),
         dt: T.Tensor((batch, heads, dt_dim), dt_dtype),
-        A: T.Tensor((heads,), "float32"),
+        A: T.Tensor((heads, a_dim), "float32"),
         B: T.Tensor((batch, groups, dstate), io_dtype),
         C: T.Tensor((batch, groups, dstate), io_dtype),
-        Dv: T.Tensor((heads,), "float32"),
-        dt_bias: T.Tensor((heads,), "float32"),
+        Dv: T.Tensor((heads, d_dim), "float32"),
+        dt_bias: T.Tensor((heads, b_dim), "float32"),
         z: T.Tensor((batch, heads, dim), io_dtype),
         src_slots: T.Tensor((batch,), slot_dtype),
         dst_slots: T.Tensor((batch,), slot_dtype),
@@ -139,14 +152,17 @@ def tilelang_ssu_one_token(
                 # the same value, so the unexpanded buffer can be used as-is.
                 dt_value = T.cast(dt[batch_idx, head, 0 if dt_dim == 1 else d], "float32")
                 if use_dt_bias == 1:
-                    dt_value = dt_value + dt_bias[head]
+                    dt_value = dt_value + dt_bias[head, 0 if b_dim == 1 else d]
                 if dt_softplus == 1:
                     dt_value = T.if_then_else(
                         dt_value > SOFTPLUS_THRESHOLD,
                         dt_value,
                         T.log(1.0 + T.exp(dt_value)),
                     )
-                decay = T.exp(A[head] * dt_value)
+                # A is either per-head (a_dim == 1, the tied form) or per-(head, dim):
+                # the consumers pass the latter as a [heads, dim, dstate] view whose
+                # last stride is zero, so the column read here is exact for both.
+                decay = T.exp(A[head, 0 if a_dim == 1 else d] * dt_value)
                 x_value = T.cast(x[batch_idx, head, d], "float32")
 
                 # B/C are shared by every (dim, dstate) element of this head.
@@ -182,7 +198,7 @@ def tilelang_ssu_one_token(
 
                 if lane == 0:
                     if has_D == 1:
-                        out_acc[0] += Dv[head] * x_value
+                        out_acc[0] += Dv[head, 0 if d_dim == 1 else d] * x_value
                     if use_z == 1:
                         out_acc[0] = (
                             out_acc[0]
@@ -246,6 +262,24 @@ def _validate_launch(
         raise RuntimeError("B/C groups must divide heads for the native SSU kernel.")
 
 
+def _channel_dim(tensor: torch.Tensor | None, dim: int) -> int:
+    """1 for a per-head vector, ``dim`` for the per-(head, dim) matrix form."""
+    if tensor is None:
+        return 1
+    if tensor.dim() == 1:
+        return 1
+    if tensor.dim() == 2 and tensor.shape[1] == 1:
+        # [heads, 1] is the per-head form: the wrapper keeps the caller's broadcast
+        # view instead of materializing a [heads, dim] copy, and says so with a
+        # trailing axis of one.
+        return 1
+    if tensor.dim() == 2 and tensor.shape[1] == dim:
+        return dim
+    raise RuntimeError(
+        f"per-head parameter must be [heads] or [heads, {dim}], got {tuple(tensor.shape)}."
+    )
+
+
 def _kernel_for(
     state: torch.Tensor,
     x: torch.Tensor,
@@ -255,6 +289,9 @@ def _kernel_for(
     *,
     rows_per_cta: int,
     lanes_per_row: int,
+    a_dim: int = 1,
+    d_dim: int = 1,
+    b_dim: int = 1,
 ):
     return tilelang_ssu_one_token(
         state_dtype=state.dtype,
@@ -267,6 +304,9 @@ def _kernel_for(
         lanes_per_row=lanes_per_row,
         dt_dtype=dt.dtype,
         dt_dim=dt.shape[2],
+        a_dim=a_dim,
+        d_dim=d_dim,
+        b_dim=b_dim,
     )
 
 
@@ -282,6 +322,9 @@ def prewarm_ssu_one_token(
     lanes_per_row: int = 32,
     dt_dtype: torch.dtype = torch.float32,
     dt_dim: int | None = None,
+    a_dim: int = 1,
+    d_dim: int = 1,
+    b_dim: int = 1,
 ) -> None:
     """Compile one kernel configuration without launching it."""
     tilelang_ssu_one_token(
@@ -295,6 +338,9 @@ def prewarm_ssu_one_token(
         lanes_per_row=lanes_per_row,
         dt_dtype=dt_dtype,
         dt_dim=dt_dim,
+        a_dim=a_dim,
+        d_dim=d_dim,
+        b_dim=b_dim,
     )
 
 
@@ -359,6 +405,15 @@ def ssu_one_token_launch(
             "B, C, D, dt_bias, z and the slot tensors must be contiguous."
         )
     _validate_launch(state, x, dt, A, B, dstate, rows_per_cta, lanes_per_row)
+    # The kernel declares these as [heads, a_dim]-style matrices, so the per-head
+    # vector form is reshaped rather than duplicated: reshape on a contiguous
+    # [heads] tensor is a view.
+    heads = state.shape[1]
+    A = A.reshape(heads, _channel_dim(A, dim)).contiguous()
+    if Dv is not None:
+        Dv = Dv.reshape(heads, _channel_dim(Dv, dim)).contiguous()
+    if dt_bias is not None:
+        dt_bias = dt_bias.reshape(heads, _channel_dim(dt_bias, dim)).contiguous()
 
     kernel = _kernel_for(
         state,
@@ -366,6 +421,9 @@ def ssu_one_token_launch(
         dt,
         B,
         src_slots,
+        a_dim=_channel_dim(A, dim),
+        d_dim=_channel_dim(Dv, dim),
+        b_dim=_channel_dim(dt_bias, dim),
         rows_per_cta=rows_per_cta,
         lanes_per_row=lanes_per_row,
     )
@@ -377,8 +435,8 @@ def ssu_one_token_launch(
         A,
         B,
         C,
-        Dv if Dv is not None else _dummy((heads,), torch.float32, x.device),
-        dt_bias if dt_bias is not None else _dummy((heads,), torch.float32, x.device),
+        Dv if Dv is not None else _dummy((heads, _channel_dim(Dv, dim)), torch.float32, x.device),
+        dt_bias if dt_bias is not None else _dummy((heads, _channel_dim(dt_bias, dim)), torch.float32, x.device),
         z if z is not None else _dummy((batch, heads, dim), x.dtype, x.device),
         src_slots,
         dst_slots if dst_slots is not None else src_slots,
