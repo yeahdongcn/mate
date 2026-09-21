@@ -16,6 +16,8 @@ __all__ = [
     "selective_state_update_multi_token_reference",
     "selective_state_update_one_token_reference",
     "ssd_chunk_cumsum_reference",
+    "ssd_chunk_state_reference",
+    "ssd_chunk_scan_reference",
 ]
 
 _SOFTPLUS_THRESHOLD = 20.0
@@ -297,3 +299,169 @@ def ssd_chunk_cumsum_reference(
         dt_out[:, chunk, :] = padded.transpose(0, 1)
 
     return dA_cumsum, dt_out
+
+
+def ssd_chunk_state_reference(
+    x: torch.Tensor,
+    B: torch.Tensor,
+    dt_out: torch.Tensor,
+    dA_cumsum: torch.Tensor,
+    cu_chunk_seqlens: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Reference intra-chunk states ``S_c[h, d, n]`` for the SSD prefill.
+
+    Shapes: ``x`` is ``[tokens, heads, dim]``, ``B`` is ``[tokens, groups,
+    dstate]``, and ``dt_out``/``dA_cumsum`` are the head-major ``[heads, nchunks,
+    chunk_size]`` outputs of the cumsum stage. The result is ``[nchunks, heads,
+    dim, dstate]`` fp32.
+
+    The arithmetic mirrors the device path exactly, including its two rounding
+    points: ``scale = exp(min(last - dA_cumsum[t], 0)) * dt`` stays fp32, and the
+    scaled ``B`` is rounded to the activation dtype **before** the dot, which is
+    accumulated in fp32.
+
+    Padding carries the contract: because ``dt_out`` is zero past a chunk's end
+    and ``dA_cumsum`` saturates there, the decay factor for those positions is
+    zero and the masked-out tail contributes nothing.
+    """
+    if x.dim() != 3 or B.dim() != 3:
+        raise ValueError("x and B must be [tokens, heads, dim] / [tokens, groups, dstate].")
+    tokens, heads, dim = x.shape
+    if B.shape[0] != tokens:
+        raise ValueError("x and B must share the token axis.")
+    groups, dstate = B.shape[1], B.shape[2]
+    if heads % groups:
+        raise ValueError("heads must be divisible by groups.")
+    head_ratio = heads // groups
+    _, nchunks, block = dA_cumsum.shape
+    if dt_out.shape != dA_cumsum.shape:
+        raise ValueError("dt_out and dA_cumsum must share a shape.")
+    if dA_cumsum.shape[0] != heads:
+        raise ValueError("dA_cumsum's head axis must match x.")
+
+    offsets = [int(v) for v in cu_chunk_seqlens.reshape(-1).tolist()]
+    if len(offsets) - 1 != nchunks:
+        raise ValueError("cu_chunk_seqlens must have nchunks + 1 entries.")
+    if block != chunk_size:
+        raise ValueError("dA_cumsum's last axis must be chunk_size.")
+
+    x_fp32 = x.to(torch.float32)
+    b_fp32 = B.to(torch.float32)
+    states = torch.zeros(
+        (nchunks, heads, dim, dstate), dtype=torch.float32, device=x.device
+    )
+
+    for chunk in range(nchunks):
+        start, end = offsets[chunk], offsets[chunk + 1]
+        limit = end - start
+        if limit <= 0:
+            continue
+        # The chunk's total decay lives in the padded row's last position.
+        last = dA_cumsum[:, chunk, block - 1].to(torch.float32)
+        delta = (last.unsqueeze(1) - dA_cumsum[:, chunk, :limit].to(torch.float32))
+        delta = delta.clamp(max=0.0)
+        scale = torch.exp(delta) * dt_out[:, chunk, :limit].to(torch.float32)
+        x_chunk = x_fp32[start:end]
+        for group in range(groups):
+            head_slice = slice(group * head_ratio, (group + 1) * head_ratio)
+            scaled = (
+                b_fp32[start:end, group, :].unsqueeze(0)
+                * scale[head_slice].unsqueeze(2)
+            ).to(x.dtype)
+            states[chunk, head_slice] = torch.einsum(
+                "thd,hln->hdn", x_chunk[:, head_slice, :], scaled.to(torch.float32)
+            )
+    return states
+
+
+def ssd_chunk_scan_reference(
+    x: torch.Tensor,
+    C: torch.Tensor,
+    B: torch.Tensor,
+    dt_out: torch.Tensor,
+    dA_cumsum: torch.Tensor,
+    states: torch.Tensor,
+    initial_states: torch.Tensor | None,
+    seq_idx: torch.Tensor,
+    cu_chunk_seqlens: torch.Tensor,
+    chunk_size: int,
+    D_param: torch.Tensor | None = None,
+    z: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference SSD chunk scan.
+
+    ``B`` is taken directly (rather than a materialized ``CB``) so this doubles as
+    an independent check of the BMM stage; the device kernel consumes ``CB``.
+    ``out`` is written in place when supplied and returned; positions at or past a
+    chunk's logical end are never touched, and rows opened by a sequence take
+    their entering state from ``initial_states[seq_idx[chunk]]``.
+
+    Rounding points mirror the device path: the past-state product accumulates in
+    fp32, the decay ``exp(dA_cs[t])`` scales that term *after* the dot, and the
+    scaled ``CB`` is rounded to the activation dtype **before** the diagonal dot.
+    """
+    tokens, heads, dim = x.shape
+    groups, dstate = C.shape[1], C.shape[2]
+    head_ratio = heads // groups
+    _, nchunks, block = dA_cumsum.shape
+    if block != chunk_size:
+        raise ValueError("dA_cumsum's last axis must be chunk_size.")
+    offsets = [int(v) for v in cu_chunk_seqlens.reshape(-1).tolist()]
+    if len(offsets) - 1 != nchunks:
+        raise ValueError("cu_chunk_seqlens must have nchunks + 1 entries.")
+    if out is None:
+        out = torch.zeros_like(x)
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous to be filled in place.")
+
+    seq = [int(v) for v in seq_idx.reshape(-1).tolist()]
+    c_fp32 = C.to(torch.float32)
+    b_fp32 = B.to(torch.float32)
+    x_fp32 = x.to(torch.float32)
+    dA = dA_cumsum.to(torch.float32)
+    dt = dt_out.to(torch.float32)
+    st = states.to(torch.float32)
+
+    for chunk in range(nchunks):
+        start, end = offsets[chunk], offsets[chunk + 1]
+        limit = end - start
+        if limit <= 0:
+            continue
+        opens = chunk == 0 or seq[chunk] != seq[chunk - 1]
+        if opens and initial_states is not None:
+            prev = initial_states[seq[chunk]].to(torch.float32)
+        elif opens:
+            prev = torch.zeros((heads, dim, dstate), dtype=torch.float32, device=x.device)
+        else:
+            prev = st[chunk - 1]
+        for head in range(heads):
+            group = head // head_ratio
+            dA_head = dA[head, chunk, :limit]
+            dt_head = dt[head, chunk, :limit]
+            c_rows = c_fp32[start:end, group, :]  # (limit, dstate)
+            # past-state term, then the decay applied after the dot. The state
+            # is [dim, dstate] and is transposed for the product, exactly as the
+            # kernel's load transposes it into (dstate, dim).
+            acc = c_rows @ prev[head].transpose(0, 1)  # (limit, dim)
+            acc = acc * torch.exp(dA_head).unsqueeze(1)
+            # diagonal term over the causal triangle
+            decay = torch.exp(
+                torch.clamp(
+                    dA_head.unsqueeze(1) - dA_head.unsqueeze(0), max=0.0
+                )
+            )
+            cb = b_fp32[start:end, group, :]  # (limit, dstate)
+            cb = torch.einsum("in,jn->ij", c_rows, cb)  # (limit, limit)
+            cb = cb * decay * dt_head.unsqueeze(0)
+            causal = torch.tril(torch.ones(limit, limit, device=x.device, dtype=torch.bool))
+            cb = torch.where(causal, cb, torch.zeros_like(cb)).to(x.dtype).to(torch.float32)
+            acc = acc + cb @ x_fp32[start:end, head, :]
+            if D_param is not None:
+                acc = acc + x_fp32[start:end, head, :] * D_param[head].to(torch.float32)
+            if z is not None:
+                z_head = z[start:end, head, :].to(torch.float32)
+                acc = acc * z_head * torch.sigmoid(z_head)
+            out[start:end, head, :] = acc.to(out.dtype)
+    return out
