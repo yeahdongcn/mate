@@ -565,10 +565,19 @@ def prewarm_ssd_combined_fwd_varlen(
     from mate.mamba_kernels.tilelang.ssd_chunk_state import prewarm_ssd_chunk_state
     from mate.mamba_kernels.tilelang.ssd_state_passing import prewarm_ssd_state_passing
 
+    # Each stage's prewarm takes its own shape vocabulary: cumsum and the scan key
+    # on (heads, groups), the intra-chunk stages on (dim, dstate, chunk_size) plus
+    # the head ratio, and the chunk matrix on (chunk_size, dstate) -- it is shared
+    # across the heads of a group. Passing the orchestration's own argument order
+    # through would put integers where dtypes belong.
+    head_ratio = heads // groups
     prewarm_ssd_chunk_cumsum(heads, chunk_size, dt_dtype)
-    prewarm_ssd_chunk_state(heads, groups, dim, dstate, chunk_size, io_dtype)
-    prewarm_ssd_state_passing(heads, dim, dstate, io_dtype, state_dtype)
-    prewarm_ssd_bmm(groups, dstate, chunk_size, io_dtype)
+    prewarm_ssd_chunk_state(dim, dstate, chunk_size, head_ratio, io_dtype)
+    prewarm_ssd_state_passing(
+        dim, dstate, chunk_size, state_dtype, in_dtype=state_dtype,
+        init_dtype=state_dtype,
+    )
+    prewarm_ssd_bmm(chunk_size, dstate, io_dtype)
     prewarm_ssd_chunk_scan(
         heads, groups, dim, dstate, chunk_size, io_dtype, state_dtype, block_M
     )
