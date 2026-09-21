@@ -63,8 +63,21 @@ def tilelang_ssu_one_token(
     head_ratio,
     rows_per_cta,
     lanes_per_row,
+    dt_dtype=None,
+    dt_dim=None,
 ):
-    """Build the one-token SSU kernel for one (dtype, shape, config) tuple."""
+    """Build the one-token SSU kernel for one (dtype, shape, config) tuple.
+
+    ``dt_dim`` is ``1`` when the caller passes the per-head step instead of a
+    [batch, heads, dim] tensor. vLLM expands it across head_dim, and the two
+    forms carry identical values, so reading one element per head lets the caller
+    hand over the unexpanded buffer and skip the copy that a widening cast on the
+    decode path would otherwise cost per mixer per step.
+    """
+    if dt_dtype is None:
+        dt_dtype = torch.float32
+    if dt_dim is None:
+        dt_dim = dim
     batch = T.dynamic("batch")
     heads = T.dynamic("heads")
     groups = T.dynamic("groups")
@@ -79,7 +92,7 @@ def tilelang_ssu_one_token(
     def tilelang_ssu_one_token_kernel(
         state: T.Tensor((slots, heads, dim, dstate), state_dtype),
         x: T.Tensor((batch, heads, dim), io_dtype),
-        dt: T.Tensor((batch, heads, dim), "float32"),
+        dt: T.Tensor((batch, heads, dt_dim), dt_dtype),
         A: T.Tensor((heads,), "float32"),
         B: T.Tensor((batch, groups, dstate), io_dtype),
         C: T.Tensor((batch, groups, dstate), io_dtype),
@@ -122,7 +135,9 @@ def tilelang_ssu_one_token(
                 dst = T.cast(dst_slots[batch_idx], "int32")
 
                 # dt -> decay, shared by every dstate lane of this row.
-                dt_value = dt[batch_idx, head, d]
+                # dt_dim == 1 is the broadcast form: every d of this head reads
+                # the same value, so the unexpanded buffer can be used as-is.
+                dt_value = T.cast(dt[batch_idx, head, 0 if dt_dim == 1 else d], "float32")
                 if use_dt_bias == 1:
                     dt_value = dt_value + dt_bias[head]
                 if dt_softplus == 1:
@@ -215,8 +230,18 @@ def _validate_launch(
         raise RuntimeError(
             "state must be a contiguous [slots, heads, dim, dstate] pool."
         )
-    if dt.dtype != torch.float32 or A.dtype != torch.float32:
-        raise RuntimeError("dt and A must be fp32 for the native SSU kernel.")
+    if dt.shape != (x.shape[0], x.shape[1], dt.shape[2]) or dt.shape[2] not in (
+        1,
+        x.shape[2],
+    ):
+        raise RuntimeError(
+            "dt must be [batch, heads, dim] or the per-head broadcast [batch, heads, 1]; "
+            f"got {tuple(dt.shape)} for x={tuple(x.shape)}."
+        )
+    if dt.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise RuntimeError(f"dt must be fp32, bf16 or fp16; got {dt.dtype}.")
+    if A.dtype != torch.float32:
+        raise RuntimeError("A must be fp32 for the native SSU kernel.")
     if B.shape[1] == 0 or state.shape[1] % B.shape[1] != 0:
         raise RuntimeError("B/C groups must divide heads for the native SSU kernel.")
 
@@ -224,6 +249,7 @@ def _validate_launch(
 def _kernel_for(
     state: torch.Tensor,
     x: torch.Tensor,
+    dt: torch.Tensor,
     B: torch.Tensor,
     src_slots: torch.Tensor,
     *,
@@ -239,6 +265,8 @@ def _kernel_for(
         head_ratio=state.shape[1] // B.shape[1],
         rows_per_cta=rows_per_cta,
         lanes_per_row=lanes_per_row,
+        dt_dtype=dt.dtype,
+        dt_dim=dt.shape[2],
     )
 
 
@@ -252,6 +280,8 @@ def prewarm_ssu_one_token(
     head_ratio: int,
     rows_per_cta: int = 4,
     lanes_per_row: int = 32,
+    dt_dtype: torch.dtype = torch.float32,
+    dt_dim: int | None = None,
 ) -> None:
     """Compile one kernel configuration without launching it."""
     tilelang_ssu_one_token(
@@ -263,6 +293,8 @@ def prewarm_ssu_one_token(
         head_ratio=head_ratio,
         rows_per_cta=rows_per_cta,
         lanes_per_row=lanes_per_row,
+        dt_dtype=dt_dtype,
+        dt_dim=dt_dim,
     )
 
 
@@ -331,6 +363,7 @@ def ssu_one_token_launch(
     kernel = _kernel_for(
         state,
         x,
+        dt,
         B,
         src_slots,
         rows_per_cta=rows_per_cta,

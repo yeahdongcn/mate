@@ -192,7 +192,8 @@ def selective_state_update(
         )
         if cu_seqlens.numel() != x.shape[0] + 1 or not torch.equal(cu_seqlens, expected):
             raise NotImplementedError(
-                "native mamba SSU implements single-token decoding only; "
+                "native mamba SSU implements single-token decoding only; this looks "
+                "like packed variable-length decoding, and "
                 f"cu_seqlens={cu_seqlens.flatten()[:8].tolist()}... does not describe "
                 f"{x.shape[0]} sequences of one token each."
             )
@@ -227,7 +228,8 @@ def selective_state_update(
         raise NotImplementedError(
             f"native mamba SSU supports x dtypes {_SUPPORTED_IO_DTYPES}, got {x.dtype}."
         )
-    if x.shape != dt.shape or x.shape != (x.shape[0], heads, dim):
+    dt_broadcast = dt.dim() == 3 and dt.shape[:2] == (x.shape[0], heads) and dt.shape[2] == 1
+    if not dt_broadcast and (x.shape != dt.shape or x.shape != (x.shape[0], heads, dim)):
         raise ValueError(
             f"x/dt must match the state head layout: x={tuple(x.shape)}, "
             f"dt={tuple(dt.shape)}, state={tuple(state.shape)}."

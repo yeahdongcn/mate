@@ -251,7 +251,9 @@ def test_out_buffer_is_written_in_place():
 @pytest.mark.parametrize(
     "overrides, message",
     [
-        ({"cu_seqlens": torch.tensor([0, 1], dtype=torch.int32)}, "variable-length"),
+        # One token per sequence is exactly what the native SSU implements, so it
+        # is accepted (see test_one_token_per_sequence_cu_seqlens_is_accepted).
+        ({"cu_seqlens": torch.tensor([0, 2], dtype=torch.int32)}, "variable-length"),
         ({"rand_seed": torch.zeros(1, dtype=torch.int32)}, "stochastic rounding"),
         ({"state_scale": torch.ones(_SLOTS, dtype=torch.float32)}, "quantized state"),
         ({"cache_steps": 4}, "intermediate"),
