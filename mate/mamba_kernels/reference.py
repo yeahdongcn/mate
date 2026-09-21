@@ -25,6 +25,15 @@ __all__ = [
 _SOFTPLUS_THRESHOLD = 20.0
 
 
+def _dot_dtype(a_dtype: torch.dtype, b_dtype: torch.dtype) -> torch.dtype:
+    """The SSD dot's activation dtype: 16-bit wins, fp32 otherwise."""
+    if torch.bfloat16 in (a_dtype, b_dtype):
+        return torch.bfloat16
+    if torch.float16 in (a_dtype, b_dtype):
+        return torch.float16
+    return torch.float32
+
+
 def selective_state_update_one_token_reference(
     state: torch.Tensor,
     x: torch.Tensor,

@@ -354,9 +354,9 @@ def _stage(name: str):
 
     launchers = {
         "cumsum": ssd_chunk_cumsum.chunk_cumsum_launch,
-        "chunk_state": ssd_chunk_state.chunk_state_launch,
-        "state_passing": ssd_state_passing.state_passing_launch,
-        "bmm": ssd_bmm.bmm_launch,
+        "chunk_state": ssd_chunk_state.ssd_chunk_state_launch,
+        "state_passing": ssd_state_passing.ssd_state_passing_launch,
+        "bmm": ssd_bmm.ssd_bmm_launch,
         "chunk_scan": ssd_chunk_scan.chunk_scan_launch,
     }
     return launchers[name]
