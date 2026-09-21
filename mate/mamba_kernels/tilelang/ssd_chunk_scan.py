@@ -127,6 +127,12 @@ def tilelang_ssd_chunk_scan(
             prev_chunk = T.max(bc - 1, 0)
             opens_sequence = (bc == 0) | (seq_idx[bc] != seq_idx[prev_chunk])
             takes_initial_state = opens_sequence & (use_initial_states != 0)
+            # A chunk that opens a sequence must not read the previous chunk's
+            # state: that state belongs to the previous request. Without initial
+            # states its entering state is zero, so `opens_sequence` -- not
+            # `bc > 0` -- has to be the outer condition. Reading the previous
+            # sequence's final state here is silent, plausible-looking corruption.
+            carries_state = (opens_sequence == 0) & (bc > 0)
             head_group = bh // head_ratio
 
             c_shared = T.alloc_shared((block_M, dstate), dtype=io_dtype)
@@ -152,7 +158,7 @@ def tilelang_ssd_chunk_scan(
                     takes_initial_state,
                     T.cast(initial_states[seq_idx[bc], bh, d, n], io_dtype),
                     T.if_then_else(
-                        bc > 0,
+                        carries_state,
                         T.cast(states[prev_chunk, bh, d, n], io_dtype),
                         T.cast(0, io_dtype),
                     ),
