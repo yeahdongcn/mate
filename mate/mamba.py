@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import torch
 
-from mate.api_logging import mate_api
+import functools
+
+from mate.api_logging import get_api_logger, mate_api
 
 __all__ = [
     "prewarm_selective_state_update",
@@ -107,6 +109,22 @@ def _slots(
     if indices.dtype not in _SUPPORTED_SLOT_DTYPES:
         raise ValueError(f"{name} must be int32 or int64, got {indices.dtype}.")
     return indices.contiguous()
+
+
+@functools.lru_cache(maxsize=1)
+def _announce_native_ssd() -> None:
+    """Log once per process that the native SSD prefill is the active path.
+
+    A performance pair that only shows a latency difference cannot prove which
+    implementation ran: the same argv can reach a different kernel. This line is
+    the assertion -- visible with ``MATE_LOGLEVEL=1`` (the ``mate.api`` logger is
+    silent otherwise, so it costs nothing on the default path), and absent when
+    the wrapper resolves somewhere else.
+    """
+    get_api_logger().info(
+        "mate.mamba: native SSD prefill active (TileLang chunked scan on MUSA); "
+        "flashinfer.mamba.ssd_combined_fwd_varlen resolves here"
+    )
 
 
 @mate_api
@@ -448,6 +466,7 @@ def ssd_combined_fwd_varlen(
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
     nchunks = cu_chunk_seqlens.numel() - 1
+    _announce_native_ssd()
     if nchunks < 1:
         raise ValueError("cu_chunk_seqlens must have at least two entries.")
     if seq_idx.numel() != nchunks:
