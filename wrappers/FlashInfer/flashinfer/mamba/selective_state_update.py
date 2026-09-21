@@ -46,8 +46,8 @@ def _flat_slots(indices: Any, batch: int) -> Any:
     guessing there would pair rows with the wrong state. Those calls keep their
     shape and MATE refuses them explicitly.
     """
-    if indices is None:
-        return None
+    if indices is None or batch is None or not hasattr(indices, "dim"):
+        return indices
     if indices.dim() > 1 and indices.numel() == batch:
         return indices.reshape(-1)
     return indices
@@ -177,8 +177,11 @@ def selective_state_update(
     dt_bias = _per_head_fp32(dt_bias)
     x = _materialized(x)
     dt = _dt_input(dt)
-    state_batch_indices = _flat_slots(state_batch_indices, x.shape[0])
-    dst_state_batch_indices = _flat_slots(dst_state_batch_indices, x.shape[0])
+    # x can be a non-tensor sentinel on the pure-forwarding path, in which case
+    # there is no batch to compare against and the indices pass through.
+    batch = x.shape[0] if hasattr(x, "shape") else None
+    state_batch_indices = _flat_slots(state_batch_indices, batch)
+    dst_state_batch_indices = _flat_slots(dst_state_batch_indices, batch)
     return implementation(
         state,
         x,
