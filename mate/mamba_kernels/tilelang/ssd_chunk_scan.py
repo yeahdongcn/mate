@@ -254,11 +254,19 @@ _DUMMY_CACHE: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor] = {}
 def _dummy(
     shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    """Return an unread placeholder for an absent optional input."""
+    """Return a zeroed placeholder for an absent optional input.
+
+    Zeroed, not ``empty``: the kernels reach a placeholder through the same
+    expression as the real operand, and a select compiles to a blend, so the
+    never-taken side is still evaluated. With an uninitialized buffer the blend
+    can carry that garbage -- including NaN -- into the result, which is how a
+    call whose input has no initial states at all ends up with every output
+    element NaN.
+    """
     key = (shape, dtype, str(device))
     tensor = _DUMMY_CACHE.get(key)
     if tensor is None:
-        tensor = torch.empty(shape, device=device, dtype=dtype)
+        tensor = torch.zeros(shape, device=device, dtype=dtype)
         _DUMMY_CACHE[key] = tensor
     return tensor
 

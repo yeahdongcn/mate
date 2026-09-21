@@ -231,16 +231,17 @@ _DUMMY_CACHE: dict[tuple[tuple[int, ...], torch.dtype, str], torch.Tensor] = {}
 def _dummy(
     shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    """Return an unread placeholder for an absent optional input.
+    """Return a zeroed placeholder for an absent optional input.
 
-    The kernel never dereferences an input whose runtime flag is zero, so one
-    cached buffer per (shape, dtype, device) keeps the op at a single launch and
-    allocates nothing per call.
+    Zeroed rather than ``empty``: a select compiles to a blend, so the
+    never-taken side is evaluated, and garbage from an uninitialized buffer can
+    reach the result -- NaN included. One cached buffer per (shape, dtype,
+    device) keeps the op at a single launch and allocation.
     """
     key = (shape, dtype, str(device))
     tensor = _DUMMY_CACHE.get(key)
     if tensor is None:
-        tensor = torch.empty(shape, device=device, dtype=dtype)
+        tensor = torch.zeros(shape, device=device, dtype=dtype)
         _DUMMY_CACHE[key] = tensor
     return tensor
 
