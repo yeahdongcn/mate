@@ -15,6 +15,7 @@ import torch
 __all__ = [
     "selective_state_update_multi_token_reference",
     "selective_state_update_one_token_reference",
+    "ssd_chunk_cumsum_reference",
 ]
 
 _SOFTPLUS_THRESHOLD = 20.0
@@ -222,3 +223,65 @@ def selective_state_update_multi_token_reference(
             state[final_slot].copy_(running.to(state.dtype))
 
     return y.to(x.dtype)
+
+
+def ssd_chunk_cumsum_reference(
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    cu_chunk_seqlens: torch.Tensor,
+    chunk_size: int,
+    dt_softplus: bool,
+    dt_limit: tuple[float, float] = (0.0, float("inf")),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference SSD chunk-local cumsum.
+
+    Returns ``(dA_cumsum, dt_out)``, both head-major
+    ``[heads, nchunks, chunk_size]`` fp32, where ``dt_out`` is the processed
+    ``dt`` (bias, softplus, clamp) and ``dA_cumsum`` is the *inclusive* prefix
+    sum of ``dt_out * A`` over each chunk's tokens.
+
+    Chunks are scanned independently -- never across a sequence boundary -- and a
+    chunk's padded row positions past its end are left untouched, mirroring the
+    kernel and the production contract.
+    """
+    if dt.dim() != 2:
+        raise ValueError("dt must be [tokens, heads].")
+    heads = dt.shape[1]
+    offsets = [int(x) for x in cu_chunk_seqlens.reshape(-1).tolist()]
+    nchunks = len(offsets) - 1
+    if nchunks < 1:
+        raise ValueError("cu_chunk_seqlens must have at least two entries.")
+
+    dt_min, dt_max = dt_limit
+    dA_cumsum = torch.zeros(
+        (heads, nchunks, chunk_size), dtype=torch.float32, device=dt.device
+    )
+    dt_out = torch.zeros_like(dA_cumsum)
+
+    a_value = A.to(torch.float32)
+    bias = None if dt_bias is None else dt_bias.to(torch.float32)
+
+    for chunk in range(nchunks):
+        lo, hi = offsets[chunk], offsets[chunk + 1]
+        length = hi - lo
+        if length < 0 or hi > dt.shape[0]:
+            raise ValueError(
+                f"chunk {chunk} spans [{lo}, {hi}) outside 0..{dt.shape[0]}."
+            )
+        if length == 0:
+            continue
+        segment = dt[lo:hi].to(torch.float32)
+        value = segment if bias is None else segment + bias.view(1, heads)
+        if dt_softplus:
+            value = torch.where(
+                value > _SOFTPLUS_THRESHOLD,
+                value,
+                torch.log1p(torch.exp(value)),
+            )
+        value = value.clamp(min=dt_min, max=dt_max)
+        prefix = torch.cumsum(value * a_value.view(1, heads), dim=0)
+        dA_cumsum[:, chunk, :length] = prefix.transpose(0, 1)
+        dt_out[:, chunk, :length] = value.transpose(0, 1)
+
+    return dA_cumsum, dt_out
