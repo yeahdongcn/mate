@@ -172,15 +172,20 @@ def recording_backend(monkeypatch):
     return calls, module
 
 
-def test_varlen_call_is_forwarded_positionally_with_every_argument(recording_backend):
+def test_varlen_call_is_forwarded_by_name_with_every_argument(recording_backend):
     calls, _ = recording_backend
     args = [object() for _ in range(11)] + [None] * 11
     result = ssd_combined_fwd_varlen(*args)
 
     name, forwarded, kwargs = calls[0]
     assert name == "ssd_combined_fwd_varlen"
-    assert list(forwarded) == args
-    assert kwargs == {}
+    # Forwarded by name, never by position: upstream orders
+    # initial_states, dt_softplus, dt_limit where MATE orders
+    # dt_softplus, dt_limit, initial_states, so position would misalign them.
+    assert forwarded == ()
+    mate_parameters = list(inspect.signature(ssd_combined_fwd_varlen).parameters)
+    assert list(kwargs) == mate_parameters
+    assert list(kwargs.values()) == args
     assert result == "ssd_combined_fwd_varlen:result"
 
 
@@ -218,10 +223,17 @@ def test_varlen_accepts_the_consumer_keyword_call(recording_backend):
     ssd_combined_fwd_varlen(**keywords)
 
     _, forwarded, kwargs = calls[0]
-    assert kwargs == {}
-    # Keyword arguments land in the contracted positional slots, and the three
-    # checkpointing arguments the consumer omits keep their defaults.
-    assert tuple(forwarded) == (sentinel,) * 5 + (128,) + (sentinel,) * 13 + (None,) * 3
+    assert forwarded == ()
+    # Names reach MATE unchanged, and the three checkpointing arguments the
+    # consumer omits keep their defaults.
+    assert list(kwargs) == CONSUMER_VARLEN_KEYWORDS + [
+        "checkpoint_token_indices",
+        "checkpoint_state_slots",
+        "checkpoint_states",
+    ]
+    assert kwargs["chunk_size"] == 128
+    assert kwargs["x"] is sentinel and kwargs["state_dtype"] is sentinel
+    assert kwargs["checkpoint_token_indices"] is None
 
 
 def test_selective_state_update_forwards_keyword_capabilities(recording_backend):
