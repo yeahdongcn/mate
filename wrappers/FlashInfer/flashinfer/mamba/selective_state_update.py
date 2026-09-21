@@ -24,6 +24,22 @@ NULL_BLOCK_ID = 0
 import torch
 
 
+def _flat_slots(indices: Any, batch: int) -> Any:
+    """Return the slot vector MATE expects, or leave it for MATE to refuse.
+
+    vLLM hands over `state_indices_tensor_d[:num_decode_tokens]`, which arrives
+    shaped [rows, width]. Flattening is only correct when the tensor carries one
+    slot per row; a speculative call carries one slot per accepted token, and
+    guessing there would pair rows with the wrong state. Those calls keep their
+    shape and MATE refuses them explicitly.
+    """
+    if indices is None:
+        return None
+    if indices.dim() > 1 and indices.numel() == batch:
+        return indices.reshape(-1)
+    return indices
+
+
 def _per_head_fp32(tensor: Any) -> Any:
     """Return MATE's per-head fp32 view of a vLLM per-head vector."""
     if tensor is None:
@@ -107,6 +123,8 @@ def selective_state_update(
     # reason the caller could not act on: vLLM has no fp32 D to pass.
     D = _per_head_fp32(D)
     dt_bias = _per_head_fp32(dt_bias)
+    state_batch_indices = _flat_slots(state_batch_indices, x.shape[0])
+    dst_state_batch_indices = _flat_slots(dst_state_batch_indices, x.shape[0])
     return implementation(
         state,
         x,
