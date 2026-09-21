@@ -43,7 +43,10 @@ _THREADS = 128
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    # Thread storage sync stays ON: ``dtT_shared`` is written by one loop and
+    # read by another, so the barriers around that handoff have to be the
+    # compiler's. With the pass disabled the transpose loop reads stale cells
+    # (observed as whole heads of ``dA_cumsum`` off by O(1) on MUSA).
     tilelang.PassConfigKey.TL_ENABLE_MUSA_BURST: True,
     tilelang.PassConfigKey.TL_ENABLE_REDUCE_BURST: True,
     tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
@@ -142,10 +145,24 @@ def tilelang_ssd_chunk_cumsum(
 
             T.cumsum(scaled, dim=1)
 
+            # The row total is the one cross-thread value the padded tail needs,
+            # so its owner publishes it into a small shared broadcast. The scan
+            # itself only reaches that total to within a rounding of its own last
+            # cell (a tile-level scan never adds the tail's zeros the way a
+            # sequential one does), and the padding contract is the total itself:
+            # downstream stages read it back from index ``block_S - 1``.
+            total_shared = T.alloc_shared((heads,), dtype=accum_dtype)
+            for i, j in T.Parallel(heads, block_S):
+                if j == block_S - 1:
+                    total_shared[i] = scaled[i, j]
+
             # Every row is written in full: zero dt in the tail, saturated total
             # of dA_cumsum in the tail.
             for i, j in T.Parallel(heads, block_S):
-                dA_cumsum[i, bc, j] = T.cast(scaled[i, j], out_dtype)
+                if chunk_start + j < chunk_end:
+                    dA_cumsum[i, bc, j] = T.cast(scaled[i, j], out_dtype)
+                else:
+                    dA_cumsum[i, bc, j] = T.cast(total_shared[i], out_dtype)
                 dt_out[i, bc, j] = T.cast(processed[i, j], out_dtype)
 
     symbol = (

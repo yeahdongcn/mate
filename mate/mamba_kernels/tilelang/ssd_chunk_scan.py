@@ -164,6 +164,14 @@ def tilelang_ssd_chunk_scan(
                     ),
                 )
 
+            # TL_DISABLE_THREAD_STORAGE_SYNC is set (family convention), so the
+            # barrier between a distributed shared-memory write and its consumer
+            # is not inserted automatically. Without it the gemm reads operand
+            # tiles that other threads have not finished writing yet: the result
+            # is a sparse, data-dependent, run-to-run varying set of wrong rows
+            # that looks like a math bug and is not one.
+            T.sync_threads()
+
             T.gemm(c_shared, s_shared, acc, clear_accum=True)
 
             # --- the decay is applied to the past-state term after its dot
@@ -197,6 +205,8 @@ def tilelang_ssd_chunk_scan(
                     T.cast(0, io_dtype),
                 )
 
+            T.sync_threads()
+
             T.gemm(cb_shared, x_shared, acc, clear_accum=False)
 
             # --- epilogue: D skip, then the z gate, then a masked store
@@ -212,12 +222,14 @@ def tilelang_ssd_chunk_scan(
                         z_shared[i, d] = z[chunk_start + row0 + i, bh, d]
                     else:
                         z_shared[i, d] = T.cast(0, io_dtype)
+                T.sync_threads()
                 for i, d in T.Parallel(block_M, dim):
                     z_value = T.alloc_var(accum_dtype)
                     z_value = T.cast(z_shared[i, d], accum_dtype)
                     acc[i, d] = acc[i, d] * z_value / (1.0 + T.exp(-z_value))
 
             T.copy(acc, acc_shared)
+            T.sync_threads()
             for i, d in T.Parallel(block_M, dim):
                 if row0 + i < limit:
                     out[chunk_start + row0 + i, bh, d] = T.cast(
