@@ -15,9 +15,11 @@ import torch
 __all__ = [
     "selective_state_update_multi_token_reference",
     "selective_state_update_one_token_reference",
+    "ssd_bmm_reference",
     "ssd_chunk_cumsum_reference",
-    "ssd_chunk_state_reference",
     "ssd_chunk_scan_reference",
+    "ssd_chunk_state_reference",
+    "ssd_state_passing_reference",
 ]
 
 _SOFTPLUS_THRESHOLD = 20.0
@@ -486,3 +488,204 @@ def ssd_chunk_scan_reference(
                 acc = acc * z_head * torch.sigmoid(z_head)
             out[start:end, head, :] = acc.to(out.dtype)
     return out
+
+
+def ssd_state_passing_reference(
+    states: torch.Tensor,
+    dA_cumsum: torch.Tensor,
+    last_chunk_indices: torch.Tensor,
+    initial_states: torch.Tensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    seq_idx: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference inter-chunk state passing for the SSD prefill.
+
+    Shapes: ``states`` is ``[nchunks, heads, dim, dstate]``, ``dA_cumsum`` is the
+    head-major ``[heads, nchunks, chunk_size]`` output of the cumsum stage and
+    ``last_chunk_indices`` is ``[batch]``. The result is ``[nchunks, heads, dim,
+    dstate]`` in ``state_dtype``.
+
+    ``out[c]`` is the state **entering chunk ``c+1``**: the running state after
+    chunk ``c`` has been applied:
+    ``out[c] = exp(dA_cumsum[:, c, L-1]) * running + states[c]``.
+
+    Boundaries come from ``seq_idx`` when it is given -- the same rule the device
+    oracle uses: chunks are visited in index order, a sequence's **first** chunk
+    enters from ``initial_states[seq_idx[c]]`` and every later chunk of the same
+    ``seq_idx`` continues that sequence's running state. Physical chunks that the
+    caller assigned to other sequences in between are skipped without decaying
+    it, so ``initial_states`` is indexed by the value of ``seq_idx``, not by
+    sequence position.
+
+    Without ``seq_idx`` the boundaries are ``last_chunk_indices`` arithmetic
+    instead: sequence ``b`` owns chunks ``(last_chunk_indices[b-1],
+    last_chunk_indices[b]]`` -- so its first chunk is ``last_chunk_indices[b-1] +
+    1`` and its last is ``last_chunk_indices[b]``, with ``b == 0`` starting at
+    chunk 0 -- and enters from ``initial_states[b]``, indexed by **sequence
+    position**. A sequence with no chunks (``last_chunk_indices[b] == -1``, or an
+    empty range between two neighbours) iterates zero times and so does not
+    advance the running state. The two rules agree whenever the caller's metadata
+    is contiguous and consistent, which is what the packed prefill path produces.
+
+    Rounding point: ``running`` stays fp32 across every chunk of a sequence and is
+    rounded to ``state_dtype`` only on the store. That matches the device kernel,
+    which also rounds the state the chunk-scan stage reads back in.
+
+    ``state_dtype`` resolves as ``state_dtype`` -> ``initial_states.dtype`` ->
+    ``states.dtype``. The device orchestration's last-resort fallback is the
+    activation dtype rather than the fp32 stage input, so a caller that supplies
+    neither must pass ``state_dtype`` explicitly to reproduce it.
+
+    Rows the metadata does not cover are left zero, so an empty sequence is
+    observable as an unwritten range rather than as the input's contents.
+    """
+    if states.dim() != 4:
+        raise ValueError("states must be [nchunks, heads, dim, dstate].")
+    nchunks, heads, dim, dstate = states.shape
+    if dA_cumsum.dim() != 3:
+        raise ValueError("dA_cumsum must be [heads, nchunks, chunk_size].")
+    chunk_size = dA_cumsum.shape[2]
+    if dA_cumsum.shape != (heads, nchunks, chunk_size):
+        raise ValueError("dA_cumsum must be [heads, nchunks, chunk_size].")
+    if last_chunk_indices is not None and last_chunk_indices.dim() != 1:
+        raise ValueError("last_chunk_indices must be [batch].")
+    if seq_idx is not None and seq_idx.shape != (nchunks,):
+        raise ValueError("seq_idx must contain one sequence id per chunk.")
+    if last_chunk_indices is not None:
+        batch = last_chunk_indices.shape[0]
+    elif initial_states is not None:
+        batch = initial_states.shape[0]
+    elif seq_idx is not None:
+        # The device oracle derives the sequence count this way when the caller
+        # supplies only seq_idx.
+        batch = max([int(value) for value in seq_idx.reshape(-1).tolist()] or [0]) + 1
+    else:
+        raise ValueError("pass seq_idx or last_chunk_indices for the boundaries.")
+    if initial_states is not None and initial_states.shape != (
+        batch,
+        heads,
+        dim,
+        dstate,
+    ):
+        raise ValueError(
+            "initial_states must be [batch, heads, dim, dstate] matching "
+            "last_chunk_indices."
+        )
+    if seq_idx is not None:
+        seq_idx_values = [int(value) for value in seq_idx.reshape(-1).tolist()]
+        if any(value < 0 or value >= batch for value in seq_idx_values):
+            raise ValueError("seq_idx values must index initial_states.")
+
+    if state_dtype is None and initial_states is not None:
+        state_dtype = initial_states.dtype
+    if state_dtype is None:
+        state_dtype = states.dtype
+
+    out = torch.zeros(
+        (nchunks, heads, dim, dstate), dtype=state_dtype, device=states.device
+    )
+
+    if seq_idx is not None:
+        running_by_sequence: dict[int, torch.Tensor] = {}
+        for chunk in range(nchunks):
+            sequence = seq_idx_values[chunk]
+            running = running_by_sequence.get(sequence)
+            if running is None:
+                running = (
+                    torch.zeros(
+                        (heads, dim, dstate),
+                        dtype=torch.float32,
+                        device=states.device,
+                    )
+                    if initial_states is None
+                    else initial_states[sequence].to(torch.float32)
+                )
+            decay = torch.exp(dA_cumsum[:, chunk, chunk_size - 1].to(torch.float32))
+            running = decay.view(heads, 1, 1) * running + states[chunk].to(
+                torch.float32
+            )
+            running_by_sequence[sequence] = running
+            out[chunk] = running.to(state_dtype)
+        return out
+
+    last = [int(value) for value in last_chunk_indices.reshape(-1).tolist()]
+
+    for sequence in range(batch):
+        chunk_end = last[sequence] + 1
+        chunk_start = (last[sequence - 1] + 1) if sequence > 0 else 0
+        if initial_states is None:
+            running = torch.zeros(
+                (heads, dim, dstate), dtype=torch.float32, device=states.device
+            )
+        else:
+            running = initial_states[sequence].to(torch.float32)
+        for chunk in range(chunk_start, chunk_end):
+            # exp(dA_cs) at the padded row's last position, the chunk's total
+            # decay. The kernel evaluates it as exp2(dA_cs * log2(e)).
+            decay = torch.exp(dA_cumsum[:, chunk, chunk_size - 1].to(torch.float32))
+            # Same operand order as the kernel: (decay * running) + states.
+            running = decay.view(heads, 1, 1) * running + states[chunk].to(
+                torch.float32
+            )
+            out[chunk] = running.to(state_dtype)
+
+    return out
+
+
+def ssd_bmm_reference(
+    cmat: torch.Tensor,
+    bmat: torch.Tensor,
+    cu_chunk_seqlens: torch.Tensor,
+    chunk_size: int,
+    dot_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Reference non-causal chunk-level ``C @ B^T`` for the SSD prefill.
+
+    ``cmat``/``bmat`` are token-major ``[tokens, groups, dstate]`` and the result
+    is ``[nchunks, groups, chunk_size, chunk_size]`` fp32:
+
+        ``CB[c, g, i, j] = sum_n C[t_i, g, n] * B[t_j, g, n]``
+
+    with ``t_i = cu_chunk_seqlens[c] + i``. Non-causal: the strict upper triangle
+    is materialized as well, and the chunk-scan stage masks it afterwards.
+
+    Rounding point: both operands are rounded to ``dot_dtype`` -- the activation
+    dtype when either operand is 16-bit, fp32 otherwise -- **before** the product,
+    and the reduction over ``dstate`` accumulates in fp32.
+
+    Masking: the chunk's valid length is ``cu_chunk_seqlens[c+1] -
+    cu_chunk_seqlens[c]``. Rows at or past that boundary of either operand are
+    zero, so entries with ``i >= limit`` or ``j >= limit`` are exactly zero while
+    the full ``chunk_size x chunk_size`` tile is still written.
+    """
+    if cmat.dim() != 3 or bmat.dim() != 3:
+        raise ValueError("cmat and bmat must be [tokens, groups, dstate].")
+    if bmat.shape != cmat.shape:
+        raise ValueError("cmat and bmat must share a shape.")
+    tokens, _, _ = cmat.shape
+    offsets = [int(value) for value in cu_chunk_seqlens.reshape(-1).tolist()]
+    nchunks = len(offsets) - 1
+    if nchunks < 1:
+        raise ValueError("cu_chunk_seqlens must have at least two entries.")
+    if dot_dtype is None:
+        dot_dtype = _dot_dtype(cmat.dtype, bmat.dtype)
+
+    cb = torch.zeros(
+        (nchunks, cmat.shape[1], chunk_size, chunk_size),
+        dtype=torch.float32,
+        device=cmat.device,
+    )
+    for chunk in range(nchunks):
+        lo, hi = offsets[chunk], offsets[chunk + 1]
+        if lo < 0 or hi > tokens or hi < lo:
+            raise ValueError(f"chunk {chunk} spans [{lo}, {hi}) outside 0..{tokens}.")
+        limit = hi - lo
+        if limit <= 0:
+            continue
+        if limit > chunk_size:
+            raise ValueError(f"chunk {chunk} is longer than chunk_size.")
+        # The rounding happens before the product, on both operands.
+        a = cmat[lo:hi].to(dot_dtype).to(torch.float32)
+        b = bmat[lo:hi].to(dot_dtype).to(torch.float32)
+        cb[chunk, :, :limit, :limit] = torch.einsum("igk,jgk->gij", a, b)
+    return cb
