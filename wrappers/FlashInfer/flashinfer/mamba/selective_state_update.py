@@ -32,7 +32,9 @@ def _materialized(tensor: Any) -> Any:
     kilobytes per mixer per step -- and it is captured with the graph, so it does
     not reallocate at replay.
     """
-    if tensor is None or tensor.is_contiguous():
+    if tensor is None or not hasattr(tensor, "is_contiguous"):
+        return tensor
+    if tensor.is_contiguous():
         return tensor
     return tensor.contiguous()
 
