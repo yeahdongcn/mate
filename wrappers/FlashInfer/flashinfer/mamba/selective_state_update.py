@@ -21,6 +21,20 @@ __all__ = ["selective_state_update"]
 NULL_BLOCK_ID = 0
 
 
+import torch
+
+
+def _per_head_fp32(tensor: Any) -> Any:
+    """Return MATE's per-head fp32 view of a vLLM per-head vector."""
+    if tensor is None:
+        return None
+    if tensor.dim() >= 2 and all(stride == 0 for stride in tensor.stride()[1:]):
+        tensor = tensor[:, 0]
+    if tensor.dtype != torch.float32:
+        tensor = tensor.float()
+    return tensor
+
+
 def selective_state_update(
     state: Any,
     x: Any,
@@ -85,6 +99,14 @@ def selective_state_update(
             "rounding from rand_seed, and this call supplied none."
         )
     implementation = _backend.resolve("selective_state_update")
+    # vLLM builds its per-head vectors as `self.D[:, None].expand(-1, head_dim)`:
+    # a zero-stride 2-D broadcast in the model dtype. MATE's native kernel takes
+    # one fp32 value per head, and widening bf16/fp16 to fp32 is exact, so the
+    # adapter hands over the broadcast's first column instead of materializing a
+    # [heads, head_dim] copy. Refusing bf16 D here made the flag fail closed for a
+    # reason the caller could not act on: vLLM has no fp32 D to pass.
+    D = _per_head_fp32(D)
+    dt_bias = _per_head_fp32(dt_bias)
     return implementation(
         state,
         x,
