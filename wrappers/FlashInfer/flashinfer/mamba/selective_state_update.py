@@ -24,6 +24,19 @@ NULL_BLOCK_ID = 0
 import torch
 
 
+def _materialized(tensor: Any) -> Any:
+    """Return a contiguous tensor, copying only when vLLM passed a view.
+
+    vLLM expands `dt_d` across head_dim, so it arrives as a zero-stride view that
+    MATE's kernel refuses. The copy is tokens x heads x head_dim elements -- a few
+    kilobytes per mixer per step -- and it is captured with the graph, so it does
+    not reallocate at replay.
+    """
+    if tensor is None or tensor.is_contiguous():
+        return tensor
+    return tensor.contiguous()
+
+
 def _flat_slots(indices: Any, batch: int) -> Any:
     """Return the slot vector MATE expects, or leave it for MATE to refuse.
 
@@ -123,6 +136,8 @@ def selective_state_update(
     # reason the caller could not act on: vLLM has no fp32 D to pass.
     D = _per_head_fp32(D)
     dt_bias = _per_head_fp32(dt_bias)
+    x = _materialized(x)
+    dt = _materialized(dt)
     state_batch_indices = _flat_slots(state_batch_indices, x.shape[0])
     dst_state_batch_indices = _flat_slots(dst_state_batch_indices, x.shape[0])
     return implementation(
