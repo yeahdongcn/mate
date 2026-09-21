@@ -233,13 +233,17 @@ def tilelang_ssd_chunk_scan(
                     z_value = T.cast(z_shared[i, d], accum_dtype)
                     acc[i, d] = acc[i, d] * z_value / (1.0 + T.exp(-z_value))
 
-            T.copy(acc, acc_shared)
-            T.sync_threads()
+            # Store straight from the fragment. The shared round-trip this replaces
+            # redistributes the accumulator for coalesced stores, but its read-back
+            # is not covered by a barrier that the copy reliably completes under
+            # TL_DISABLE_THREAD_STORAGE_SYNC: repeating one recorded 512-token call
+            # in one process gave agreement, 1e29, agreement -- single-element
+            # corruption at the top of the bf16 range, which is what reading shared
+            # memory that was never written looks like. The same call is stable with
+            # the store taken directly from the fragment.
             for i, d in T.Parallel(block_M, dim):
                 if row0 + i < limit:
-                    out[chunk_start + row0 + i, bh, d] = T.cast(
-                        acc_shared[i, d], io_dtype
-                    )
+                    out[chunk_start + row0 + i, bh, d] = T.cast(acc[i, d], io_dtype)
 
     symbol = (
         f"tilelang_ssd_chunk_scan_h{heads}_g{groups}_d{dim}_n{dstate}"
