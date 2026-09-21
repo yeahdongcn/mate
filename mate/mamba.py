@@ -170,12 +170,32 @@ def selective_state_update(
         raise ValueError(
             f"native mamba SSU accepts backends {_SUPPORTED_BACKENDS}, got backend={backend!r}."
         )
-    if cu_seqlens is not None or num_accepted_tokens is not None or x.dim() != 3:
+    if x.dim() != 3:
         raise NotImplementedError(
-            "native mamba SSU implements single-token decoding only; packed "
-            "variable-length/MTP decoding (cu_seqlens/num_accepted_tokens, or a "
-            "4D x) is not implemented yet."
+            "native mamba SSU implements single-token decoding only; a 4D x is "
+            "not implemented yet."
         )
+    if num_accepted_tokens is not None:
+        raise NotImplementedError(
+            "native mamba SSU implements single-token decoding only; MTP "
+            "acceptance (num_accepted_tokens) is not implemented yet."
+        )
+    if cu_seqlens is not None:
+        # vLLM's mamba2 mixer always passes the query start locations on the decode
+        # path. For plain target-only decoding that is exactly one token per
+        # sequence, which is the case this kernel implements -- refusing it made
+        # the native backend unreachable behind --mamba-backend flashinfer. A
+        # genuinely packed call still has to be refused rather than silently
+        # decoding only the first token of each sequence.
+        expected = torch.arange(
+            x.shape[0] + 1, device=cu_seqlens.device, dtype=cu_seqlens.dtype
+        )
+        if cu_seqlens.numel() != x.shape[0] + 1 or not torch.equal(cu_seqlens, expected):
+            raise NotImplementedError(
+                "native mamba SSU implements single-token decoding only; "
+                f"cu_seqlens={cu_seqlens.flatten()[:8].tolist()}... does not describe "
+                f"{x.shape[0]} sequences of one token each."
+            )
     if rand_seed is not None:
         raise NotImplementedError(
             "native mamba SSU does not implement stochastic rounding (rand_seed) yet."
