@@ -584,3 +584,136 @@ def test_flat_slot_tables_are_normalized_rather_than_refused():
         mate.mamba._slot_table(
             torch.zeros(2, 2, 2, dtype=torch.int32), name="state_batch_indices"
         )
+
+
+# ---------------------------------------------------------------------------
+# Cross-check against the implementation this kernel replaces.
+#
+# The oracle above is MATE's own reference, so it pins the semantics but not the
+# replaceability. The arm the MTP6 config falls back to today is the stock Triton
+# SSU, and agreeing with *that* under the same call is what makes the swap a swap
+# rather than a behaviour change. The two reduce over dstate in a different order,
+# so agreement here is tolerance-based, and the bitwise-equal count is a property
+# of that order rather than a gate -- a state that is merely close is still a
+# behaviour change for the draft model, which is why the tolerance is the same one
+# the standalone validator uses.
+# ---------------------------------------------------------------------------
+
+try:  # the cross-check is optional: MATE must stay testable without vLLM-MUSA
+    from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+        selective_state_update as _TRITON_SSU,
+    )
+except Exception:  # pragma: no cover - environment probe
+    _TRITON_SSU = None
+
+
+def _run_triton(case: dict[str, object]):
+    """Run the stock Triton SSU on the same case, in the wrapper's calling style.
+
+    The serving wrapper keeps ``A``, ``D`` and ``dt_bias`` tied per head as
+    zero-stride views, and the Triton launcher detects exactly that; the expands
+    here reproduce the same scalar decay rather than a per-(head, dim) one.
+    """
+    state = case["state"].clone()
+    heads, dim, dstate = state.shape[1:]
+    rows = case["x"].shape[0]
+    out = torch.empty_like(case["x"])
+    _TRITON_SSU(
+        state,
+        case["x"],
+        case["dt"].expand(rows, heads, dim),
+        case["A"].view(heads, 1, 1).expand(heads, dim, dstate),
+        case["B"],
+        case["C"],
+        case["D"].view(heads, 1).expand(heads, dim),
+        case["dt_bias"].view(heads, 1).expand(heads, dim),
+        z=case["z"],
+        dt_softplus=SOFTPLUS,
+        state_batch_indices=case["src_slots"],
+        dst_state_batch_indices=case["dst_slots"],
+        null_block_id=PAD,
+        out=out,
+        num_accepted_tokens=case["num_accepted_tokens"],
+        cu_seqlens=case["cu_seqlens"],
+    )
+    return out, state
+
+
+def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float):
+    """Fail with the size of the disagreement, not just its existence."""
+    delta = (actual.to(torch.float32) - expected.to(torch.float32)).abs()
+    limit = atol + rtol * expected.to(torch.float32).abs()
+    bad = int((delta > limit).sum().item())
+    if bad:
+        raise AssertionError(
+            f"{bad}/{delta.numel()} elements outside atol={atol} rtol={rtol}; "
+            f"max abs difference {float(delta.max().item()):.4e}"
+        )
+
+
+def _compare_triton(case: dict[str, object]) -> None:
+    """Both implementations answer the same call; the oracle is not involved.
+
+    Two families are left out on purpose. Dense calls are MATE's own extra entry
+    point and the serving path never uses them, so there is nothing for the
+    fallback arm to agree with. Cases whose seeded read slot is the pad are left
+    out for the opposite reason: the pad is a rule MATE's normalizer implements,
+    and the stock kernel does not share it.
+    """
+    expected_out, expected_state = _run_triton(case)
+    actual_state = case["state"].clone()
+    actual_out = _run_kernel(case, state=actual_state).reshape(expected_out.shape)
+    _assert_parity(actual_out, expected_out, 2e-2, 2e-2)
+    _assert_parity(actual_state, expected_state, 1e-3, 1e-2)
+    print(
+        f"    bitwise-equal out "
+        f"{int((actual_out == expected_out).sum().item())}/{expected_out.numel()}"
+    )
+
+
+#: (tokens per sequence, acceptance count) for the cross-check. Triton specializes
+#: per shape, so this covers the ends of every regime instead of all of them.
+_TRITON_SHAPES = [
+    (1, 0),
+    (1, 1),
+    (2, 0),
+    (2, 1),
+    (2, 2),
+    (4, 1),
+    (4, 4),
+    (7, 0),
+    (7, 3),
+    (7, 6),
+    (7, 7),
+]
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.skipif(_TRITON_SSU is None, reason="vLLM-MUSA's Triton SSU is unavailable")
+@torch.inference_mode
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("steps, accepted", _TRITON_SHAPES)
+def test_packed_call_agrees_with_triton(batch, steps, accepted):
+    """The MTP6 call form: one table for both sides, one acceptance count."""
+    case = _case([steps] * batch, accepted=[accepted] * batch, same_slots=True)
+    case["dst_slots"] = case["src_slots"]
+    _compare_triton(case)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.skipif(_TRITON_SSU is None, reason="vLLM-MUSA's Triton SSU is unavailable")
+@torch.inference_mode
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("steps, accepted", [(1, 1), (2, 2), (4, 4), (7, 3), (7, 7)])
+def test_distinct_slot_tables_agree_with_triton(batch, steps, accepted):
+    """Prefix caching's form: the read table and the write table are different."""
+    _compare_triton(_case([steps] * batch, accepted=[accepted] * batch))
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.skipif(_TRITON_SSU is None, reason="vLLM-MUSA's Triton SSU is unavailable")
+@torch.inference_mode
+def test_variable_length_call_agrees_with_triton():
+    """Rows of different lengths: what the serving path builds from cu_seqlens."""
+    _compare_triton(_case([1, 6, 2, 5], accepted=[1, 3, 2, 5]))
+
