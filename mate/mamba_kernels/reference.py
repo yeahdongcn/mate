@@ -105,9 +105,16 @@ def selective_state_update_one_token_reference(
 
 
 def _slot_at(slots: torch.Tensor, batch_idx: int, step: int) -> int:
-    """Read a slot id from either the ``[batch]`` or ``[batch, width]`` form."""
+    """Read a slot id, addressed the way the kernels address it.
+
+    A 2-D ``[sequences, steps]`` table is read at ``[batch_idx, step]``. A 1-D table
+    is the flat form the Triton kernel reaches by unsqueezing it to ``[rows, 1]``:
+    both of its strides are then 1, so sequence ``batch_idx``'s position ``step`` is
+    entry ``batch_idx + step``. That is what vLLM's MTP6 call passes -- one entry per
+    packed row -- and with a single sequence it is simply the position.
+    """
     if slots.dim() == 1:
-        return int(slots[batch_idx])
+        return int(slots[batch_idx + step])
     return int(slots[batch_idx, step])
 
 
@@ -145,9 +152,10 @@ def selective_state_update_multi_token_reference(
       ``dst_slots[b, 0]`` (falling back to the read slot);
     - plain MTP without destination slots: one write after the token loop, back
       to the read slot;
-    - speculative decoding (``num_accepted_tokens`` given): one write per token
-      through the ``dst_slots[b, t]`` slot chain, where each written slot becomes
-      the next token's read slot.
+    - speculative decoding (``num_accepted_tokens`` given): one write per token to
+      ``dst_slots[b, t]``, or to ``src_slots[b, t]`` when no destination table is
+      given, which is the default the Triton kernel applies by aliasing
+      ``dst_state_batch_indices`` onto ``state_batch_indices``.
 
     A padded source slot reads as a zero state, a padded destination slot is never
     written, and ``disable_state_update`` suppresses every write. Empty sequences
@@ -215,15 +223,13 @@ def selective_state_update_multi_token_reference(
             if disable_state_update:
                 continue
             if spec_decoding:
-                write_slot = (
-                    _slot_at(dst_slots, b, token)
-                    if dst_slots is not None
-                    else read_slot
+                # No destination table: the write target is the read table's own
+                # entry for this token, not the slot the sequence started from.
+                write_slot = _slot_at(
+                    src_slots if dst_slots is None else dst_slots, b, token
                 )
                 if write_slot != pad_slot_id:
                     state[write_slot].copy_(running.to(state.dtype))
-                # The slot just written is the next token's read slot.
-                read_slot = write_slot
 
         if disable_state_update or spec_decoding:
             continue

@@ -251,14 +251,21 @@ def test_out_buffer_is_written_in_place():
 @pytest.mark.parametrize(
     "overrides, message",
     [
-        # One token per sequence is exactly what the native SSU implements, so it
-        # is accepted (see test_one_token_per_sequence_cu_seqlens_is_accepted).
-        ({"cu_seqlens": torch.tensor([0, 2], dtype=torch.int32)}, "variable-length"),
         ({"rand_seed": torch.zeros(1, dtype=torch.int32)}, "stochastic rounding"),
         ({"state_scale": torch.ones(_SLOTS, dtype=torch.float32)}, "quantized state"),
         ({"cache_steps": 4}, "intermediate"),
+        # A packed call is no longer refused: one sequence of two tokens, which the
+        # packed kernel handles (the numeric check lives in test_mamba_mtp.py).
+        ({"cu_seqlens": torch.tensor([0, 2], dtype=torch.int32)}, None),
+        # vLLM's SSU dispatch forwards the slot-table width as `cache_steps` whenever
+        # it passes cu_seqlens, including the plain one-token-per-sequence step. That
+        # must keep running -- refusing it would take the whole
+        # `--mamba-backend flashinfer` arm off the native path.
         (
-            {"philox_rounds": 0, "cache_steps": 0, "intermediate_states_buffer": None},
+            {
+                "cache_steps": 2,
+                "cu_seqlens": torch.tensor([0, 1, 2], dtype=torch.int32),
+            },
             None,
         ),
     ],

@@ -185,17 +185,67 @@ def test_num_accepted_tokens_indexes_the_read_slot() -> None:
     inp, pool = _make_inputs(2), _make_pool()
     slots = torch.tensor([[0, 3]])
     # The consumer passes the accepted-token count, and the state is read at
-    # ``count - 1`` so that the accepted token itself is the starting state.
-    for count, start in ((1, 0), (2, 3)):
+    # ``count - 1`` so that the accepted token itself is the starting state. With no
+    # destination table the write target is the read table's own entry for each
+    # token, which is what the Triton kernel's ``dst = src`` default produces: the
+    # second token writes column 1 whether or not the first one wrote column 0.
+    for count, first_read in ((1, 0), (2, 3)):
         y, state = _multi(
             pool, inp, [2], [0], slots, None, accepted=torch.tensor([count])
         )
         expected_y, expected_state = _sequential(
-            pool, inp, [[(0, start, None), (1, start, None)]]
+            pool, inp, [[(0, first_read, 0), (1, 0, 3)]]
         )
         assert torch.equal(y[0], expected_y[0])
         assert torch.equal(y[1], expected_y[1])
         assert torch.equal(state, expected_state)
+
+
+def test_flat_slot_tables_are_addressed_by_position() -> None:
+    inp, pool = _make_inputs(3), _make_pool()
+    # vLLM's MTP6 call passes one flat entry per packed row. Triton reaches it by
+    # unsqueezing to [rows, 1], so both strides are 1 and sequence 0's position t is
+    # entry t -- which is why the accepted position is also the entry read.
+    slots = torch.tensor([2, 5, 6])
+    y, state = _multi(pool, inp, [3], [0], slots, None, accepted=torch.tensor([1]))
+    expected_y, expected_state = _sequential(
+        pool, inp, [[(0, 2, 2), (1, 2, 5), (2, 5, 6)]]
+    )
+    for row in range(3):
+        assert torch.equal(y[row], expected_y[row])
+    assert torch.equal(state, expected_state)
+
+    # A flat destination table is addressed the same way, independently of the read
+    # table: token t writes its own entry.
+    y, state = _multi(
+        pool,
+        inp,
+        [3],
+        [0],
+        slots,
+        torch.tensor([10, 11, 12]),
+        accepted=torch.tensor([1]),
+    )
+    expected_y, expected_state = _sequential(
+        pool, inp, [[(0, 2, 10), (1, 10, 11), (2, 11, 12)]]
+    )
+    for row in range(3):
+        assert torch.equal(y[row], expected_y[row])
+    assert torch.equal(state, expected_state)
+
+
+def test_flat_slot_tables_carry_one_entry_per_sequence_without_acceptance() -> None:
+    inp, pool = _make_inputs(4), _make_pool()
+    # Without acceptance counts a flat table is the per-sequence slot vector the
+    # plain path passes, so sequence b reads and writes entry b even when its rows
+    # span several tokens.
+    y, state = _multi(pool, inp, [2, 2], [0, 2], torch.tensor([1, 3]), None)
+    expected_y, expected_state = _sequential(
+        pool, inp, [[(0, 1, 1), (1, 1, 1)], [(2, 3, 3), (3, 3, 3)]]
+    )
+    for row in range(4):
+        assert torch.equal(y[row], expected_y[row])
+    assert torch.equal(state, expected_state)
 
 
 def test_pad_slots_disable_state_update_and_empty_sequences() -> None:
