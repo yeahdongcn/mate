@@ -2,24 +2,37 @@
 
 ``selective_state_update`` is the decode-side entry point consumed by the
 FlashInfer-shaped compatibility wrapper (``flashinfer.mamba``) in a MUSA build
-whose provider is MATE. It implements the one-token selective state update
-natively in tilelang and mirrors the reference contract exactly for the
-supported configuration.
+whose provider is MATE. It implements the selective state update natively in
+tilelang and mirrors the reference contract exactly for the supported
+configuration.
 
-Supported today (single token per sequence):
+Two kernels share this entry point, and the call shape picks between them:
+
+- one token per sequence with no acceptance counts and no slot table
+  (``ssu_one_token``) -- the plain decode step, which vLLM's Mamba2 mixer makes on
+  every step, so it keeps the shape it was built for;
+- everything else (``ssu_packed_varlen``): packed variable-length rows described by
+  ``cu_seqlens``, one token per sequence per speculative position, a per-token
+  destination slot table, and the acceptance count that seeds the read slot. This is
+  the MTP decode call, and its state chain is what makes speculative decoding work.
+
+Supported today:
 
 - ``state`` fp16/bf16/fp32 ``[slots, heads, dim, dstate]``, contiguous
 - ``x``/``B``/``C``/``z`` fp16 or bf16; ``dt``/``A``/``D``/``dt_bias`` fp32
 - per-head (tied) ``A``, ``D`` and ``dt_bias``, i.e. ``A[h]`` broadcasting over
   ``dim``/``dstate``, which is the layout the Mamba2 consumers pass
+- ``state_batch_indices``/``dst_state_batch_indices`` as a ``[sequences]`` vector or
+  a ``[sequences, steps]`` table, ``cu_seqlens``, ``num_accepted_tokens``
+- 3-D packed ``x`` ``[rows, heads, dim]`` and the dense 4-D
+  ``[batch, steps, heads, dim]`` form of it
 - ``pad_slot_id`` and ``disable_state_update`` honoured in kernel
 
 Everything else raises ``NotImplementedError`` naming the missing capability
-rather than silently narrowing semantics. Not implemented yet: packed
-variable-length and MTP decoding (``cu_seqlens``/``num_accepted_tokens``),
-stochastic rounding (``rand_seed``), quantized state (``state_scale``),
-intermediate/replay state capture (``cache_steps`` and
-``intermediate_*``), and channel-wise ``D``/``dt_bias``.
+rather than silently narrowing semantics. Not implemented yet: stochastic rounding
+(``rand_seed``), quantized state (``state_scale``), intermediate/replay state
+capture (``intermediate_*``, and ``cache_steps`` outside the packed form where
+FlashInfer defines it as the sequence length), and channel-wise ``D``/``dt_bias``.
 
 Graph capture: the tilelang kernel is compiled on first use for each
 (dtype, shape, flag) tuple. Call :func:`prewarm_selective_state_update` during
@@ -57,6 +70,13 @@ def _ssu_launch():
     return ssu_one_token_launch
 
 
+def _ssu_packed_launch():
+    """Import the packed (MTP/packed-varlen) SSU launcher on first use."""
+    from mate.mamba_kernels.tilelang.ssu_packed_varlen import ssu_packed_launch
+
+    return ssu_packed_launch
+
+
 _SUPPORTED_STATE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_SLOT_DTYPES = (torch.int32, torch.int64)
@@ -64,6 +84,11 @@ _SUPPORTED_ALGORITHMS = ("auto", "native", "simple")
 _SUPPORTED_BACKENDS = ("auto", "musa", "native", "flashinfer")
 _DEFAULT_LANES_PER_ROW = 32
 _DEFAULT_ROWS_PER_CTA = 4
+
+#: Dtype of the query-start metadata this module synthesizes. vLLM allocates its
+#: ``query_start_loc`` as int32, and the synthesized tensor has to be comparable
+#: with the caller's for the one-token fast-path check to mean anything.
+_SEQ_DTYPE = torch.int32
 
 
 def _per_head(
@@ -109,24 +134,126 @@ def _matches(tensor: torch.Tensor, heads: int, dim: int | None) -> bool:
     return dim is None or tensor.shape[1] == dim
 
 
-def _slots(
+def _slot_vector(
     indices: torch.Tensor | None,
     batch: int,
     *,
     name: str,
     device: torch.device,
 ) -> torch.Tensor:
+    """The one-token path's ``[batch]`` slot vector, materialized when absent."""
     if indices is None:
         # One tensor op; the consumers pass explicit indices on the capture path.
-        return torch.arange(batch, dtype=torch.int32, device=device)
-    if indices.dim() != 1 or indices.shape[0] != batch:
-        raise NotImplementedError(
-            f"native mamba SSU implements the one-token path only, so {name} must "
-            f"be a 1D tensor with one entry per batch row; got {tuple(indices.shape)}."
+        return torch.arange(batch, dtype=_SEQ_DTYPE, device=device)
+    if indices.dim() != 1:
+        raise ValueError(
+            f"{name} must be [sequences] on the one-token path; got "
+            f"{tuple(indices.shape)}."
+        )
+    if indices.shape[0] != batch:
+        raise ValueError(
+            f"{name} must hold one entry per sequence ({batch}), got "
+            f"{indices.shape[0]}."
         )
     if indices.dtype not in _SUPPORTED_SLOT_DTYPES:
         raise ValueError(f"{name} must be int32 or int64, got {indices.dtype}.")
     return indices.contiguous()
+
+
+def _slot_table(
+    indices: torch.Tensor | None,
+    sequences: int,
+    *,
+    name: str,
+) -> torch.Tensor | None:
+    """The packed path's ``[sequences, steps]`` slot table, or ``None``.
+
+    The consumers pass a vector when a call carries one slot per sequence; widening
+    it to one column is a view, and the packed kernel then reads column 0 -- which is
+    the only column a one-token-per-sequence call has.
+    """
+    if indices is None:
+        return None
+    if indices.dtype not in _SUPPORTED_SLOT_DTYPES:
+        raise ValueError(f"{name} must be int32 or int64, got {indices.dtype}.")
+    if indices.dim() == 1:
+        if indices.shape[0] != sequences:
+            raise ValueError(
+                f"{name} must hold one entry per sequence ({sequences}), got "
+                f"{indices.shape[0]}."
+            )
+        return indices.contiguous().reshape(sequences, 1)
+    if indices.dim() == 2:
+        if indices.shape[0] != sequences:
+            raise ValueError(
+                f"{name} must hold one row per sequence ({sequences}), got "
+                f"{tuple(indices.shape)}."
+            )
+        return indices.contiguous()
+    raise ValueError(
+        f"{name} must be [sequences] or [sequences, steps]; got "
+        f"{tuple(indices.shape)}."
+    )
+
+
+_DENSE_SEQ_STARTS: dict[tuple[int, int, str, torch.dtype], torch.Tensor] = {}
+
+
+def _dense_seq_starts(
+    batch: int, steps: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Regular query starts for a dense ``[batch, steps, ...]`` call.
+
+    The packed kernel reads every sequence's row range from ``cu_seqlens``, and the
+    dense layout is just equal-length sequences. Building the tensor once per
+    (batch, steps) keeps a ``torch.arange`` out of every decode step and every
+    captured graph replay, which is the family's wrapper contract.
+    """
+    key = (batch, steps, str(device), dtype)
+    starts = _DENSE_SEQ_STARTS.get(key)
+    if starts is None:
+        starts = torch.arange(
+            0, (batch + 1) * steps, steps, dtype=dtype, device=device
+        ).contiguous()
+        _DENSE_SEQ_STARTS[key] = starts
+    return starts
+
+
+def _flatten_steps(
+    tensor: torch.Tensor | None, rows: int, *, name: str
+) -> torch.Tensor | None:
+    """Flatten a dense multi-token operand's ``(batch, steps)`` axes into rows."""
+    if tensor is None:
+        return None
+    if tensor.dim() != 4:
+        raise ValueError(
+            f"a dense (4-D) x requires a 4-D {name} as well, got "
+            f"{tuple(tensor.shape)}; pass every operand in one layout."
+        )
+    return tensor.reshape(rows, *tensor.shape[2:])
+
+
+def _one_token_per_sequence(cu_seqlens: torch.Tensor | None, rows: int) -> bool:
+    """Whether the query starts describe exactly one token per sequence.
+
+    vLLM's Mamba2 mixer passes them on every decode step, and for plain
+    (non-speculative) decoding they are ``arange(rows + 1)`` -- the call the
+    one-token kernel exists for. Equal counts do not prove it (``[0, 0, 2]`` also
+    has ``rows + 1`` entries), so the vector is compared rather than counted, and an
+    empty sequence keeps the fast path out of the picture.
+
+    This comparison is the one place the entry point synchronizes, and it is the
+    check the one-token path already performed. The packed route never does: it
+    reads ``cu_seqlens`` in kernel.
+    """
+    if cu_seqlens is None:
+        return True
+    if cu_seqlens.dim() != 1 or cu_seqlens.numel() != rows + 1:
+        return False
+    if cu_seqlens.dtype not in _SUPPORTED_SLOT_DTYPES:
+        raise ValueError(f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}.")
+    expected = torch.arange(rows + 1, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    return bool(torch.equal(cu_seqlens, expected))
 
 
 @functools.lru_cache(maxsize=1)
@@ -142,6 +269,131 @@ def _announce_native_ssd() -> None:
     get_api_logger().info(
         "mate.mamba: native SSD prefill active (TileLang chunked scan on MUSA); "
         "flashinfer.mamba.ssd_combined_fwd_varlen resolves here"
+    )
+
+
+def _packed_selective_state_update(
+    *,
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    a_head: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    d_head: torch.Tensor | None,
+    bias_head: torch.Tensor | None,
+    z: torch.Tensor | None,
+    state_batch_indices: torch.Tensor | None,
+    dst_state_batch_indices: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+    out: torch.Tensor,
+    dt_softplus: bool,
+    pad_slot_id: int,
+    disable_state_update: bool,
+) -> torch.Tensor:
+    """Route a multi-token call to the packed kernel, validating its extra contract.
+
+    Everything here is a device-tensor or shape decision: the packed route never
+    copies a scalar back to the host, so a captured decode step can replay it.
+    """
+    rows = x.shape[0]
+    # How many sequences the call describes: whichever metadata the caller supplied
+    # has to agree on it, and the shape checks below are what enforce that.
+    if state_batch_indices is not None:
+        sequences = int(state_batch_indices.shape[0])
+    elif dst_state_batch_indices is not None:
+        sequences = int(dst_state_batch_indices.shape[0])
+    elif cu_seqlens is not None:
+        sequences = int(cu_seqlens.numel()) - 1
+    else:
+        raise ValueError(
+            "a packed multi-token call must carry per-sequence metadata: "
+            "state_batch_indices, dst_state_batch_indices, num_accepted_tokens or "
+            "cu_seqlens."
+        )
+
+    if num_accepted_tokens is not None:
+        if num_accepted_tokens.dim() != 1:
+            raise ValueError(
+                "num_accepted_tokens must be [sequences], got "
+                f"{tuple(num_accepted_tokens.shape)}."
+            )
+        if num_accepted_tokens.dtype not in _SUPPORTED_SLOT_DTYPES:
+            raise ValueError(
+                f"num_accepted_tokens must be int32 or int64, got "
+                f"{num_accepted_tokens.dtype}."
+            )
+        # The Triton kernel asserts the same two things: an acceptance count picks a
+        # column of the read table, and every speculative position owns a column of
+        # the destination table, so a one-entry-per-sequence vector cannot carry the
+        # call. Reading column 0 instead would decode from the wrong state.
+        if state_batch_indices is None:
+            raise ValueError(
+                "num_accepted_tokens selects the read slot, so it needs "
+                "state_batch_indices as the 2-D [sequences, steps] table."
+            )
+        for name, indices in (
+            ("state_batch_indices", state_batch_indices),
+            ("dst_state_batch_indices", dst_state_batch_indices),
+        ):
+            if indices is not None and indices.dim() != 2:
+                raise ValueError(
+                    f"{name} must be the 2-D [sequences, steps] table when "
+                    f"num_accepted_tokens is given; got {tuple(indices.shape)}."
+                )
+        if cu_seqlens is not None and num_accepted_tokens.dtype != cu_seqlens.dtype:
+            raise ValueError(
+                "cu_seqlens and num_accepted_tokens must share a dtype for the packed "
+                f"SSU kernel; got {cu_seqlens.dtype} and {num_accepted_tokens.dtype}."
+            )
+
+    if cu_seqlens is None:
+        if rows != sequences:
+            raise ValueError(
+                "a packed multi-token call must pass cu_seqlens: "
+                f"{rows} rows cannot be split across {sequences} sequences without "
+                "it. A dense [batch, steps, heads, dim] x carries that layout."
+            )
+        cu_seqlens = _dense_seq_starts(sequences, 1, x.device, _SEQ_DTYPE)
+    elif cu_seqlens.dim() != 1 or cu_seqlens.numel() != sequences + 1:
+        raise ValueError(
+            f"cu_seqlens must be the 1-D vector holding one start per sequence plus "
+            f"the total: expected {sequences + 1} entries for {sequences} sequences, "
+            f"got {tuple(cu_seqlens.shape)}."
+        )
+    if cu_seqlens.dtype not in _SUPPORTED_SLOT_DTYPES:
+        raise ValueError(f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}.")
+
+    src_table = _slot_table(state_batch_indices, sequences, name="state_batch_indices")
+    if src_table is None:
+        # With no slot table the state coordinate is the sequence's own row, which is
+        # what the Triton kernel uses when HAS_STATE_BATCH_INDICES is false.
+        src_table = torch.arange(sequences, dtype=_SEQ_DTYPE, device=x.device).reshape(
+            sequences, 1
+        )
+    dst_table = _slot_table(
+        dst_state_batch_indices, sequences, name="dst_state_batch_indices"
+    )
+
+    return _ssu_packed_launch()(
+        state,
+        x,
+        dt,
+        a_head,
+        B,
+        C,
+        d_head,
+        bias_head,
+        z,
+        src_table,
+        dst_table,
+        cu_seqlens.contiguous(),
+        None if num_accepted_tokens is None else num_accepted_tokens.contiguous(),
+        out,
+        dt_softplus=dt_softplus,
+        pad_slot_id=pad_slot_id,
+        disable_state_update=disable_state_update,
     )
 
 
@@ -179,6 +431,10 @@ def selective_state_update(
     The argument order, defaults and semantics follow the FlashInfer-shaped
     contract the MUSA consumers already call, so this function can serve as the
     implementation behind that surface without an adapter layer.
+
+    ``x`` is the packed ``[rows, heads, dim]`` form together with ``cu_seqlens``, or
+    the dense ``[batch, steps, heads, dim]`` form of the same recurrence. Both are
+    supported, and the call shape -- not a flag -- decides which kernel runs.
     """
     if algorithm not in _SUPPORTED_ALGORITHMS:
         raise ValueError(
@@ -188,33 +444,6 @@ def selective_state_update(
         raise ValueError(
             f"native mamba SSU accepts backends {_SUPPORTED_BACKENDS}, got backend={backend!r}."
         )
-    if x.dim() != 3:
-        raise NotImplementedError(
-            "native mamba SSU implements single-token decoding only; a 4D x is "
-            "not implemented yet."
-        )
-    if num_accepted_tokens is not None:
-        raise NotImplementedError(
-            "native mamba SSU implements single-token decoding only; MTP "
-            "acceptance (num_accepted_tokens) is not implemented yet."
-        )
-    if cu_seqlens is not None:
-        # vLLM's mamba2 mixer always passes the query start locations on the decode
-        # path. For plain target-only decoding that is exactly one token per
-        # sequence, which is the case this kernel implements -- refusing it made
-        # the native backend unreachable behind --mamba-backend flashinfer. A
-        # genuinely packed call still has to be refused rather than silently
-        # decoding only the first token of each sequence.
-        expected = torch.arange(
-            x.shape[0] + 1, device=cu_seqlens.device, dtype=cu_seqlens.dtype
-        )
-        if cu_seqlens.numel() != x.shape[0] + 1 or not torch.equal(cu_seqlens, expected):
-            raise NotImplementedError(
-                "native mamba SSU implements single-token decoding only; this looks "
-                "like packed variable-length decoding, and "
-                f"cu_seqlens={cu_seqlens.flatten()[:8].tolist()}... does not describe "
-                f"{x.shape[0]} sequences of one token each."
-            )
     if rand_seed is not None:
         raise NotImplementedError(
             "native mamba SSU does not implement stochastic rounding (rand_seed) yet."
@@ -227,11 +456,55 @@ def selective_state_update(
         intermediate_states_buffer is not None
         or intermediate_state_indices is not None
         or intermediate_state_scales is not None
-        or cache_steps
     ):
         raise NotImplementedError(
             "native mamba SSU does not implement intermediate/replay state capture yet."
         )
+    if cache_steps and cu_seqlens is None:
+        # FlashInfer defines cache_steps as the number of steps to cache -- the
+        # sequence length in varlen mode, the depth of a dense multi-token call
+        # otherwise -- and vLLM's SSU dispatch forwards it as the slot-table width
+        # whenever it passes cu_seqlens. Refusing the packed form would leave the
+        # whole --mamba-backend flashinfer arm unreachable, so only the dense form is
+        # refused here: that one asks for intermediate-state capture, which is the
+        # capability this module does not have.
+        raise NotImplementedError(
+            "native mamba SSU does not implement the dense multi-token "
+            "intermediate-state cache (cache_steps without cu_seqlens) yet."
+        )
+    if x.dim() not in (3, 4):
+        raise ValueError(
+            f"x must be the packed [rows, heads, dim] or the dense "
+            f"[batch, steps, heads, dim] form, got {tuple(x.shape)}."
+        )
+    dense_shape = None
+    dense_out = None
+    if x.dim() == 4:
+        # The dense form is the same recurrence as packed varlen with one
+        # equal-length sequence per batch row, so it is flattened -- a view on the
+        # contiguous operands the consumers pass -- and the packed kernel is handed
+        # the regular cu_seqlens that expresses it. Keeping one kernel for both
+        # layouts is what makes the dense form free rather than a second code path.
+        dense_batch, steps = x.shape[:2]
+        dense_shape = tuple(x.shape)
+        if cu_seqlens is None:
+            cu_seqlens = _dense_seq_starts(dense_batch, steps, x.device, _SEQ_DTYPE)
+        if out is not None:
+            if not out.is_contiguous():
+                raise ValueError(
+                    "a dense (4-D) out must be contiguous: the kernel writes it "
+                    "through a flattened view, and a copy would drop the result."
+                )
+            dense_out = out
+            out = out.view(dense_batch * steps, out.shape[2], out.shape[3])
+        rows = dense_batch * steps
+        x = x.reshape(rows, x.shape[2], x.shape[3])
+        dt = _flatten_steps(dt, rows, name="dt")
+        B = _flatten_steps(B, rows, name="B")
+        C = _flatten_steps(C, rows, name="C")
+        z = _flatten_steps(z, rows, name="z")
+    rows = x.shape[0]
+
     if state.dim() != 4:
         raise ValueError(
             f"state must be [slots, heads, dim, dstate], got {tuple(state.shape)}."
@@ -246,67 +519,103 @@ def selective_state_update(
         raise NotImplementedError(
             f"native mamba SSU supports x dtypes {_SUPPORTED_IO_DTYPES}, got {x.dtype}."
         )
-    dt_broadcast = dt.dim() == 3 and dt.shape[:2] == (x.shape[0], heads) and dt.shape[2] == 1
-    if not dt_broadcast and (x.shape != dt.shape or x.shape != (x.shape[0], heads, dim)):
+    dt_broadcast = dt.dim() == 3 and dt.shape[:2] == (rows, heads) and dt.shape[2] == 1
+    if not dt_broadcast and (x.shape != dt.shape or x.shape != (rows, heads, dim)):
         raise ValueError(
             f"x/dt must match the state head layout: x={tuple(x.shape)}, "
             f"dt={tuple(dt.shape)}, state={tuple(state.shape)}."
         )
     if B.dim() != 3 or C.shape != B.shape:
         raise ValueError(
-            f"single-token B/C must be [batch, groups, dstate]; got B="
-            f"{tuple(B.shape)}, C={tuple(C.shape)}."
+            f"B/C must be [rows, groups, dstate]; got B={tuple(B.shape)}, "
+            f"C={tuple(C.shape)}."
         )
     if B.dtype != x.dtype or C.dtype != x.dtype:
         raise ValueError("B and C must share the x dtype for the native SSU kernel.")
-    batch = x.shape[0]
 
     a_head = _per_head(A, heads, dim=dim, name="A")
     d_head = _per_head(D, heads, dim=dim, name="D") if D is not None else None
     bias_head = (
-        _per_head(dt_bias, heads, dim=dim, name="dt_bias") if dt_bias is not None else None
+        _per_head(dt_bias, heads, dim=dim, name="dt_bias")
+        if dt_bias is not None
+        else None
     )
     if z is not None and (z.shape != x.shape or z.dtype != x.dtype):
         raise ValueError("z must match x in shape and dtype for the native SSU kernel.")
     if out is None:
-        out = torch.empty((batch, heads, dim), dtype=x.dtype, device=x.device)
-    elif out.shape != (batch, heads, dim) or out.dtype != x.dtype:
+        out = torch.empty((rows, heads, dim), dtype=x.dtype, device=x.device)
+    elif out.shape != (rows, heads, dim) or out.dtype != x.dtype:
         raise ValueError(
             f"out must be {x.dtype} with shape {tuple(x.shape)}, got "
             f"{out.dtype} {tuple(out.shape)}."
         )
 
-    src_slots = _slots(
-        state_batch_indices, batch, name="state_batch_indices", device=x.device
-    )
-    dst_slots = (
-        None
-        if dst_state_batch_indices is None
-        else _slots(
-            dst_state_batch_indices,
-            batch,
-            name="dst_state_batch_indices",
-            device=x.device,
+    # The plain decode step -- one token per sequence, no acceptance counts, no slot
+    # table -- stays on the kernel built for it, because that is the call vLLM's
+    # Mamba2 mixer makes on every step of every decode. Multi-token information is
+    # what moves a call to the packed kernel: acceptance counts, a slot table with a
+    # column per speculative position, or query starts that are not one token per
+    # row.
+    if (
+        num_accepted_tokens is None
+        and _one_token_per_sequence(cu_seqlens, rows)
+        and (state_batch_indices is None or state_batch_indices.dim() == 1)
+        and (dst_state_batch_indices is None or dst_state_batch_indices.dim() == 1)
+    ):
+        result = _ssu_launch()(
+            state,
+            x,
+            dt,
+            a_head,
+            B,
+            C,
+            d_head,
+            bias_head,
+            z,
+            _slot_vector(
+                state_batch_indices, rows, name="state_batch_indices", device=x.device
+            ),
+            None
+            if dst_state_batch_indices is None
+            else _slot_vector(
+                dst_state_batch_indices,
+                rows,
+                name="dst_state_batch_indices",
+                device=x.device,
+            ),
+            out,
+            dt_softplus=bool(dt_softplus),
+            pad_slot_id=int(pad_slot_id),
+            disable_state_update=bool(disable_state_update),
         )
-    )
+    else:
+        result = _packed_selective_state_update(
+            state=state,
+            x=x,
+            dt=dt,
+            a_head=a_head,
+            B=B,
+            C=C,
+            d_head=d_head,
+            bias_head=bias_head,
+            z=z,
+            state_batch_indices=state_batch_indices,
+            dst_state_batch_indices=dst_state_batch_indices,
+            cu_seqlens=cu_seqlens,
+            num_accepted_tokens=num_accepted_tokens,
+            out=out,
+            dt_softplus=bool(dt_softplus),
+            pad_slot_id=int(pad_slot_id),
+            disable_state_update=bool(disable_state_update),
+        )
 
-    return _ssu_launch()(
-        state,
-        x,
-        dt,
-        a_head,
-        B,
-        C,
-        d_head,
-        bias_head,
-        z,
-        src_slots,
-        dst_slots,
-        out,
-        dt_softplus=bool(dt_softplus),
-        pad_slot_id=int(pad_slot_id),
-        disable_state_update=bool(disable_state_update),
-    )
+    if dense_out is not None:
+        # The caller's own buffer, so `returned is out` holds for the dense form too.
+        return dense_out
+    if dense_shape is not None:
+        # A dense call gets its rank back; shapes carry meaning in this family.
+        return result.view(dense_shape)
+    return result
 
 
 @mate_api
@@ -322,13 +631,43 @@ def prewarm_selective_state_update(
     slot_dtype: torch.dtype,
     rows_per_cta: int = _DEFAULT_ROWS_PER_CTA,
     lanes_per_row: int = _DEFAULT_LANES_PER_ROW,
+    packed: bool = False,
+    meta_dtype: torch.dtype = _SEQ_DTYPE,
+    dt_dim: int | None = None,
 ) -> None:
     """Compile the native kernel for one configuration, outside capture.
 
     Call this during warmup (before any graph capture) for each shape/dtype
     combination the serving configuration will use. Compiling inside a captured
     graph stalls the worker, so prewarming is required rather than optional.
+
+    ``packed`` selects the kernel a multi-token serving configuration will actually
+    run -- the packed/MTP one -- because that is a different compilation from the
+    one-token fast path. ``dt_dim`` is what the configuration passes as ``dt``: ``1``
+    for the per-head step the FlashInfer-shaped wrapper hands over (one value per
+    head, broadcast over ``dim``), ``None`` for this module's default of a full
+    ``[rows, heads, dim]`` dt. ``meta_dtype`` is the dtype of
+    ``cu_seqlens``/``num_accepted_tokens``, which the packed kernel specializes on.
     """
+    if packed:
+        from mate.mamba_kernels.tilelang.ssu_packed_varlen import (
+            prewarm_ssu_packed_varlen,
+        )
+
+        prewarm_ssu_packed_varlen(
+            state_dtype=state_dtype,
+            io_dtype=io_dtype,
+            slot_dtype=slot_dtype,
+            meta_dtype=meta_dtype,
+            dim=dim,
+            dstate=dstate,
+            head_ratio=heads // groups,
+            dt_dim=dt_dim,
+            rows_per_cta=rows_per_cta,
+            lanes_per_row=lanes_per_row,
+        )
+        return
+
     from mate.mamba_kernels.tilelang.ssu_one_token import prewarm_ssu_one_token
 
     prewarm_ssu_one_token(
@@ -340,6 +679,7 @@ def prewarm_selective_state_update(
         slot_dtype=slot_dtype,
         rows_per_cta=rows_per_cta,
         lanes_per_row=lanes_per_row,
+        dt_dim=dt_dim,
     )
 
 
