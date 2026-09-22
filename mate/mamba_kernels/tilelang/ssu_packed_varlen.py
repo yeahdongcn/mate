@@ -21,8 +21,15 @@ Contract, as the stock Triton ``selective_state_update`` defines it (see
 - the initial state is read once, from ``src_slots[b, max(num_accepted[b] - 1, 0)]``
   when acceptance counts are given (``src_slots[b, 0]`` otherwise), so a step
   resumes from the state the accepted position left behind;
+- the slot tables are addressed by **strides**, not by a declared shape. Triton
+  reaches a flat table by unsqueezing it to ``[rows, 1]``, which makes both strides
+  1, so sequence ``b``'s position ``t`` is entry ``b + t`` for a flat table and
+  ``b * steps + t`` for a contiguous 2-D ``[sequences, steps]`` one. vLLM's MTP6
+  call passes the flat form -- ``state_batch_indices`` and
+  ``dst_state_batch_indices`` are ``[rows]``, one entry per packed row;
 - with acceptance counts, **every** token stores its evolving state to
-  ``dst_slots[b, i_t]``, skipping slots equal to ``pad_slot_id``. That chain is
+  ``dst_slots[b, i_t]``, or to ``src_slots[b, i_t]`` when no destination table is
+  given (the Triton default), skipping slots equal to ``pad_slot_id``. That chain is
   what lets the next call start mid-sequence instead of recomputing the accepted
   prefix, so it is semantics, not an optimization;
 - without acceptance counts, the state is stored once after the token loop, to
@@ -114,7 +121,13 @@ def tilelang_ssu_packed_varlen(
     heads = T.dynamic("heads")
     groups = T.dynamic("groups")
     slots = T.dynamic("slots")
-    max_steps = T.dynamic("max_steps")
+    # Each slot table is a flat buffer addressed by two strides the caller passes,
+    # not by a declared shape: Triton reaches a flat table by unsqueezing it to
+    # [rows, 1], which makes both strides 1, and that is the form vLLM's MTP call
+    # hands over. The two tables may have different lengths, so each one gets its own
+    # extent symbol for the declaration and an integer argument for the bounds check.
+    src_elems = T.dynamic("src_elems")
+    dst_elems = T.dynamic("dst_elems")
     # The query-start metadata is declared with its own dynamic length rather than
     # `batch + 1`: the arithmetic relation is a caller contract the launcher checks
     # on the shapes, and keeping every axis an independent dynamic symbol avoids
@@ -137,8 +150,14 @@ def tilelang_ssu_packed_varlen(
         Dv: T.Tensor((heads, d_dim), "float32"),
         dt_bias: T.Tensor((heads, b_dim), "float32"),
         z: T.Tensor((rows, heads, dim), io_dtype),
-        src_slots: T.Tensor((batch, max_steps), slot_dtype),
-        dst_slots: T.Tensor((batch, max_steps), slot_dtype),
+        src_slots: T.Tensor((src_elems,), slot_dtype),
+        src_seq_stride: T.int32,
+        src_step_stride: T.int32,
+        src_length: T.int32,
+        dst_slots: T.Tensor((dst_elems,), slot_dtype),
+        dst_seq_stride: T.int32,
+        dst_step_stride: T.int32,
+        dst_length: T.int32,
         cu_seqlens: T.Tensor((meta_rows,), meta_dtype),
         num_accepted: T.Tensor((batch,), meta_dtype),
         out: T.Tensor((rows, heads, dim), io_dtype),
@@ -178,6 +197,7 @@ def tilelang_ssu_packed_varlen(
             seed = T.alloc_var("int32")
             src = T.alloc_var("int32")
             dst = T.alloc_var("int32")
+            slot_index = T.alloc_var("int32")
             token_dst = T.alloc_var("int32")
 
             if d < dim:
@@ -196,18 +216,30 @@ def tilelang_ssu_packed_varlen(
                         # accepted" sentinel.
                         seed = T.max(T.cast(num_accepted[batch_idx], "int32") - 1, 0)
 
-                    # Branch around the table read instead of selecting: a select
-                    # evaluates both sides, so the never-taken side would still form
-                    # the (possibly out-of-range) address. Out-of-contract callers
-                    # pass a table narrower than their longest sequence; reading past
-                    # it is a memory fault with bounds checks off, so a slot that has
-                    # no column reads as "no state" instead.
+                    # The table is addressed by strides rather than by a shape: this
+                    # sequence's starting position is entry
+                    # ``batch_idx * seq_stride + seed * step_stride``. vLLM's MTP call
+                    # passes a flat [rows] table, whose strides are both 1 (that is
+                    # what Triton's unsqueeze(1) produces), so the entry is simply
+                    # ``row + seed`` -- and with one sequence in the batch, the
+                    # accepted position itself.
+                    #
+                    # Branch around the read instead of selecting: a select evaluates
+                    # both sides, so the never-taken side would still form the
+                    # (possibly out-of-range) address. A caller can pass a table that
+                    # does not cover every (sequence, position) pair; reading past it
+                    # is a memory fault with bounds checks off, so a slot with no
+                    # entry reads as "no state" instead.
                     src = pad_slot_id
-                    if seed < max_steps:
-                        src = T.cast(src_slots[batch_idx, seed], "int32")
+                    slot_index = batch_idx * src_seq_stride + seed * src_step_stride
+                    if slot_index < src_length:
+                        src = T.cast(src_slots[slot_index], "int32")
 
                     if use_dst_table == 1:
-                        dst = T.cast(dst_slots[batch_idx, 0], "int32")
+                        dst = pad_slot_id
+                        slot_index = batch_idx * dst_seq_stride
+                        if slot_index < dst_length:
+                            dst = T.cast(dst_slots[slot_index], "int32")
                     else:
                         # No destination table: the state stays where it was read
                         # from. For a single token per sequence that is the
@@ -266,16 +298,26 @@ def tilelang_ssu_packed_varlen(
 
                         if use_accepted == 1:
                             # Every token publishes its own state slot, so the next
-                            # call can resume from the accepted position. A table
-                            # narrower than the sequence stores nothing past its last
-                            # column rather than writing an unrelated slot.
-                            token_dst = src
+                            # call can resume from the accepted position. With no
+                            # destination table the target is the read table itself,
+                            # which is the default the Triton kernel applies when it
+                            # aliases ``dst_state_batch_indices`` onto
+                            # ``state_batch_indices``. A table that does not cover the
+                            # position stores nothing rather than writing an unrelated
+                            # slot.
+                            token_dst = pad_slot_id
                             if use_dst_table == 1:
-                                token_dst = pad_slot_id
-                                if i_t < max_steps:
-                                    token_dst = T.cast(
-                                        dst_slots[batch_idx, i_t], "int32"
-                                    )
+                                slot_index = (
+                                    batch_idx * dst_seq_stride + i_t * dst_step_stride
+                                )
+                                if slot_index < dst_length:
+                                    token_dst = T.cast(dst_slots[slot_index], "int32")
+                            else:
+                                slot_index = (
+                                    batch_idx * src_seq_stride + i_t * src_step_stride
+                                )
+                                if slot_index < src_length:
+                                    token_dst = T.cast(src_slots[slot_index], "int32")
                             if write_state == 1 and token_dst != pad_slot_id:
                                 for i in T.vectorized(vec):
                                     state[token_dst, head, d, lane * vec + i] = T.cast(
@@ -357,16 +399,21 @@ def _validate_launch(
         raise RuntimeError("A must be fp32 for the native SSU kernel.")
     if B.shape[1] == 0 or state.shape[1] % B.shape[1] != 0:
         raise RuntimeError("B/C groups must divide heads for the native SSU kernel.")
-    if src_slots.dim() != 2:
+    # The tables are flat buffers plus two caller-supplied strides, so a 1-D table
+    # carries no sequence count and cannot be checked against the batch: the split
+    # comes from cu_seqlens, and how far a read or a store reaches is bounded by the
+    # table's own length in the kernel.
+    for name, tensor in (("src_slots", src_slots), ("dst_slots", dst_slots)):
+        if tensor is not None and tensor.dim() not in (1, 2):
+            raise RuntimeError(
+                f"{name} must be the flat [rows] or the 2-D [sequences, steps] slot "
+                f"table; got {tuple(tensor.shape)}."
+            )
+    batch = cu_seqlens.numel() - 1
+    if batch < 1:
         raise RuntimeError(
-            "src_slots must be the 2-D [sequences, steps] slot table for the "
-            f"packed SSU kernel; got {tuple(src_slots.shape)}."
-        )
-    batch = src_slots.shape[0]
-    if dst_slots is not None and dst_slots.shape != src_slots.shape:
-        raise RuntimeError(
-            "src_slots and dst_slots must be one [sequences, steps] table each; got "
-            f"{tuple(src_slots.shape)} and {tuple(dst_slots.shape)}."
+            "cu_seqlens must hold one start per sequence plus the total; got "
+            f"{cu_seqlens.numel()} entries."
         )
     if cu_seqlens.numel() != batch + 1:
         raise RuntimeError(
@@ -505,7 +552,11 @@ def ssu_packed_launch(
     dt_bias: torch.Tensor | None,
     z: torch.Tensor | None,
     src_slots: torch.Tensor,
+    src_seq_stride: int,
+    src_step_stride: int,
     dst_slots: torch.Tensor | None,
+    dst_seq_stride: int,
+    dst_step_stride: int,
     cu_seqlens: torch.Tensor,
     num_accepted: torch.Tensor | None,
     out: torch.Tensor,
@@ -520,7 +571,10 @@ def ssu_packed_launch(
 
     ``mate.mamba.selective_state_update`` has already validated the contract:
     packed rows, per-head (tied) ``A``/``D``/``dt_bias`` in fp32, per-head ``dt``,
-    contiguous rows, and a 2-D ``[sequences, steps]`` slot table per side.
+    contiguous rows, and a flat or 2-D slot table per side. The two strides say how
+    the kernel reaches sequence ``b``'s position ``t`` in each table: from vLLM's
+    flat ``state_batch_indices`` it is entry ``b + t`` (strides 1 and 1), from a
+    contiguous 2-D ``[sequences, steps]`` table it is ``b * steps + t``.
     """
     heads, dim = x.shape[1], x.shape[2]
     slots, state_heads, state_dim, dstate = state.shape
@@ -557,7 +611,7 @@ def ssu_packed_launch(
     if dt_bias is not None:
         dt_bias = dt_bias.reshape(heads, _channel_dim(dt_bias, dim)).contiguous()
 
-    batch = src_slots.shape[0]
+    batch = cu_seqlens.numel() - 1
     kernel = _kernel_for(
         state,
         x,
@@ -587,9 +641,15 @@ def ssu_packed_launch(
         else _dummy((heads, _channel_dim(dt_bias, dim)), torch.float32, x.device),
         z if z is not None else _dummy((x.shape[0], heads, dim), x.dtype, x.device),
         src_slots,
+        int(src_seq_stride),
+        int(src_step_stride),
+        int(src_slots.numel()),
         dst_slots
         if dst_slots is not None
         else _dummy(tuple(src_slots.shape), src_slots.dtype, x.device),
+        int(dst_seq_stride),
+        int(dst_step_stride),
+        int(src_slots.numel()) if dst_slots is None else int(dst_slots.numel()),
         cu_seqlens,
         num_accepted
         if num_accepted is not None

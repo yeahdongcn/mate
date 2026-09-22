@@ -162,37 +162,34 @@ def _slot_vector(
 
 def _slot_table(
     indices: torch.Tensor | None,
-    sequences: int,
     *,
     name: str,
-) -> torch.Tensor | None:
-    """The packed path's ``[sequences, steps]`` slot table, or ``None``.
+) -> tuple[torch.Tensor, int, int] | None:
+    """Flatten a slot table and say how the packed kernel must address it.
 
-    The consumers pass a vector when a call carries one slot per sequence; widening
-    it to one column is a view, and the packed kernel then reads column 0 -- which is
-    the only column a one-token-per-sequence call has.
+    The kernel reads entry ``sequence * seq_stride + position * step_stride``, which
+    is how the Triton kernel addresses these tensors: it reaches a flat table by
+    unsqueezing it to ``[rows, 1]``, so both of its strides are 1 and sequence ``b``'s
+    position ``t`` is entry ``b + t``. vLLM's MTP6 call passes exactly that form --
+    ``state_batch_indices`` and ``dst_state_batch_indices`` are ``[rows]``, one entry
+    per packed row -- while a contiguous 2-D ``[sequences, steps]`` table keeps
+    strides ``(steps, 1)``. Only the addressing differs: with one sequence per call
+    the two forms name the same entries.
     """
     if indices is None:
         return None
     if indices.dtype not in _SUPPORTED_SLOT_DTYPES:
         raise ValueError(f"{name} must be int32 or int64, got {indices.dtype}.")
-    if indices.dim() == 1:
-        if indices.shape[0] != sequences:
-            raise ValueError(
-                f"{name} must hold one entry per sequence ({sequences}), got "
-                f"{indices.shape[0]}."
-            )
-        return indices.contiguous().reshape(sequences, 1)
-    if indices.dim() == 2:
-        if indices.shape[0] != sequences:
-            raise ValueError(
-                f"{name} must hold one row per sequence ({sequences}), got "
-                f"{tuple(indices.shape)}."
-            )
-        return indices.contiguous()
+    table = indices.contiguous()
+    if table.dim() == 1:
+        return table, 1, 1
+    if table.dim() == 2:
+        # Contiguous here, so the strides are the row length and 1 by construction;
+        # asking the tensor keeps the two in step if that ever changes.
+        return table.reshape(-1), table.stride(0), table.stride(1)
     raise ValueError(
-        f"{name} must be [sequences] or [sequences, steps]; got "
-        f"{tuple(indices.shape)}."
+        f"{name} must be the flat [rows] or the 2-D [sequences, steps] slot table; "
+        f"got {tuple(indices.shape)}."
     )
 
 
@@ -298,14 +295,22 @@ def _packed_selective_state_update(
     copies a scalar back to the host, so a captured decode step can replay it.
     """
     rows = x.shape[0]
-    # How many sequences the call describes: whichever metadata the caller supplied
-    # has to agree on it, and the shape checks below are what enforce that.
-    if state_batch_indices is not None:
+    # How many sequences the call describes. The row split answers this whenever
+    # cu_seqlens is present, which does not depend on the slot tables at all -- and a
+    # flat table carries one entry per packed row, not one per sequence, so its length
+    # cannot answer it. Acceptance counts are one per sequence, and a 2-D table has a
+    # row per sequence.
+    if cu_seqlens is not None:
+        sequences = int(cu_seqlens.numel()) - 1
+    elif num_accepted_tokens is not None:
+        sequences = int(num_accepted_tokens.numel())
+    elif state_batch_indices is not None:
+        # A flat table only reaches here without cu_seqlens, and then a row is a
+        # sequence, so either form has one entry per sequence: the row split below
+        # requires exactly that.
         sequences = int(state_batch_indices.shape[0])
     elif dst_state_batch_indices is not None:
         sequences = int(dst_state_batch_indices.shape[0])
-    elif cu_seqlens is not None:
-        sequences = int(cu_seqlens.numel()) - 1
     else:
         raise ValueError(
             "a packed multi-token call must carry per-sequence metadata: "
@@ -324,24 +329,15 @@ def _packed_selective_state_update(
                 f"num_accepted_tokens must be int32 or int64, got "
                 f"{num_accepted_tokens.dtype}."
             )
-        # The Triton kernel asserts the same two things: an acceptance count picks a
-        # column of the read table, and every speculative position owns a column of
-        # the destination table, so a one-entry-per-sequence vector cannot carry the
-        # call. Reading column 0 instead would decode from the wrong state.
+        # The Triton launcher asserts the same thing: an acceptance count picks an
+        # entry of the read table, so without that table there is nothing to pick it
+        # from. The table itself may be flat or 2-D -- the count is an index, not a
+        # shape requirement -- and vLLM's MTP6 call passes the flat form.
         if state_batch_indices is None:
             raise ValueError(
                 "num_accepted_tokens selects the read slot, so it needs "
-                "state_batch_indices as the 2-D [sequences, steps] table."
+                "state_batch_indices to read it from."
             )
-        for name, indices in (
-            ("state_batch_indices", state_batch_indices),
-            ("dst_state_batch_indices", dst_state_batch_indices),
-        ):
-            if indices is not None and indices.dim() != 2:
-                raise ValueError(
-                    f"{name} must be the 2-D [sequences, steps] table when "
-                    f"num_accepted_tokens is given; got {tuple(indices.shape)}."
-                )
         if cu_seqlens is not None and num_accepted_tokens.dtype != cu_seqlens.dtype:
             raise ValueError(
                 "cu_seqlens and num_accepted_tokens must share a dtype for the packed "
@@ -365,15 +361,20 @@ def _packed_selective_state_update(
     if cu_seqlens.dtype not in _SUPPORTED_SLOT_DTYPES:
         raise ValueError(f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}.")
 
-    src_table = _slot_table(state_batch_indices, sequences, name="state_batch_indices")
+    src_table = _slot_table(state_batch_indices, name="state_batch_indices")
     if src_table is None:
         # With no slot table the state coordinate is the sequence's own row, which is
-        # what the Triton kernel uses when HAS_STATE_BATCH_INDICES is false.
-        src_table = torch.arange(sequences, dtype=_SEQ_DTYPE, device=x.device).reshape(
-            sequences, 1
+        # what the Triton kernel uses when HAS_STATE_BATCH_INDICES is false: one slot
+        # per sequence, so stride 1 with a single position.
+        src_table = (
+            torch.arange(sequences, dtype=_SEQ_DTYPE, device=x.device),
+            1,
+            1,
         )
-    dst_table = _slot_table(
-        dst_state_batch_indices, sequences, name="dst_state_batch_indices"
+    dst_table = _slot_table(dst_state_batch_indices, name="dst_state_batch_indices")
+    src_slots, src_seq_stride, src_step_stride = src_table
+    dst_slots, dst_seq_stride, dst_step_stride = (
+        (None, 0, 0) if dst_table is None else dst_table
     )
 
     return _ssu_packed_launch()(
@@ -386,8 +387,12 @@ def _packed_selective_state_update(
         d_head,
         bias_head,
         z,
-        src_table,
-        dst_table,
+        src_slots,
+        src_seq_stride,
+        src_step_stride,
+        dst_slots,
+        dst_seq_stride,
+        dst_step_stride,
         cu_seqlens.contiguous(),
         None if num_accepted_tokens is None else num_accepted_tokens.contiguous(),
         out,

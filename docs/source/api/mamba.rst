@@ -71,6 +71,29 @@ Speculative decoding (MTP) example, ``batch`` sequences of ``steps`` tokens:
        pad_slot_id=0,
    )
 
+vLLM's MTP6 decode passes the slot tables **flat** instead: one entry per packed
+row, which the Triton kernel addresses by unsqueezing to ``[rows, 1]``. Both
+forms are accepted, and with one sequence per call they name the same entries:
+
+.. code-block:: python
+
+   rows = 7
+   slots = torch.arange(rows, device="musa", dtype=torch.int32)
+   y = selective_state_update(
+       state,
+       x,
+       dt,
+       A,
+       B,
+       C,
+       None,
+       state_batch_indices=slots,
+       dst_state_batch_indices=slots,
+       num_accepted_tokens=torch.tensor([1], device="musa", dtype=torch.int32),
+       cu_seqlens=torch.tensor([0, rows], device="musa", dtype=torch.int32),
+       pad_slot_id=0,
+   )
+
 SSU at a glance
 ---------------
 
@@ -101,14 +124,19 @@ SSU at a glance
    * - ``dt_softplus``
      - supported
    * - Slot semantics
-     - ``pad_slot_id`` reads as a zero state and is never written;
-       ``disable_state_update`` leaves the pool unchanged
+     - ``state_batch_indices`` and ``dst_state_batch_indices`` may be the flat
+       ``[rows]`` form or the 2-D ``[sequences, steps]`` table; both are addressed
+       by strides, so a flat table puts sequence ``b``'s position ``t`` at entry
+       ``b + t`` and a contiguous 2-D table at ``b * steps + t``. ``pad_slot_id``
+       reads as a zero state and is never written; ``disable_state_update`` leaves
+       the pool unchanged
    * - Variable-length and MTP decode
      - supported: ``cu_seqlens`` splits the packed rows between sequences and
        ``num_accepted_tokens`` seeds each sequence's read slot at ``count - 1``
-       (floored at 0), with one destination slot per speculative position written
-       as the chain advances. ``pad_slot_id`` destinations are never written; empty
-       sequences are skipped
+       (floored at 0). Every token then publishes its state to its own destination
+       entry — or to its own entry of the read table when no destination table is
+       given, the default the Triton kernel applies. ``pad_slot_id`` destinations
+       are never written; empty sequences are skipped
    * - Stochastic rounding
      - not implemented; ``rand_seed`` raises ``NotImplementedError``
 

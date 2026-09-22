@@ -5,7 +5,8 @@ tokens per sequence in one call, one destination state slot per speculative
 position, and a read slot seeded by the acceptance count. These tests compare it
 against ``mate.mamba_kernels.reference`` over the call shapes the serving path can
 produce -- tokens per sequence 1..7, batch 1/2/8, every acceptance count in
-``0..T``, shared and distinct slot tables, and null block entries on either side.
+``0..T``, shared and distinct slot tables, the flat ``[rows]`` tables vLLM's MTP6
+call passes, and null block entries on either side.
 
 The comparison is per element and against the oracle rather than against recorded
 numbers, because a state that is merely *close* is a behaviour change here: under
@@ -60,6 +61,7 @@ def _case(
     null_dst: tuple[tuple[int, int], ...] = (),
     dense: bool = False,
     disable_state_update: bool = False,
+    flat: bool = False,
     device: torch.device | None = None,
 ) -> dict[str, object]:
     """Build one packed decode call plus the oracle's description of the same call.
@@ -67,7 +69,12 @@ def _case(
     Every ``(sequence, step)`` pair owns its own slot row, so a write to the wrong
     slot shows up as a large difference instead of a coincidence. ``null_src`` and
     ``null_dst`` poke the sentinel into chosen table entries. ``dense`` describes the
-    same call through the 4-D ``[batch, steps, heads, dim]`` layout.
+    same call through the 4-D ``[batch, steps, heads, dim]`` layout, and ``flat``
+    describes it the way vLLM's MTP6 call does: one 1-D table with an entry per packed
+    row, addressed as ``sequence + step``. A flat table only names every
+    ``(sequence, step)`` pair separately when there is one sequence, so flat cases
+    with several multi-token sequences are left to the non-spec regime, where only
+    entry ``sequence`` is touched.
     """
     device = _device() if device is None else device
     # A CPU generator keeps the inputs of a case identical across runs, devices and
@@ -76,7 +83,9 @@ def _case(
     batch = len(steps)
     rows = sum(steps)
     width = max(steps)
-    slot_rows = 1 + 2 * batch * width  # row 0 stays the sentinel
+    # Row 0 stays the sentinel; a flat table needs one entry per packed row, a 2-D
+    # table one per (sequence, step) pair.
+    slot_rows = 1 + 2 * (rows if flat else batch * width)
 
     def _rand(*shape: int) -> torch.Tensor:
         return torch.randn(*shape, dtype=torch.float32, generator=generator).to(device)
@@ -95,24 +104,32 @@ def _case(
     dt_bias = _rand(heads, 1) * 0.1
     z = _rand(rows, heads, dim).to(IO_DTYPE)
 
-    src_slots = (
-        torch.arange(1, 1 + batch * width, dtype=torch.int32, device=device)
-        .reshape(batch, width)
-        .contiguous()
-    )
+    table_elems = rows if flat else batch * width
+    src_slots = torch.arange(1, 1 + table_elems, dtype=torch.int32, device=device)
     dst_slots = (
         src_slots.clone()
         if same_slots
         else torch.arange(
-            1 + batch * width, 1 + 2 * batch * width, dtype=torch.int32, device=device
+            1 + table_elems, 1 + 2 * table_elems, dtype=torch.int32, device=device
         )
-        .reshape(batch, width)
-        .contiguous()
     )
-    for sequence, step in null_src:
-        src_slots[sequence, step] = PAD
-    for sequence, step in null_dst:
-        dst_slots[sequence, step] = PAD
+    if not flat:
+        src_slots = src_slots.reshape(batch, width).contiguous()
+        dst_slots = dst_slots.reshape(batch, width).contiguous()
+
+    def _poke(table: torch.Tensor, entries: tuple[tuple[int, int], ...]) -> None:
+        for sequence, step in entries:
+            if flat:
+                # A flat table is addressed by position: both coordinates select one
+                # entry, which is why a flat multi-sequence table has to stay out of
+                # the spec regime -- sequence 1's first token and sequence 0's second
+                # would be the same slot.
+                table[sequence + step] = PAD
+            else:
+                table[sequence, step] = PAD
+
+    _poke(src_slots, null_src)
+    _poke(dst_slots, null_dst)
 
     return {
         "state": state,
@@ -346,6 +363,79 @@ def test_production_shape_matches_reference():
 
 @supported_musa_compute_capability([31])
 @torch.inference_mode
+@pytest.mark.parametrize("identical", [True, False])
+@pytest.mark.parametrize("accepted", range(1, 8))
+def test_flat_production_slot_tables_match_reference(accepted, identical):
+    """The call ``--mamba-backend flashinfer`` dies on today: vLLM's MTP6 decode.
+
+    ``mamba_mixer2`` passes ``x``/``dt``/``out`` of ``[total_tokens, heads, dim]``,
+    flat 1-D ``state_batch_indices``/``dst_state_batch_indices``, an acceptance count
+    and ``query_start_loc`` for one sequence of seven tokens at ``--max-num-seqs 1``.
+    The tables carry one entry per packed row, so the accepted position is entry
+    ``accepted - 1`` and token ``t`` publishes to entry ``t`` -- reading a 2-D table's
+    ``[sequence, step]`` instead would decode from the wrong state, and refusing the
+    flat form at all is what kept this configuration from starting.
+    """
+    case = _case([7], accepted=[accepted], flat=True)
+    if identical:
+        # The mixer hands the same table over as both source and destination when
+        # prefix caching is off, so the chain moves forward in place.
+        case["dst_slots"] = case["src_slots"]
+    _compare(case)
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+@pytest.mark.parametrize("batch", [1, 2, 8])
+@pytest.mark.parametrize("steps", [1, 3, 7])
+def test_flat_slot_tables_carry_the_plain_packed_call(batch, steps):
+    """Without acceptance counts a flat table is one entry per sequence.
+
+    Only entry ``sequence`` is read and written, so several multi-token sequences
+    stay distinguishable -- which pins the sequence stride of the flat addressing.
+    """
+    _compare(_case([steps] * batch, flat=True))
+    _compare(_case([steps] * batch, same_slots=True, flat=True))
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+@pytest.mark.parametrize("null_entries", [((0, 0),), ((0, 6),)])
+def test_null_entries_in_flat_slot_tables_match_reference(null_entries):
+    """The sentinel reads as a zero state and is never written, in the flat form too."""
+    _compare(
+        _case(
+            [7],
+            accepted=[1],
+            flat=True,
+            null_src=null_entries,
+            null_dst=null_entries,
+        )
+    )
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+@pytest.mark.parametrize("flat", [True, False])
+def test_absent_destination_table_publishes_to_the_read_table(flat):
+    """With no destination table Triton aliases the read table onto the write side.
+
+    Every token then publishes to its own entry of that table rather than to the slot
+    the sequence started from, which is the behaviour to match: the read slot is only
+    the *initial* state.
+    """
+    case = _case([4], accepted=[2], flat=flat)
+    case["dst_slots"] = None
+    expected_state = case["state"].clone()
+    _run_reference(case, state=expected_state)
+    # Entries 0 and 1 are the ones the accepted position and the token loop reach, so
+    # a store that ignored the table would leave them at their initial values.
+    assert not torch.equal(expected_state[1:3], case["state"][1:3])
+    _compare(case)
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
 def test_disable_state_update_keeps_the_packed_pool():
     case = _case([3, 3], accepted=[2, 3], disable_state_update=True)
     original = case["state"].clone()
@@ -454,13 +544,6 @@ def test_packed_contract_is_validated_before_the_kernel():
     they cost nothing and they pin the errors a caller sees. The Triton kernel
     asserts the first two of them as well.
     """
-    # One acceptance count selects a column of the read table, and every speculative
-    # position owns a column of the destination table: a vector cannot carry it.
-    flat_tables = _case([2, 2], accepted=[1, 1], device=torch.device("cpu"))
-    flat_tables["src_slots"] = flat_tables["src_slots"].reshape(-1)
-    with pytest.raises(ValueError, match="2-D"):
-        _run_kernel(flat_tables)
-
     # A packed multi-token call with neither query starts nor a table that describes
     # the row split cannot be decoded.
     without_starts = _case([2, 2], device=torch.device("cpu"))
@@ -468,8 +551,36 @@ def test_packed_contract_is_validated_before_the_kernel():
     with pytest.raises(ValueError, match="cu_seqlens"):
         _run_kernel(without_starts)
 
-    # Acceptance needs a read mechanism, and that mechanism is the table's column.
+    # Acceptance needs a read mechanism, and that mechanism is the read table.
     without_table = _case([2, 2], accepted=[1, 1], device=torch.device("cpu"))
     without_table["src_slots"] = None
     with pytest.raises(ValueError, match="state_batch_indices"):
         _run_kernel(without_table)
+
+
+def test_flat_slot_tables_are_normalized_rather_than_refused():
+    """The tables are addressed by strides, so a 1-D table is a call, not an error.
+
+    The serving path passes flat tables together with an acceptance count, and the
+    kernel reaches position ``t`` of sequence ``b`` at entry ``b + t``: the strides the
+    normalizer hands over are what say so. A 2-D table keeps its own row stride, so the
+    two forms only differ in addressing -- with one sequence they name the same entries.
+    """
+    flat = torch.tensor([3, 4, 5, 6, 7, 8, 9], dtype=torch.int32)
+    table, seq_stride, step_stride = mate.mamba._slot_table(
+        flat, name="state_batch_indices"
+    )
+    assert table.data_ptr() == flat.data_ptr(), "the flat table was copied"
+    assert (seq_stride, step_stride) == (1, 1)
+
+    wide = torch.arange(6, dtype=torch.int32).reshape(2, 3)
+    table, seq_stride, step_stride = mate.mamba._slot_table(
+        wide, name="state_batch_indices"
+    )
+    assert table.shape == (6,)
+    assert (seq_stride, step_stride) == (3, 1)
+
+    with pytest.raises(ValueError, match="flat"):
+        mate.mamba._slot_table(
+            torch.zeros(2, 2, 2, dtype=torch.int32), name="state_batch_indices"
+        )
