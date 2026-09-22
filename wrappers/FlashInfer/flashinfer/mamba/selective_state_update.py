@@ -177,6 +177,14 @@ def selective_state_update(
     D = _per_head_fp32(D)
     dt_bias = _per_head_fp32(dt_bias)
     x = _materialized(x)
+    # B and C come from splitting the mixer's fused B_C projection. A plain decode step
+    # passes a one-row slice, which the reshape leaves packed; a speculative step passes
+    # the multi-token slice, whose rows are separated by the fused width and so violate
+    # the kernel's packed-input ABI ("input B strides[0] violates packed ABI
+    # constraint"). This is the same division of labour as x above: vLLM chooses the
+    # layout, the adapter restores it, and the copy is a no-op when it is already packed.
+    B = _materialized(B)
+    C = _materialized(C)
     dt = _dt_input(dt)
     if hasattr(dt, "is_contiguous") and not dt.is_contiguous():
         # The zero-stride trick only returns a contiguous view when the head stride is
