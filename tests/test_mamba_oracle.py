@@ -216,18 +216,20 @@ def test_flat_slot_tables_are_addressed_by_position() -> None:
     assert torch.equal(state, expected_state)
 
     # A flat destination table is addressed the same way, independently of the read
-    # table: token t writes its own entry.
+    # table: token t writes its own entry. The pool is ``SLOTS`` rows deep, so the
+    # entries have to stay inside it -- an out-of-pool slot is a caller bug, and the
+    # oracle fails loudly on one instead of quietly indexing past the end.
     y, state = _multi(
         pool,
         inp,
         [3],
         [0],
         slots,
-        torch.tensor([10, 11, 12]),
+        torch.tensor([3, 4, 7]),
         accepted=torch.tensor([1]),
     )
     expected_y, expected_state = _sequential(
-        pool, inp, [[(0, 2, 10), (1, 10, 11), (2, 11, 12)]]
+        pool, inp, [[(0, 2, 3), (1, 3, 4), (2, 4, 7)]]
     )
     for row in range(3):
         assert torch.equal(y[row], expected_y[row])
