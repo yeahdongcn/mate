@@ -109,9 +109,17 @@ def _require_aligned(name: str, tensor: torch.Tensor) -> None:
     hold is undefined behaviour, so the alignment the kernel asserts for ``tensor``'s
     outer strides has to be enforced here. A strided input is walked along its last
     axis, so that axis supplies the extent. An axis of extent 1 is exempt: nothing is
-    ever addressed along it, so its stride cannot misalign a row start.
+    ever addressed along it, so its stride cannot misalign a row start. Aligned
+    strides over a misaligned base would still issue misaligned vector loads, so
+    the storage offset is checked too.
     """
     align = _align_elems(tensor.dtype, tensor.shape[-1])
+    if tensor.storage_offset() % align != 0:
+        raise RuntimeError(
+            f"{name} must start at a storage offset that is a multiple of {align} "
+            f"elements ({align * tensor.element_size()}-byte alignment for "
+            f"{tensor.dtype}); got offset {tensor.storage_offset()}."
+        )
     for axis, stride in enumerate(tensor.stride()[:-1]):
         if tensor.shape[axis] != 1 and stride % align != 0:
             raise RuntimeError(
@@ -678,6 +686,13 @@ def ssu_packed_launch(
         raise RuntimeError(
             "z must have a dense dim axis (stride(-1) == 1); its outer axes may be "
             "strided."
+        )
+    if not out.is_contiguous():
+        # The kernel declares out as a dense [batch, heads, dim] store target, so a
+        # strided view would be written at the wrong addresses rather than refused.
+        raise RuntimeError(
+            "out must be contiguous: the SSU kernel writes it as a dense "
+            "[batch, heads, dim] buffer."
         )
     _require_aligned("B", B)
     _require_aligned("C", C)
