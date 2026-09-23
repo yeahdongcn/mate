@@ -105,10 +105,19 @@ def tilelang_ssd_bmm(
     ab_shape = (num_tokens, groups, dstate)
     cb_shape = (nchunks, groups, chunk_size, chunk_size)
 
+    #: ``cmat`` and ``bmat`` are read-only inputs, so they are declared strided: their
+    #: outer axes may be strided views into a larger buffer. The innermost axis (dstate)
+    #: is the one the block loads walk, so it is pinned to stride 1 and the launcher
+    #: enforces it -- the one layout requirement this kernel cannot relax. ``cb`` is the
+    #: output it writes and ``cu_chunk_seqlens`` is caller-built metadata; both are used
+    #: as dense spans, so they stay ``T.Tensor``.
+    cmat_strides = (T.dynamic("cmat_stride_token"), T.dynamic("cmat_stride_group"), 1)
+    bmat_strides = (T.dynamic("bmat_stride_token"), T.dynamic("bmat_stride_group"), 1)
+
     @T.prim_func
     def tilelang_ssd_bmm_kernel(
-        cmat: T.Tensor(ab_shape, dtype=a_dtype),
-        bmat: T.Tensor(ab_shape, dtype=b_dtype),
+        cmat: T.StridedTensor(ab_shape, cmat_strides, a_dtype),
+        bmat: T.StridedTensor(ab_shape, bmat_strides, b_dtype),
         cu_chunk_seqlens: T.Tensor((nchunks + 1,), dtype=seqlen_dtype),
         cb: T.Tensor(cb_shape, dtype=out_dtype),
     ):
@@ -205,8 +214,11 @@ def ssd_bmm_launch(
             f"cmat and bmat must share a shape, got {tuple(cmat.shape)} and "
             f"{tuple(bmat.shape)}."
         )
-    if not cmat.is_contiguous() or not bmat.is_contiguous():
-        raise RuntimeError("cmat and bmat must be contiguous.")
+    if cmat.stride(-1) != 1 or bmat.stride(-1) != 1:
+        raise RuntimeError(
+            "cmat and bmat must have a dense dstate axis (stride(-1) == 1); their "
+            "outer axes may be strided."
+        )
     num_tokens, groups, dstate = cmat.shape
     if groups < 1 or dstate < 1:
         raise RuntimeError("cmat's group and dstate axes must be non-empty.")

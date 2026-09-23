@@ -167,7 +167,9 @@ def _ssu_case(
     }
 
 
-def _ssu_run_kernel(case, *, out=None):
+def _ssu_run_kernel(case, *, out=None, **kwargs):
+    # `kwargs` carry `algorithm`/`backend`, which only the vocabulary tests set: every
+    # other test wants the production call shape, i.e. both left at their defaults.
     return mate.mamba.selective_state_update(
         case["state"],
         case["x"],
@@ -184,6 +186,7 @@ def _ssu_run_kernel(case, *, out=None):
         pad_slot_id=case["pad_slot_id"],
         disable_state_update=case["disable_state_update"],
         out=out,
+        **kwargs,
     )
 
 
@@ -295,7 +298,12 @@ def test_out_buffer_is_written_in_place():
         # A packed call is no longer refused: one sequence of two tokens, which the
         # packed kernel handles (the numeric check lives in the packed MTP
         # section above).
-        ({"cu_seqlens": torch.tensor([0, 2], dtype=torch.int32)}, None),
+        # The metadata tensors live on the device like every other input; a CPU
+        # `cu_seqlens` in an otherwise device-side case fails for the wrong reason.
+        (
+            {"cu_seqlens": torch.tensor([0, 2], dtype=torch.int32, device=_ssu_device())},
+            None,
+        ),
         # vLLM's SSU dispatch forwards the slot-table width as `cache_steps` whenever
         # it passes cu_seqlens, including the plain one-token-per-sequence step. That
         # must keep running -- refusing it would take the whole
@@ -303,7 +311,9 @@ def test_out_buffer_is_written_in_place():
         (
             {
                 "cache_steps": 2,
-                "cu_seqlens": torch.tensor([0, 1, 2], dtype=torch.int32),
+                "cu_seqlens": torch.tensor(
+                    [0, 1, 2], dtype=torch.int32, device=_ssu_device()
+                ),
             },
             None,
         ),
@@ -343,11 +353,60 @@ def test_unsupported_paths_fail_loudly(overrides, message):
         )
 
 
-def test_channel_wise_D_is_reported_as_a_gap():
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_channel_wise_D_is_applied_per_channel():
+    """A per-(head, dim) ``D`` is the shape vLLM's decode step passes, and it is used.
+
+    The fp32 oracle models a per-head ``D`` only, so this is checked in two directions:
+    channels that agree must reproduce the per-head result, and moving one channel must
+    move the output -- a kernel that read a single column would pass the first half alone.
+    """
     case = _ssu_case()
-    channel_D = torch.rand(SSU_HEADS, SSU_DIM, dtype=torch.float32, device=_ssu_device())
-    with pytest.raises(NotImplementedError, match="per-head"):
-        _ssu_run_kernel({**case, "D": channel_D})
+    per_head = case["D"]
+    flat = per_head[:, None].repeat(1, SSU_DIM)
+
+    baseline = _ssu_run_kernel({**case, "D": per_head})
+    broadcast = _ssu_run_kernel({**case, "D": flat})
+    torch.testing.assert_close(broadcast, baseline, rtol=2e-2, atol=2e-2)
+
+    varying = flat.clone()
+    varying[:, -1] += 1.0
+    assert not torch.allclose(_ssu_run_kernel({**case, "D": varying}), baseline)
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssu_algorithm_accepts_the_consumer_vocabulary():
+    """vLLM forwards its ``MambaSSUAlgorithm`` choice; one implementation answers all of it.
+
+    Every value that vocabulary can carry must run and agree, and a value outside it must
+    still fail loudly: the argument is validated, it just does not select a kernel.
+    """
+    baseline = _ssu_run_kernel(_ssu_case())
+    for algorithm in ("auto", "simple", "vertical", "horizontal"):
+        actual = _ssu_run_kernel(_ssu_case(), algorithm=algorithm)
+        torch.testing.assert_close(actual, baseline, rtol=2e-2, atol=2e-2)
+
+    with pytest.raises(ValueError, match="implements"):
+        _ssu_run_kernel(_ssu_case(), algorithm="bogus")
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssu_backend_names_the_implementation():
+    """``tilelang`` names this kernel family; a consumer's dispatch name is not a backend.
+
+    ``--mamba-backend flashinfer`` selects us where vLLM dispatches and never reaches this
+    argument, so accepting ``flashinfer`` here would only hide a wrong call.
+    """
+    baseline = _ssu_run_kernel(_ssu_case())
+    torch.testing.assert_close(
+        _ssu_run_kernel(_ssu_case(), backend="tilelang"), baseline, rtol=2e-2, atol=2e-2
+    )
+    for backend in ("flashinfer", "musa", "native"):
+        with pytest.raises(ValueError, match="accepts backends"):
+            _ssu_run_kernel(_ssu_case(), backend=backend)
 
 
 # ---------------------------------------------------------------------------
@@ -2857,3 +2916,42 @@ def test_workspace_is_reused_across_calls(combined_oracle):
         assert space.dt_out is second[key].dt_out
         assert space.states is second[key].states
         assert space.CB is second[key].CB
+
+
+# ---------------------------------------------------------------------------
+# 7. Device: the SSD prefill BMM kernel's input-layout guarantee
+#
+# Sections 4-6 model the prefill stages on the CPU, and no CPU test can hold a statement
+# about a kernel signature. The BMM is the stage that declares its read-only inputs
+# strided, so it gets the one device test that keeps that declaration honest: the same
+# values must come out of a strided view and its dense copy, and a dstate axis that is
+# not dense must be refused instead of being read as if it were.
+# ---------------------------------------------------------------------------
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssd_bmm_kernel_reads_strided_inputs():
+    launcher = mate.mamba._stage("bmm")
+    chunk, groups, dstate, nchunks = 4, 2, 16, 2
+    tokens = chunk * nchunks
+    device = torch.device("musa")
+    torch.manual_seed(0)
+
+    cu_chunk_seqlens = torch.tensor([0, chunk, tokens], dtype=torch.int32, device=device)
+    wide = torch.randn(tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device)
+    cmat = wide[:, :, :dstate]
+    bmat = wide.flip(-1)[:, :, dstate:]
+    assert cmat.stride(-1) == 1 and not cmat.is_contiguous()
+
+    strided = launcher(cmat, bmat, cu_chunk_seqlens, chunk)
+    dense = launcher(cmat.contiguous(), bmat.contiguous(), cu_chunk_seqlens, chunk)
+    assert torch.equal(strided, dense)
+
+    expected = ssd_bmm_reference(
+        cmat.contiguous(), bmat.contiguous(), cu_chunk_seqlens, chunk
+    )
+    torch.testing.assert_close(strided, expected, rtol=2e-2, atol=2e-2)
+
+    with pytest.raises(RuntimeError, match="dense dstate axis"):
+        launcher(wide[:, :, ::2], bmat, cu_chunk_seqlens, chunk)

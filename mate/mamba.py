@@ -80,8 +80,17 @@ def _ssu_packed_launch():
 _SUPPORTED_STATE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_SLOT_DTYPES = (torch.int32, torch.int64)
-_SUPPORTED_ALGORITHMS = ("auto", "native", "simple")
-_SUPPORTED_BACKENDS = ("auto", "musa", "native", "flashinfer")
+#: The values a consumer can hand us through ``algorithm``: vLLM spells them
+#: ``vllm.config.mamba.MambaSSUAlgorithm`` (``auto``/``simple``/``vertical``/``horizontal``)
+#: and passes its selection straight through. This family implements one algorithm, so
+#: every accepted value runs the same kernels -- ``auto`` included -- and validation only
+#: turns a typo into an error here instead of a silently ignored argument.
+_SUPPORTED_ALGORITHMS = ("auto", "simple", "vertical", "horizontal")
+#: Backend names this family answers to, named by implementation rather than by consumer:
+#: ``tilelang`` is the kernel family under ``mate/mamba_kernels/tilelang``. A consumer's
+#: own backend name is not part of this vocabulary -- vLLM's ``--mamba-backend flashinfer``
+#: selects us where it dispatches and never reaches this argument.
+_SUPPORTED_BACKENDS = ("auto", "tilelang")
 _DEFAULT_LANES_PER_ROW = 32
 _DEFAULT_ROWS_PER_CTA = 4
 
