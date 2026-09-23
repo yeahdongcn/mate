@@ -366,13 +366,16 @@ def test_channel_wise_D_is_applied_per_channel():
     per_head = case["D"]
     flat = per_head[:, None].repeat(1, SSU_DIM)
 
+    # One case per run: the call updates the destination slots of `state` in place, so a
+    # reused case would hand the next call an already-updated state.
     baseline = _ssu_run_kernel({**case, "D": per_head})
-    broadcast = _ssu_run_kernel({**case, "D": flat})
+    broadcast = _ssu_run_kernel({**_ssu_case(), "D": flat})
     torch.testing.assert_close(broadcast, baseline, rtol=2e-2, atol=2e-2)
 
     varying = flat.clone()
     varying[:, -1] += 1.0
-    assert not torch.allclose(_ssu_run_kernel({**case, "D": varying}), baseline)
+    moved = _ssu_run_kernel({**_ssu_case(), "D": varying})
+    assert not torch.allclose(moved, baseline)
 
 
 @supported_musa_compute_capability([31])
