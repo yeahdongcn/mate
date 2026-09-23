@@ -141,7 +141,8 @@ def tilelang_ssd_chunk_cumsum(
     #: carries the literal stride the kernel reads them with. ``dA_cumsum`` and
     #: ``dt_out`` are written in full and ``cu_chunk_seqlens`` is caller-built
     #: metadata: both stay ``T.Tensor`` as dense spans.
-    dt_strides = (T.dynamic("dt_stride_token"), 1)
+    dt_stride_token = T.dynamic("dt_stride_token")
+    dt_strides = (dt_stride_token, 1)
     dt_align = _align_elems(dt_dtype, heads)
 
     @T.prim_func

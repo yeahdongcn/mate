@@ -158,8 +158,12 @@ def tilelang_ssd_bmm(
     #: enforces it -- the one layout requirement this kernel cannot relax. ``cb`` is the
     #: output it writes and ``cu_chunk_seqlens`` is caller-built metadata; both are used
     #: as dense spans, so they stay ``T.Tensor``.
-    cmat_strides = (T.dynamic("cmat_stride_token"), T.dynamic("cmat_stride_group"), 1)
-    bmat_strides = (T.dynamic("bmat_stride_token"), T.dynamic("bmat_stride_group"), 1)
+    bmat_stride_group = T.dynamic("bmat_stride_group")
+    bmat_stride_token = T.dynamic("bmat_stride_token")
+    cmat_stride_group = T.dynamic("cmat_stride_group")
+    cmat_stride_token = T.dynamic("cmat_stride_token")
+    cmat_strides = (cmat_stride_token, cmat_stride_group, 1)
+    bmat_strides = (bmat_stride_token, bmat_stride_group, 1)
     #: The operand loads walk dstate with a vectorized copy, so every outer stride has
     #: to keep the start of a row aligned to the vector those loads can use. That is
     #: what the ``T.assume`` lines below tell the compiler, and what

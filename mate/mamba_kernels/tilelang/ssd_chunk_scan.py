@@ -154,16 +154,26 @@ def tilelang_ssd_chunk_scan(
     #: ``CB``, ``dt_out``, ``dA_cumsum`` and ``states`` are the dense buffers the
     #: earlier stages write, ``out`` is written in place here, and ``seq_idx`` /
     #: ``cu_chunk_seqlens`` are caller-built metadata: all stay ``T.Tensor``.
-    x_strides = (T.dynamic("x_stride_token"), T.dynamic("x_stride_head"), 1)
-    c_strides = (T.dynamic("c_stride_token"), T.dynamic("c_stride_group"), 1)
+    c_stride_group = T.dynamic("c_stride_group")
+    c_stride_token = T.dynamic("c_stride_token")
+    d_stride_head = T.dynamic("d_stride_head")
+    init_stride_dim = T.dynamic("init_stride_dim")
+    init_stride_head = T.dynamic("init_stride_head")
+    init_stride_seq = T.dynamic("init_stride_seq")
+    x_stride_head = T.dynamic("x_stride_head")
+    x_stride_token = T.dynamic("x_stride_token")
+    z_stride_head = T.dynamic("z_stride_head")
+    z_stride_token = T.dynamic("z_stride_token")
+    x_strides = (x_stride_token, x_stride_head, 1)
+    c_strides = (c_stride_token, c_stride_group, 1)
     init_strides = (
-        T.dynamic("init_stride_seq"),
-        T.dynamic("init_stride_head"),
-        T.dynamic("init_stride_dim"),
+        init_stride_seq,
+        init_stride_head,
+        init_stride_dim,
         1,
     )
-    d_strides = (T.dynamic("d_stride_head"), 1)
-    z_strides = (T.dynamic("z_stride_token"), T.dynamic("z_stride_head"), 1)
+    d_strides = (d_stride_head, 1)
+    z_strides = (z_stride_token, z_stride_head, 1)
     io_align = _align_elems(io_dtype, dim)
     c_align = _align_elems(io_dtype, dstate)
     init_align = _align_elems(state_dtype, dstate)

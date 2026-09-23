@@ -32,6 +32,7 @@ import inspect
 import itertools
 import os
 import pathlib
+import re
 
 import pytest
 import torch
@@ -3240,3 +3241,41 @@ def test_ssu_packed_kernel_reads_strided_operands():
         _mtp_run_kernel(
             dict(case, state=case["state"].clone(), C=odd[:, :, :MTP_DSTATE])
         )
+
+
+# ---------------------------------------------------------------------------
+# 9. Source: every name a ``T.assume`` hints is bound where the kernel is built
+# ---------------------------------------------------------------------------
+# A ``T.assume`` line is ordinary Python, evaluated while the kernel factory assembles the
+# prim_func. A stride symbol that was only ever written inline inside a declaration -
+# ``T.dynamic("x_stride_token")`` inside the ``T.StridedTensor`` strides tuple, never bound to
+# a name - raises ``NameError`` at build time: after the launcher's shape checks have passed,
+# before a single element is computed, and with no device-side diagnostic. In serving that is
+# an engine that cannot start, which is how this one was found: the declarations were only
+# exercised on a device once the hints had been added. The device tests above catch it too,
+# but only where a MUSA device exists, so this checks the sources instead.
+def test_every_assumed_stride_symbol_is_bound():
+    """No ``T.assume`` may name an identifier its module never binds."""
+    kernel_dir = pathlib.Path(mate.mamba.__file__).parent / "mamba_kernels" / "tilelang"
+    assert kernel_dir.is_dir(), kernel_dir
+    checked = 0
+    for source in sorted(kernel_dir.glob("*.py")):
+        text = source.read_text()
+        hints = re.findall(r"T\.assume\(([^)]*)\)", text)
+        if not hints:
+            continue
+        bound = set(re.findall(r"^\s*(\w+)\s*=", text, re.M))
+        bound |= set(re.findall(r"\bfor\s+(\w+)\s+in\b", text))
+        bound |= set(re.findall(r"^\s*import\s+(\w+)", text, re.M))
+        for names in re.findall(r"^\s*from\s+\S+\s+import\s+([\w,\s]+)", text, re.M):
+            bound |= {n.strip() for n in names.split(",") if n.strip()}
+        for hint in hints:
+            for name in re.findall(r"\b([A-Za-z_]\w*)\b", hint):
+                if name in {"T", "if", "else", "and", "or", "not", "in", "is"}:
+                    continue
+                assert name in bound, (
+                    f"{source.name}: T.assume names {name!r} in {hint.strip()!r}, "
+                    "but that module never binds it"
+                )
+        checked += 1
+    assert checked >= 7, f"only {checked} kernel modules declare T.assume hints"

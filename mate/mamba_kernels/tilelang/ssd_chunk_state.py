@@ -159,8 +159,12 @@ def tilelang_ssd_chunk_state(
     #: cumsum stage and read here as dense spans, ``states`` is written in full by
     #: this kernel, and ``cu_chunk_seqlens`` is caller-built metadata: all stay
     #: ``T.Tensor``.
-    x_strides = (T.dynamic("x_stride_token"), T.dynamic("x_stride_head"), 1)
-    b_strides = (T.dynamic("b_stride_token"), T.dynamic("b_stride_group"), 1)
+    b_stride_group = T.dynamic("b_stride_group")
+    b_stride_token = T.dynamic("b_stride_token")
+    x_stride_head = T.dynamic("x_stride_head")
+    x_stride_token = T.dynamic("x_stride_token")
+    x_strides = (x_stride_token, x_stride_head, 1)
+    b_strides = (b_stride_token, b_stride_group, 1)
     x_align = _align_elems(x_dtype, dim)
     b_align = _align_elems(b_dtype, dstate)
 

@@ -157,10 +157,14 @@ def tilelang_ssu_one_token(
     #: pool update, ``A``/``Dv``/``dt_bias`` are the per-head matrices this launcher
     #: materializes itself, ``src_slots``/``dst_slots`` are caller-built metadata and
     #: ``out`` is the store target: all stay dense ``T.Tensor``.
+    b_stride_batch = T.dynamic("b_stride_batch")
+    b_stride_group = T.dynamic("b_stride_group")
+    c_stride_batch = T.dynamic("c_stride_batch")
+    c_stride_group = T.dynamic("c_stride_group")
     x_strides = (T.dynamic("x_stride_batch"), T.dynamic("x_stride_head"), 1)
     dt_strides = (T.dynamic("dt_stride_batch"), T.dynamic("dt_stride_head"), 1)
-    b_strides = (T.dynamic("b_stride_batch"), T.dynamic("b_stride_group"), 1)
-    c_strides = (T.dynamic("c_stride_batch"), T.dynamic("c_stride_group"), 1)
+    b_strides = (b_stride_batch, b_stride_group, 1)
+    c_strides = (c_stride_batch, c_stride_group, 1)
     z_strides = (T.dynamic("z_stride_batch"), T.dynamic("z_stride_head"), 1)
     io_align = _align_elems(io_dtype, dstate)
 

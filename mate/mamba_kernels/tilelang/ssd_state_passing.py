@@ -167,10 +167,13 @@ def tilelang_ssd_state_passing(
     #: written in place (``out`` defaults to it), ``out`` is the store target,
     #: ``dA_cumsum`` is the cumsum stage's dense output and ``last_chunk_indices`` /
     #: ``seq_idx`` are caller-built metadata: all stay ``T.Tensor`` as dense spans.
+    init_stride_dim = T.dynamic("init_stride_dim")
+    init_stride_head = T.dynamic("init_stride_head")
+    init_stride_seq = T.dynamic("init_stride_seq")
     init_strides = (
-        T.dynamic("init_stride_seq"),
-        T.dynamic("init_stride_head"),
-        T.dynamic("init_stride_dim"),
+        init_stride_seq,
+        init_stride_head,
+        init_stride_dim,
         1,
     )
     init_align = _align_elems(init_dtype, dstate)

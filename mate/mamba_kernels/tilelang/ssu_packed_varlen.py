@@ -195,10 +195,14 @@ def tilelang_ssu_packed_varlen(
     #: update, ``A``/``Dv``/``dt_bias`` are the per-head matrices this launcher
     #: materializes itself, the slot tables plus ``cu_seqlens``/``num_accepted`` are
     #: caller-built metadata and ``out`` is the store target: all stay dense.
+    b_stride_group = T.dynamic("b_stride_group")
+    b_stride_row = T.dynamic("b_stride_row")
+    c_stride_group = T.dynamic("c_stride_group")
+    c_stride_row = T.dynamic("c_stride_row")
     x_strides = (T.dynamic("x_stride_row"), T.dynamic("x_stride_head"), 1)
     dt_strides = (T.dynamic("dt_stride_row"), T.dynamic("dt_stride_head"), 1)
-    b_strides = (T.dynamic("b_stride_row"), T.dynamic("b_stride_group"), 1)
-    c_strides = (T.dynamic("c_stride_row"), T.dynamic("c_stride_group"), 1)
+    b_strides = (b_stride_row, b_stride_group, 1)
+    c_strides = (c_stride_row, c_stride_group, 1)
     z_strides = (T.dynamic("z_stride_row"), T.dynamic("z_stride_head"), 1)
     io_align = _align_elems(io_dtype, dstate)
 
