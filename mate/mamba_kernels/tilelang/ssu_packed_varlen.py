@@ -82,6 +82,45 @@ _COMPILE_FLAGS = [
 ]
 
 
+#: Elements per 16-byte vector -- the widest load the target issues -- by dtype.
+_ALIGN_ELEMS = {torch.float16: 8, torch.bfloat16: 8, torch.float32: 4}
+
+
+def _align_elems(dtype: torch.dtype, extent: int) -> int:
+    """The stride alignment, in elements, the kernel asserts for one input.
+
+    ``extent`` is the length of the axis a strided input is walked along. A 16-byte
+    load is the widest this target issues and a load is never wider than the axis it
+    walks, so the alignment a row start has to keep is the narrower of the two: a
+    bf16 axis of 12 elements is read in 8-byte steps, not 16-byte ones.
+    """
+    align = _ALIGN_ELEMS.get(dtype)
+    if align is None:
+        raise RuntimeError(
+            f"a strided input of dtype {dtype} has no defined 16-byte alignment."
+        )
+    return min(align, (extent & -extent) or 1)
+
+
+def _require_aligned(name: str, tensor: torch.Tensor) -> None:
+    """Refuse an outer stride that the kernel's ``T.assume`` lines would deny.
+
+    ``T.assume`` is a compiler hint rather than a check, and a hint that does not
+    hold is undefined behaviour, so the alignment the kernel asserts for ``tensor``'s
+    outer strides has to be enforced here. A strided input is walked along its last
+    axis, so that axis supplies the extent. An axis of extent 1 is exempt: nothing is
+    ever addressed along it, so its stride cannot misalign a row start.
+    """
+    align = _align_elems(tensor.dtype, tensor.shape[-1])
+    for axis, stride in enumerate(tensor.stride()[:-1]):
+        if tensor.shape[axis] != 1 and stride % align != 0:
+            raise RuntimeError(
+                f"{name} stride({axis}) must be a multiple of {align} elements "
+                f"({align * tensor.element_size()}-byte alignment for "
+                f"{tensor.dtype}); got {stride}."
+            )
+
+
 @tilelang.jit(pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS)
 def tilelang_ssu_packed_varlen(
     state_dtype,
@@ -139,17 +178,33 @@ def tilelang_ssu_packed_varlen(
     threads = rows_per_cta * lanes_per_row
     dim_blocks = tilelang.cdiv(dim, rows_per_cta)
 
+    #: ``x``, ``dt``, ``B``, ``C`` and ``z`` are read-only inputs, so they are declared
+    #: strided: their row axis may be a strided view of a wider buffer. ``B``/``C`` are
+    #: the tensors the lane-vectorized loads walk, so their outer strides also carry
+    #: the alignment the kernel assumes; ``x``, ``dt`` and ``z`` are read one element
+    #: per thread, so no vector load depends on their strides and a hint would only
+    #: narrow which views are legal. ``state`` is read and written in place by the pool
+    #: update, ``A``/``Dv``/``dt_bias`` are the per-head matrices this launcher
+    #: materializes itself, the slot tables plus ``cu_seqlens``/``num_accepted`` are
+    #: caller-built metadata and ``out`` is the store target: all stay dense.
+    x_strides = (T.dynamic("x_stride_row"), T.dynamic("x_stride_head"), 1)
+    dt_strides = (T.dynamic("dt_stride_row"), T.dynamic("dt_stride_head"), 1)
+    b_strides = (T.dynamic("b_stride_row"), T.dynamic("b_stride_group"), 1)
+    c_strides = (T.dynamic("c_stride_row"), T.dynamic("c_stride_group"), 1)
+    z_strides = (T.dynamic("z_stride_row"), T.dynamic("z_stride_head"), 1)
+    io_align = _align_elems(io_dtype, dstate)
+
     @T.prim_func
     def tilelang_ssu_packed_varlen_kernel(
         state: T.Tensor((slots, heads, dim, dstate), state_dtype),
-        x: T.Tensor((rows, heads, dim), io_dtype),
-        dt: T.Tensor((rows, heads, dt_dim), dt_dtype),
+        x: T.StridedTensor((rows, heads, dim), x_strides, io_dtype),
+        dt: T.StridedTensor((rows, heads, dt_dim), dt_strides, dt_dtype),
         A: T.Tensor((heads, a_dim), "float32"),
-        B: T.Tensor((rows, groups, dstate), io_dtype),
-        C: T.Tensor((rows, groups, dstate), io_dtype),
+        B: T.StridedTensor((rows, groups, dstate), b_strides, io_dtype),
+        C: T.StridedTensor((rows, groups, dstate), c_strides, io_dtype),
         Dv: T.Tensor((heads, d_dim), "float32"),
         dt_bias: T.Tensor((heads, b_dim), "float32"),
-        z: T.Tensor((rows, heads, dim), io_dtype),
+        z: T.StridedTensor((rows, heads, dim), z_strides, io_dtype),
         src_slots: T.Tensor((src_elems,), slot_dtype),
         src_seq_stride: T.int32,
         src_step_stride: T.int32,
@@ -179,6 +234,11 @@ def tilelang_ssu_packed_varlen(
             head,
             batch_idx,
         ):
+            T.assume(b_stride_row % io_align == 0)
+            T.assume(b_stride_group % io_align == 0)
+            T.assume(c_stride_row % io_align == 0)
+            T.assume(c_stride_group % io_align == 0)
+
             tid = T.get_thread_binding()
             lane = tid % lanes_per_row
             row_in_block = tid // lanes_per_row
@@ -374,8 +434,20 @@ def _validate_launch(
         raise RuntimeError(
             "the native SSU kernel requires 1 <= rows_per_cta * lanes_per_row <= 1024."
         )
-    if not x.is_contiguous() or not dt.is_contiguous():
-        raise RuntimeError("x and dt must be contiguous for the native SSU kernel.")
+    if x.stride(-1) != 1:
+        raise RuntimeError(
+            "x must have a dense dim axis (stride(-1) == 1); its outer axes may be "
+            "strided."
+        )
+    # dt's last axis is either the dim it is read along or the extent-1 axis of the
+    # per-head broadcast form, which is never advanced and so is exempt.
+    if dt.shape[-1] != 1 and dt.stride(-1) != 1:
+        raise RuntimeError(
+            "dt must have a dense dim axis (stride(-1) == 1); the per-head broadcast "
+            "form keeps its extent-1 axis."
+        )
+    # The pool is read and written in place, so it must be the dense
+    # [slots, heads, dim, dstate] span the pool update addresses.
     if state.stride() != (
         state.shape[1] * state.shape[2] * dstate,
         state.shape[2] * dstate,
@@ -399,6 +471,14 @@ def _validate_launch(
         raise RuntimeError("A must be fp32 for the native SSU kernel.")
     if B.shape[1] == 0 or state.shape[1] % B.shape[1] != 0:
         raise RuntimeError("B/C groups must divide heads for the native SSU kernel.")
+    # The kernel walks B/C along the pool's dstate axis, which is also the extent the
+    # stride alignment is derived from: a row that is shorter than the pool's would
+    # read past its own row, and one that is longer would make the hint too strong.
+    if B.shape[0] != x.shape[0] or B.shape[2] != dstate:
+        raise RuntimeError(
+            f"B/C must be [rows={x.shape[0]}, groups, dstate={dstate}], got "
+            f"{tuple(B.shape)}."
+        )
     # The tables are flat buffers plus two caller-supplied strides, so a 1-D table
     # carries no sequence count and cannot be checked against the batch: the split
     # comes from cu_seqlens, and how far a read or a store reaches is bounded by the
@@ -425,6 +505,7 @@ def _validate_launch(
             f"num_accepted_tokens must hold one count per sequence ({batch}), got "
             f"{num_accepted.numel()}."
         )
+    # All four are caller-built metadata that the kernel reads as dense spans.
     for name, tensor in (
         ("src_slots", src_slots),
         ("dst_slots", dst_slots),
@@ -571,10 +652,14 @@ def ssu_packed_launch(
 
     ``mate.mamba.selective_state_update`` has already validated the contract:
     packed rows, per-head (tied) ``A``/``D``/``dt_bias`` in fp32, per-head ``dt``,
-    contiguous rows, and a flat or 2-D slot table per side. The two strides say how
-    the kernel reaches sequence ``b``'s position ``t`` in each table: from vLLM's
+    contiguous metadata, and a flat or 2-D slot table per side. The two strides say
+    how the kernel reaches sequence ``b``'s position ``t`` in each table: from vLLM's
     flat ``state_batch_indices`` it is entry ``b + t`` (strides 1 and 1), from a
     contiguous 2-D ``[sequences, steps]`` table it is ``b * steps + t``.
+
+    ``x``, ``dt``, ``B``, ``C`` and ``z`` may be strided views of a wider buffer;
+    ``B`` and ``C`` additionally have to keep the row alignment the kernel's
+    vectorized loads assume.
     """
     heads, dim = x.shape[1], x.shape[2]
     slots, state_heads, state_dim, dstate = state.shape
@@ -582,6 +667,27 @@ def ssu_packed_launch(
         raise RuntimeError("state must match x as [slots, heads, dim, dstate].")
     if dst_slots is not None and dst_slots.dtype != src_slots.dtype:
         raise RuntimeError("source and destination slot tables must share a dtype.")
+    # B and C are the lane-vectorized operands, so their outer strides also carry the
+    # alignment the kernel assumes; z is read one element per thread.
+    if B.stride(-1) != 1 or C.stride(-1) != 1:
+        raise RuntimeError(
+            "B and C must have a dense dstate axis (stride(-1) == 1); their row axis "
+            "may be strided."
+        )
+    if z is not None and z.stride(-1) != 1:
+        raise RuntimeError(
+            "z must have a dense dim axis (stride(-1) == 1); its outer axes may be "
+            "strided."
+        )
+    _require_aligned("B", B)
+    _require_aligned("C", C)
+    if any(
+        tensor is not None and not tensor.is_contiguous()
+        for tensor in (Dv, dt_bias, src_slots, dst_slots, cu_seqlens, num_accepted)
+    ):
+        raise RuntimeError(
+            "D, dt_bias, the slot tables and the sequence metadata must be contiguous."
+        )
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
         raise RuntimeError(
             f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}."

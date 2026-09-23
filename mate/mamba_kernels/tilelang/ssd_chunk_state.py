@@ -76,6 +76,45 @@ _COMPILE_FLAGS = [
 ]
 
 
+#: Elements per 16-byte vector -- the widest load the target issues -- by dtype.
+_ALIGN_ELEMS = {torch.float16: 8, torch.bfloat16: 8, torch.float32: 4}
+
+
+def _align_elems(dtype: torch.dtype, extent: int) -> int:
+    """The stride alignment, in elements, the kernel asserts for one input.
+
+    ``extent`` is the length of the axis a strided input is walked along. A 16-byte
+    load is the widest this target issues and a load is never wider than the axis it
+    walks, so the alignment a row start has to keep is the narrower of the two: a
+    bf16 axis of 12 elements is read in 8-byte steps, not 16-byte ones.
+    """
+    align = _ALIGN_ELEMS.get(dtype)
+    if align is None:
+        raise RuntimeError(
+            f"a strided input of dtype {dtype} has no defined 16-byte alignment."
+        )
+    return min(align, (extent & -extent) or 1)
+
+
+def _require_aligned(name: str, tensor: torch.Tensor) -> None:
+    """Refuse an outer stride that the kernel's ``T.assume`` lines would deny.
+
+    ``T.assume`` is a compiler hint rather than a check, and a hint that does not
+    hold is undefined behaviour, so the alignment the kernel asserts for ``tensor``'s
+    outer strides has to be enforced here. A strided input is walked along its last
+    axis, so that axis supplies the extent. An axis of extent 1 is exempt: nothing is
+    ever addressed along it, so its stride cannot misalign a row start.
+    """
+    align = _align_elems(tensor.dtype, tensor.shape[-1])
+    for axis, stride in enumerate(tensor.stride()[:-1]):
+        if tensor.shape[axis] != 1 and stride % align != 0:
+            raise RuntimeError(
+                f"{name} stride({axis}) must be a multiple of {align} elements "
+                f"({align * tensor.element_size()}-byte alignment for "
+                f"{tensor.dtype}); got {stride}."
+            )
+
+
 @tilelang.jit(pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS)
 def tilelang_ssd_chunk_state(
     dim,
@@ -105,10 +144,22 @@ def tilelang_ssd_chunk_state(
     da_shape = (heads, nchunks, chunk_size)
     states_shape = (nchunks, heads, dim, dstate)
 
+    #: ``x`` and ``b`` are read-only inputs, so they are declared strided: their token
+    #: and head/group axes may be views of a wider buffer while the axis each staged
+    #: copy walks (``dim`` for ``x``, ``dstate`` for ``b``) is pinned to stride 1,
+    #: which the launcher enforces. ``dt_out``/``dA_cumsum`` are written dense by the
+    #: cumsum stage and read here as dense spans, ``states`` is written in full by
+    #: this kernel, and ``cu_chunk_seqlens`` is caller-built metadata: all stay
+    #: ``T.Tensor``.
+    x_strides = (T.dynamic("x_stride_token"), T.dynamic("x_stride_head"), 1)
+    b_strides = (T.dynamic("b_stride_token"), T.dynamic("b_stride_group"), 1)
+    x_align = _align_elems(x_dtype, dim)
+    b_align = _align_elems(b_dtype, dstate)
+
     @T.prim_func
     def tilelang_ssd_chunk_state_kernel(
-        x: T.Tensor(x_shape, dtype=x_dtype),
-        b: T.Tensor(b_shape, dtype=b_dtype),
+        x: T.StridedTensor(x_shape, x_strides, x_dtype),
+        b: T.StridedTensor(b_shape, b_strides, b_dtype),
         dt_out: T.Tensor(da_shape, dtype=accum_dtype),
         dA_cumsum: T.Tensor(da_shape, dtype=accum_dtype),
         cu_chunk_seqlens: T.Tensor((nchunks + 1,), dtype=seqlen_dtype),
@@ -119,6 +170,11 @@ def tilelang_ssd_chunk_state(
             chunk,
             head,
         ):
+            T.assume(x_stride_token % x_align == 0)
+            T.assume(x_stride_head % x_align == 0)
+            T.assume(b_stride_token % b_align == 0)
+            T.assume(b_stride_group % b_align == 0)
+
             m_block = block // num_n_blocks
             n_block = block % num_n_blocks
             row = m_block * block_m
@@ -215,8 +271,13 @@ def ssd_chunk_state_launch(
         raise RuntimeError("b must be [tokens, groups, dstate].")
     if b.shape[0] != x.shape[0]:
         raise RuntimeError("x and b must share the token axis.")
-    if not x.is_contiguous() or not b.is_contiguous():
-        raise RuntimeError("x and b must be contiguous.")
+    if x.stride(-1) != 1 or b.stride(-1) != 1:
+        raise RuntimeError(
+            "x and b must have a dense innermost axis (stride(-1) == 1); their outer "
+            "axes may be strided."
+        )
+    _require_aligned("x", x)
+    _require_aligned("b", b)
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise RuntimeError(
             "x must be fp16, bf16 or fp32 for the native chunk-state kernel."
@@ -230,6 +291,8 @@ def ssd_chunk_state_launch(
         raise RuntimeError("dt_out and dA_cumsum must share [heads, nchunks, L].")
     if dt_out.dtype != torch.float32 or dA_cumsum.dtype != torch.float32:
         raise RuntimeError("dt_out and dA_cumsum must be fp32.")
+    # The cumsum stage writes both of them dense and this kernel reads them as dense
+    # spans, so they keep their contiguity gate.
     if not dt_out.is_contiguous() or not dA_cumsum.is_contiguous():
         raise RuntimeError("dt_out and dA_cumsum must be contiguous.")
     if dt_out.shape[0] != heads:
@@ -238,6 +301,7 @@ def ssd_chunk_state_launch(
         raise RuntimeError("dt_out's last axis must be chunk_size.")
     if cu_chunk_seqlens.dtype != torch.int32:
         raise RuntimeError("cu_chunk_seqlens must be int32.")
+    # Caller-built chunk offsets, read as a dense span: metadata stays dense.
     if cu_chunk_seqlens.dim() != 1 or not cu_chunk_seqlens.is_contiguous():
         raise RuntimeError("cu_chunk_seqlens must be a contiguous [nchunks + 1].")
     nchunks = cu_chunk_seqlens.numel() - 1
@@ -259,6 +323,8 @@ def ssd_chunk_state_launch(
         raise RuntimeError(f"states must be {out_shape}, got {tuple(states.shape)}.")
     if states.dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise RuntimeError("states must be fp32, bf16 or fp16.")
+    # This kernel writes every cell of a chunk's tile, so the buffer stays dense and
+    # keeps its contiguity gate.
     if not states.is_contiguous():
         raise RuntimeError("states must be contiguous.")
 

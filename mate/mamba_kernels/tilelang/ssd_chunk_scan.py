@@ -74,6 +74,45 @@ _COMPILE_FLAGS = [
 ]
 
 
+#: Elements per 16-byte vector -- the widest load the target issues -- by dtype.
+_ALIGN_ELEMS = {torch.float16: 8, torch.bfloat16: 8, torch.float32: 4}
+
+
+def _align_elems(dtype: torch.dtype, extent: int) -> int:
+    """The stride alignment, in elements, the kernel asserts for one input.
+
+    ``extent`` is the length of the axis a strided input is walked along. A 16-byte
+    load is the widest this target issues and a load is never wider than the axis it
+    walks, so the alignment a row start has to keep is the narrower of the two: a
+    bf16 axis of 12 elements is read in 8-byte steps, not 16-byte ones.
+    """
+    align = _ALIGN_ELEMS.get(dtype)
+    if align is None:
+        raise RuntimeError(
+            f"a strided input of dtype {dtype} has no defined 16-byte alignment."
+        )
+    return min(align, (extent & -extent) or 1)
+
+
+def _require_aligned(name: str, tensor: torch.Tensor) -> None:
+    """Refuse an outer stride that the kernel's ``T.assume`` lines would deny.
+
+    ``T.assume`` is a compiler hint rather than a check, and a hint that does not
+    hold is undefined behaviour, so the alignment the kernel asserts for ``tensor``'s
+    outer strides has to be enforced here. A strided input is walked along its last
+    axis, so that axis supplies the extent. An axis of extent 1 is exempt: nothing is
+    ever addressed along it, so its stride cannot misalign a row start.
+    """
+    align = _align_elems(tensor.dtype, tensor.shape[-1])
+    for axis, stride in enumerate(tensor.stride()[:-1]):
+        if tensor.shape[axis] != 1 and stride % align != 0:
+            raise RuntimeError(
+                f"{name} stride({axis}) must be a multiple of {align} elements "
+                f"({align * tensor.element_size()}-byte alignment for "
+                f"{tensor.dtype}); got {stride}."
+            )
+
+
 @tilelang.jit(pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS)
 def tilelang_ssd_chunk_scan(
     heads,
@@ -100,25 +139,60 @@ def tilelang_ssd_chunk_scan(
     head_ratio = heads // groups
     threads = 128
 
+    #: ``x``, ``C``, ``z``, ``D`` and ``initial_states`` are read-only inputs, so they
+    #: are declared strided: their outer axes may be views of a wider buffer while the
+    #: axis each block load walks (``dim`` for ``x``/``z``/``D``, ``dstate`` for
+    #: ``C``/``initial_states``) is pinned to stride 1, which the launcher enforces.
+    #: ``CB``, ``dt_out``, ``dA_cumsum`` and ``states`` are the dense buffers the
+    #: earlier stages write, ``out`` is written in place here, and ``seq_idx`` /
+    #: ``cu_chunk_seqlens`` are caller-built metadata: all stay ``T.Tensor``.
+    x_strides = (T.dynamic("x_stride_token"), T.dynamic("x_stride_head"), 1)
+    c_strides = (T.dynamic("c_stride_token"), T.dynamic("c_stride_group"), 1)
+    init_strides = (
+        T.dynamic("init_stride_seq"),
+        T.dynamic("init_stride_head"),
+        T.dynamic("init_stride_dim"),
+        1,
+    )
+    d_strides = (T.dynamic("d_stride_head"), 1)
+    z_strides = (T.dynamic("z_stride_token"), T.dynamic("z_stride_head"), 1)
+    io_align = _align_elems(io_dtype, dim)
+    c_align = _align_elems(io_dtype, dstate)
+    init_align = _align_elems(state_dtype, dstate)
+    d_align = _align_elems(torch.float32, dim)
+
     @T.prim_func
     def tilelang_ssd_chunk_scan_kernel(
-        x: T.Tensor((num_tokens, heads, dim), dtype=io_dtype),
-        C: T.Tensor((num_tokens, groups, dstate), dtype=io_dtype),
+        x: T.StridedTensor((num_tokens, heads, dim), x_strides, io_dtype),
+        C: T.StridedTensor((num_tokens, groups, dstate), c_strides, io_dtype),
         CB: T.Tensor((nchunks, groups, block_S, block_S), dtype=accum_dtype),
         dt_out: T.Tensor((heads, nchunks, block_S), dtype=accum_dtype),
         dA_cumsum: T.Tensor((heads, nchunks, block_S), dtype=accum_dtype),
         states: T.Tensor((nchunks, heads, dim, dstate), dtype=state_dtype),
-        initial_states: T.Tensor((num_seqs, heads, dim, dstate), dtype=state_dtype),
+        initial_states: T.StridedTensor(
+            (num_seqs, heads, dim, dstate), init_strides, state_dtype
+        ),
         seq_idx: T.Tensor((nchunks,), dtype=seqlen_dtype),
         cu_chunk_seqlens: T.Tensor((nchunks + 1,), dtype=seqlen_dtype),
-        D_param: T.Tensor((heads, dim), dtype=accum_dtype),
-        z: T.Tensor((num_tokens, heads, dim), dtype=io_dtype),
+        D_param: T.StridedTensor((heads, dim), d_strides, accum_dtype),
+        z: T.StridedTensor((num_tokens, heads, dim), z_strides, io_dtype),
         out: T.Tensor((num_tokens, heads, dim), dtype=io_dtype),
         use_initial_states: T.int32,
         has_d: T.int32,
         has_z: T.int32,
     ):
         with T.Kernel(m_tiles, nchunks, heads, threads=threads) as (bm, bc, bh):
+            T.assume(x_stride_token % io_align == 0)
+            T.assume(x_stride_head % io_align == 0)
+            T.assume(c_stride_token % c_align == 0)
+            T.assume(c_stride_group % c_align == 0)
+            T.assume(init_stride_seq % init_align == 0)
+            T.assume(init_stride_head % init_align == 0)
+            T.assume(init_stride_dim % init_align == 0)
+            T.assume(d_stride_head % d_align == 0)
+            T.assume(z_stride_token % io_align == 0)
+            T.assume(z_stride_head % io_align == 0)
+
             row0 = bm * block_M
             chunk_start = cu_chunk_seqlens[bc]
             limit = cu_chunk_seqlens[bc + 1] - chunk_start
@@ -334,11 +408,49 @@ def chunk_scan_launch(
         raise RuntimeError("seq_idx and cu_chunk_seqlens must be int32.")
     if D_param is not None and D_param.shape != (heads, dim):
         raise RuntimeError("D must be [heads, dim].")
+    if D_param is not None and D_param.dtype != torch.float32:
+        # The kernel declares D fp32 and the stride alignment is derived from that,
+        # so a lower-precision D is refused instead of being read as fp32.
+        raise RuntimeError("D must be fp32.")
     if z is not None and z.shape != x.shape:
         raise RuntimeError("z must match x's shape.")
-    for tensor in (x, C, CB, dt_out, dA_cumsum, states, seq_idx, cu_chunk_seqlens, out):
+    if x.stride(-1) != 1 or C.stride(-1) != 1:
+        raise RuntimeError(
+            "x and C must have a dense innermost axis (stride(-1) == 1); their outer "
+            "axes may be strided."
+        )
+    if z is not None and z.stride(-1) != 1:
+        raise RuntimeError(
+            "z must have a dense dim axis (stride(-1) == 1); its outer axes may be "
+            "strided."
+        )
+    if D_param is not None and D_param.stride(-1) != 1:
+        raise RuntimeError(
+            "D must have a dense dim axis (stride(-1) == 1); its head axis may be "
+            "strided."
+        )
+    if initial_states is not None and initial_states.stride(-1) != 1:
+        raise RuntimeError(
+            "initial_states must have a dense dstate axis (stride(-1) == 1); its "
+            "sequence axis may be strided."
+        )
+    for name, tensor in (
+        ("x", x),
+        ("C", C),
+        ("z", z),
+        ("D", D_param),
+        ("initial_states", initial_states),
+    ):
+        if tensor is not None:
+            _require_aligned(name, tensor)
+    # CB, dt_out, dA_cumsum and states are the dense buffers the earlier stages write
+    # and this one reads as dense spans, and out is written in place: they, and the
+    # caller-built metadata, keep their contiguity gate.
+    for tensor in (CB, dt_out, dA_cumsum, states, seq_idx, cu_chunk_seqlens, out):
         if not tensor.is_contiguous():
-            raise RuntimeError("x, C, CB, dt_out, dA_cumsum, states, metadata and out must be contiguous.")
+            raise RuntimeError(
+                "CB, dt_out, dA_cumsum, states, metadata and out must be contiguous."
+            )
     if out.dtype != x.dtype:
         raise RuntimeError("out must share x's dtype.")
     if block_M <= 0 or chunk_size % block_M:

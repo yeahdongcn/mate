@@ -88,6 +88,45 @@ _COMPILE_FLAGS = [
 ]
 
 
+#: Elements per 16-byte vector -- the widest load the target issues -- by dtype.
+_ALIGN_ELEMS = {torch.float16: 8, torch.bfloat16: 8, torch.float32: 4}
+
+
+def _align_elems(dtype: torch.dtype, extent: int) -> int:
+    """The stride alignment, in elements, the kernel asserts for one input.
+
+    ``extent`` is the length of the axis a strided input is walked along. A 16-byte
+    load is the widest this target issues and a load is never wider than the axis it
+    walks, so the alignment a row start has to keep is the narrower of the two: a
+    bf16 axis of 12 elements is read in 8-byte steps, not 16-byte ones.
+    """
+    align = _ALIGN_ELEMS.get(dtype)
+    if align is None:
+        raise RuntimeError(
+            f"a strided input of dtype {dtype} has no defined 16-byte alignment."
+        )
+    return min(align, (extent & -extent) or 1)
+
+
+def _require_aligned(name: str, tensor: torch.Tensor) -> None:
+    """Refuse an outer stride that the kernel's ``T.assume`` lines would deny.
+
+    ``T.assume`` is a compiler hint rather than a check, and a hint that does not
+    hold is undefined behaviour, so the alignment the kernel asserts for ``tensor``'s
+    outer strides has to be enforced here. A strided input is walked along its last
+    axis, so that axis supplies the extent. An axis of extent 1 is exempt: nothing is
+    ever addressed along it, so its stride cannot misalign a row start.
+    """
+    align = _align_elems(tensor.dtype, tensor.shape[-1])
+    for axis, stride in enumerate(tensor.stride()[:-1]):
+        if tensor.shape[axis] != 1 and stride % align != 0:
+            raise RuntimeError(
+                f"{name} stride({axis}) must be a multiple of {align} elements "
+                f"({align * tensor.element_size()}-byte alignment for "
+                f"{tensor.dtype}); got {stride}."
+            )
+
+
 @tilelang.jit(pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS)
 def tilelang_ssd_state_passing(
     dim,
@@ -114,12 +153,26 @@ def tilelang_ssd_state_passing(
     init_shape = (batch, heads, dim, dstate)
     da_shape = (heads, nchunks, chunk_size)
 
+    #: ``initial_states`` is a read-only input, so it is declared strided: its sequence
+    #: axis may be a view of a wider pool while the dstate axis the vectorized loads
+    #: walk is pinned to stride 1, which the launcher enforces. ``states`` is read and
+    #: written in place (``out`` defaults to it), ``out`` is the store target,
+    #: ``dA_cumsum`` is the cumsum stage's dense output and ``last_chunk_indices`` /
+    #: ``seq_idx`` are caller-built metadata: all stay ``T.Tensor`` as dense spans.
+    init_strides = (
+        T.dynamic("init_stride_seq"),
+        T.dynamic("init_stride_head"),
+        T.dynamic("init_stride_dim"),
+        1,
+    )
+    init_align = _align_elems(init_dtype, dstate)
+
     @T.prim_func
     def tilelang_ssd_state_passing_kernel(
         states: T.Tensor(states_shape, dtype=in_dtype),
         dA_cumsum: T.Tensor(da_shape, dtype=accum_dtype),
         last_chunk_indices: T.Tensor((batch,), dtype=seqlen_dtype),
-        initial_states: T.Tensor(init_shape, dtype=init_dtype),
+        initial_states: T.StridedTensor(init_shape, init_strides, init_dtype),
         seq_idx: T.Tensor((nchunks,), dtype=seqlen_dtype),
         out: T.Tensor(states_shape, dtype=state_dtype),
         use_initial_states: T.int32,
@@ -130,6 +183,10 @@ def tilelang_ssd_state_passing(
             b_idx,
             head,
         ):
+            T.assume(init_stride_seq % init_align == 0)
+            T.assume(init_stride_head % init_align == 0)
+            T.assume(init_stride_dim % init_align == 0)
+
             tid = T.get_thread_binding()
             lane = tid % lanes_per_row
             row_in_block = tid // lanes_per_row
@@ -285,6 +342,8 @@ def ssd_state_passing_launch(
     """
     if states.dim() != 4:
         raise RuntimeError("states must be [nchunks, heads, dim, dstate].")
+    # Read and written in place -- `out` defaults to it -- so it stays a dense span
+    # and keeps its contiguity gate.
     if not states.is_contiguous():
         raise RuntimeError("states must be contiguous.")
     nchunks, heads, dim, dstate = states.shape
@@ -304,9 +363,11 @@ def ssd_state_passing_launch(
         )
     if dA_cumsum.dtype != torch.float32:
         raise RuntimeError("dA_cumsum must be fp32.")
+    # The cumsum stage's dense output, read here as a dense span.
     if not dA_cumsum.is_contiguous():
         raise RuntimeError("dA_cumsum must be contiguous.")
 
+    # Both boundary vectors are caller-built metadata, read as dense spans.
     if last_chunk_indices is not None:
         if last_chunk_indices.dim() != 1 or not last_chunk_indices.is_contiguous():
             raise RuntimeError("last_chunk_indices must be a contiguous [batch].")
@@ -342,8 +403,12 @@ def ssd_state_passing_launch(
                 f"initial_states must be {(batch, heads, dim, dstate)}, got "
                 f"{tuple(initial_states.shape)}."
             )
-        if not initial_states.is_contiguous():
-            raise RuntimeError("initial_states must be contiguous.")
+        if initial_states.stride(-1) != 1:
+            raise RuntimeError(
+                "initial_states must have a dense dstate axis (stride(-1) == 1); its "
+                "sequence axis may be strided."
+            )
+        _require_aligned("initial_states", initial_states)
     if chunk_size <= 0:
         raise RuntimeError("chunk_size must be positive.")
     if dstate % vec != 0:
@@ -379,6 +444,7 @@ def ssd_state_passing_launch(
         raise RuntimeError(f"out must be {out_shape}, got {tuple(out.shape)}.")
     if out.dtype != state_dtype:
         raise RuntimeError(f"out must be {state_dtype}, got {out.dtype}.")
+    # The store target is written cell by cell, so it stays dense.
     if not out.is_contiguous():
         raise RuntimeError("out must be contiguous.")
 

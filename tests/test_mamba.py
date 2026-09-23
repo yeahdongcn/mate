@@ -1,6 +1,6 @@
 """Tests for the native mamba/SSU family.
 
-One module, six grouped sections:
+One module, eight grouped sections:
 
 1. the frozen ``selective_state_update`` contract and the one-token kernel on
    MUSA hardware;
@@ -9,7 +9,9 @@ One module, six grouped sections:
 3. the multi-token SSU oracle's semantics;
 4. the SSD prefill stages: chunk cumsum, chunk state, state passing and BMM;
 5. the SSD chunk scan;
-6. the packed SSD orchestration end to end.
+6. the packed SSD orchestration end to end;
+7. the SSD BMM kernel's strided-input contract on MUSA hardware;
+8. the same strided-input contract for the rest of the TileLang family.
 
 Sections 3-6 are **CPU-only**: they need no MUSA device and no TileLang kernel
 module, so they run anywhere torch does. That is a structural property of this
@@ -2958,3 +2960,283 @@ def test_ssd_bmm_kernel_reads_strided_inputs():
 
     with pytest.raises(RuntimeError, match="dense dstate axis"):
         launcher(wide[:, :, ::2], bmat, cu_chunk_seqlens, chunk)
+    # A token stride that is not a multiple of the 8 bf16 elements (16 bytes) the
+    # operand loads vectorize is the other half of the declaration: the kernel's
+    # ``T.assume`` would be false, so the view has to be refused rather than read.
+    narrow = torch.randn(tokens, groups, dstate + 4, dtype=torch.bfloat16, device=device)
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        launcher(narrow[:, :, :dstate], bmat, cu_chunk_seqlens, chunk)
+
+
+# ---------------------------------------------------------------------------
+# 8. Device: the strided input contract of the rest of the TileLang family
+#
+# Section 7 holds the BMM to its input-layout guarantee. The other kernels declare
+# the same thing -- every read-only input as a ``T.StridedTensor`` with dynamic outer
+# strides, plus a ``T.assume`` alignment the launcher validates -- so each of them
+# gets the same pair of statements here: a strided view and its dense copy produce
+# identical results, and a view that would make the declaration false is refused
+# instead of read. The buffers a stage writes (``dA_cumsum``, ``dt_out``, ``CB``,
+# ``states``, ``out``, the state pool) and the metadata callers build stay dense, and
+# their refusal is the older ``is_contiguous()`` gate the CPU sections already cover.
+# ---------------------------------------------------------------------------
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssd_chunk_cumsum_kernel_reads_a_strided_dt():
+    launcher = mate.mamba._stage("cumsum")
+    heads, chunk, nchunks = 8, 8, 2
+    tokens = chunk * nchunks
+    device = torch.device("musa")
+    torch.manual_seed(0)
+
+    cu_chunk_seqlens = torch.tensor([0, chunk, tokens], dtype=torch.int32, device=device)
+    A = -torch.rand(heads, dtype=torch.float32, device=device)
+    dt_bias = torch.rand(heads, dtype=torch.float32, device=device)
+    wide = torch.randn(tokens, 2 * heads, dtype=torch.bfloat16, device=device)
+    dt = wide[:, :heads]
+    assert dt.stride(-1) == 1 and not dt.is_contiguous()
+
+    strided = launcher(dt, A, dt_bias, cu_chunk_seqlens, chunk, dt_softplus=True)
+    dense = launcher(
+        dt.contiguous(), A, dt_bias, cu_chunk_seqlens, chunk, dt_softplus=True
+    )
+    assert torch.equal(strided[0], dense[0]) and torch.equal(strided[1], dense[1])
+
+    with pytest.raises(RuntimeError, match="dense head axis"):
+        launcher(wide[:, ::2], A, dt_bias, cu_chunk_seqlens, chunk, dt_softplus=True)
+    # The staged copy moves dt in 8-bf16 vectors, so a 12-element token stride is not
+    # something the kernel may be told to assume.
+    narrow = torch.randn(tokens, heads + 4, dtype=torch.bfloat16, device=device)
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        launcher(
+            narrow[:, :heads], A, dt_bias, cu_chunk_seqlens, chunk, dt_softplus=True
+        )
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssd_chunk_state_kernel_reads_strided_operands():
+    launcher = mate.mamba._stage("chunk_state")
+    heads, groups, dim, dstate, chunk, nchunks = 4, 2, 8, 16, 8, 2
+    tokens = chunk * nchunks
+    device = torch.device("musa")
+    torch.manual_seed(0)
+
+    cu_chunk_seqlens = torch.tensor([0, chunk, tokens], dtype=torch.int32, device=device)
+    x_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
+    b_wide = torch.randn(tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device)
+    x, b = x_wide[:, :, :dim], b_wide[:, :, :dstate]
+    assert x.stride(-1) == 1 and not x.is_contiguous() and not b.is_contiguous()
+    dt_out = torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device)
+    dA_cumsum = -torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device)
+
+    strided = launcher(x, b, dt_out, dA_cumsum, cu_chunk_seqlens, chunk)
+    dense = launcher(
+        x.contiguous(), b.contiguous(), dt_out, dA_cumsum, cu_chunk_seqlens, chunk
+    )
+    assert torch.equal(strided, dense)
+
+    with pytest.raises(RuntimeError, match="dense innermost axis"):
+        launcher(x_wide[:, :, ::2], b, dt_out, dA_cumsum, cu_chunk_seqlens, chunk)
+    # x's head stride is 12 elements here: dense along dim, but not a 16-byte row step.
+    odd = torch.randn(tokens, heads, dim + 4, dtype=torch.bfloat16, device=device)
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        launcher(odd[:, :, :dim], b, dt_out, dA_cumsum, cu_chunk_seqlens, chunk)
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssd_state_passing_kernel_reads_strided_initial_states():
+    launcher = mate.mamba._stage("state_passing")
+    heads, dim, dstate, chunk, nchunks = 2, 4, 16, 8, 2
+    device = torch.device("musa")
+    torch.manual_seed(0)
+
+    states = torch.randn(nchunks, heads, dim, dstate, dtype=torch.float32, device=device)
+    dA_cumsum = -torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device) - 0.1
+    last_chunk_indices = torch.tensor([nchunks - 1], dtype=torch.int32, device=device)
+    wide = torch.randn(1, heads, dim, 2 * dstate, dtype=torch.float32, device=device)
+    initial = wide[:, :, :, :dstate]
+    assert initial.stride(-1) == 1 and not initial.is_contiguous()
+
+    # The kernel updates the pool in place, so each run gets its own copy of it.
+    strided = launcher(
+        states.clone(),
+        dA_cumsum,
+        initial,
+        last_chunk_indices,
+        state_dtype=torch.float32,
+    )
+    dense = launcher(
+        states.clone(),
+        dA_cumsum,
+        initial.contiguous(),
+        last_chunk_indices,
+        state_dtype=torch.float32,
+    )
+    assert torch.equal(strided, dense)
+
+    with pytest.raises(RuntimeError, match="dense dstate axis"):
+        launcher(
+            states.clone(),
+            dA_cumsum,
+            wide[:, :, :, ::2],
+            last_chunk_indices,
+            state_dtype=torch.float32,
+        )
+    # fp32 vectors 4 elements, so a 2-element dstate stride is the finest grain the
+    # kernel cannot be told to assume away.
+    odd = torch.randn(1, heads, dim, dstate + 2, dtype=torch.float32, device=device)
+    with pytest.raises(RuntimeError, match="multiple of 4"):
+        launcher(
+            states.clone(),
+            dA_cumsum,
+            odd[:, :, :, :dstate],
+            last_chunk_indices,
+            state_dtype=torch.float32,
+        )
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssd_chunk_scan_kernel_reads_strided_inputs():
+    launcher = mate.mamba._stage("chunk_scan")
+    heads, groups, dim, dstate, chunk = 4, 2, 8, 16, 8
+    nchunks = 1
+    tokens = chunk * nchunks
+    device = torch.device("musa")
+    torch.manual_seed(0)
+
+    x_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
+    c_wide = torch.randn(tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device)
+    z_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
+    init_wide = torch.randn(1, heads, dim, 2 * dstate, dtype=torch.bfloat16, device=device)
+    d_wide = torch.randn(heads, 2 * dim, dtype=torch.float32, device=device)
+    x, C, z = x_wide[:, :, :dim], c_wide[:, :, :dstate], z_wide[:, :, :dim]
+    initial, D_param = init_wide[:, :, :, :dstate], d_wide[:, :dim]
+    assert x.stride(-1) == 1 and not x.is_contiguous() and not C.is_contiguous()
+
+    CB = torch.rand(nchunks, groups, chunk, chunk, dtype=torch.float32, device=device)
+    dt_out = torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device)
+    dA_cumsum = -torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device)
+    states = torch.randn(
+        nchunks, heads, dim, dstate, dtype=torch.bfloat16, device=device
+    )
+    seq_idx = torch.zeros(nchunks, dtype=torch.int32, device=device)
+    cu_chunk_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device=device)
+
+    def run(x_, C_, z_, initial_, D_):
+        return launcher(
+            x_,
+            C_,
+            CB,
+            dt_out,
+            dA_cumsum,
+            states,
+            initial_,
+            seq_idx,
+            cu_chunk_seqlens,
+            torch.empty(tokens, heads, dim, dtype=torch.bfloat16, device=device),
+            D_param=D_,
+            z=z_,
+            block_M=chunk,
+        )
+
+    strided = run(x, C, z, initial, D_param)
+    dense = run(
+        x.contiguous(),
+        C.contiguous(),
+        z.contiguous(),
+        initial.contiguous(),
+        D_param.contiguous(),
+    )
+    assert torch.equal(strided, dense)
+
+    with pytest.raises(RuntimeError, match="dense innermost axis"):
+        run(x_wide[:, :, ::2], C, z, initial, D_param)
+    odd_c = torch.randn(tokens, groups, dstate + 4, dtype=torch.bfloat16, device=device)
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        run(x, odd_c[:, :, :dstate], z, initial, D_param)
+    odd_d = torch.randn(heads, dim + 2, dtype=torch.float32, device=device)
+    with pytest.raises(RuntimeError, match="multiple of 4"):
+        run(x, C, z, initial, odd_d[:, :dim])
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssu_one_token_kernel_reads_strided_operands():
+    """The pool operands ``B``/``C`` are read by lane-vectorized loads, so their
+    strides are the alignment-bearing ones; ``x`` and ``z`` are read per element and
+    only have to keep their dim axis dense."""
+    case = _ssu_case()
+    device = _ssu_device()
+    torch.manual_seed(0)
+    b_wide = torch.randn(
+        SSU_BATCH, SSU_GROUPS, 2 * SSU_DSTATE, dtype=torch.bfloat16, device=device
+    )
+    c_wide = torch.randn_like(b_wide)
+    strided_case = dict(
+        case,
+        state=case["state"].clone(),
+        B=b_wide[:, :, :SSU_DSTATE],
+        C=c_wide[:, :, :SSU_DSTATE],
+    )
+    assert strided_case["B"].stride(-1) == 1 and not strided_case["B"].is_contiguous()
+
+    strided_out = _ssu_run_kernel(strided_case)
+    dense_case = dict(case, state=case["state"].clone())
+    dense_out = _ssu_run_kernel(dense_case)
+    assert torch.equal(strided_out, dense_out)
+    assert torch.equal(strided_case["state"], dense_case["state"])
+
+    with pytest.raises(RuntimeError, match="dense dstate axis"):
+        _ssu_run_kernel(dict(case, state=case["state"].clone(), B=b_wide[:, :, ::2]))
+    odd = torch.randn(
+        SSU_BATCH, SSU_GROUPS, SSU_DSTATE + 4, dtype=torch.bfloat16, device=device
+    )
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        _ssu_run_kernel(
+            dict(case, state=case["state"].clone(), C=odd[:, :, :SSU_DSTATE])
+        )
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssu_packed_kernel_reads_strided_operands():
+    """The packed route accepts the same views as the one-token kernel; the slot
+    tables and the sequence metadata stay dense."""
+    device = _mtp_device()
+    case = _mtp_case([3, 3], accepted=[2, 3])
+    rows = case["x"].shape[0]
+    torch.manual_seed(0)
+    b_wide = torch.randn(
+        rows, MTP_GROUPS, 2 * MTP_DSTATE, dtype=MTP_IO_DTYPE, device=device
+    )
+    c_wide = torch.randn_like(b_wide)
+    x_wide = torch.randn(rows, MTP_HEADS, 2 * MTP_DIM, dtype=MTP_IO_DTYPE, device=device)
+    strided_case = dict(
+        case,
+        state=case["state"].clone(),
+        x=x_wide[:, :, :MTP_DIM],
+        B=b_wide[:, :, :MTP_DSTATE],
+        C=c_wide[:, :, :MTP_DSTATE],
+    )
+    assert strided_case["x"].stride(-1) == 1 and not strided_case["x"].is_contiguous()
+
+    strided_out = _mtp_run_kernel(strided_case)
+    dense_case = dict(case, state=case["state"].clone())
+    dense_out = _mtp_run_kernel(dense_case)
+    assert torch.equal(strided_out, dense_out)
+    assert torch.equal(strided_case["state"], dense_case["state"])
+
+    with pytest.raises(RuntimeError, match="dense dstate axis"):
+        _mtp_run_kernel(dict(case, state=case["state"].clone(), B=b_wide[:, :, ::2]))
+    odd = torch.randn(
+        rows, MTP_GROUPS, MTP_DSTATE + 4, dtype=MTP_IO_DTYPE, device=device
+    )
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        _mtp_run_kernel(
+            dict(case, state=case["state"].clone(), C=odd[:, :, :MTP_DSTATE])
+        )

@@ -70,6 +70,45 @@ _COMPILE_FLAGS = [
 ]
 
 
+#: Elements per 16-byte vector -- the widest load the target issues -- by dtype.
+_ALIGN_ELEMS = {torch.float16: 8, torch.bfloat16: 8, torch.float32: 4}
+
+
+def _align_elems(dtype: torch.dtype, extent: int) -> int:
+    """The stride alignment, in elements, the kernel asserts for one input.
+
+    ``extent`` is the length of the axis a strided input is walked along. A 16-byte
+    load is the widest this target issues and a load is never wider than the axis it
+    walks, so the alignment a row start has to keep is the narrower of the two: a
+    bf16 axis of 12 elements is read in 8-byte steps, not 16-byte ones.
+    """
+    align = _ALIGN_ELEMS.get(dtype)
+    if align is None:
+        raise RuntimeError(
+            f"a strided input of dtype {dtype} has no defined 16-byte alignment."
+        )
+    return min(align, (extent & -extent) or 1)
+
+
+def _require_aligned(name: str, tensor: torch.Tensor) -> None:
+    """Refuse an outer stride that the kernel's ``T.assume`` lines would deny.
+
+    ``T.assume`` is a compiler hint rather than a check, and a hint that does not
+    hold is undefined behaviour, so the alignment the kernel asserts for ``tensor``'s
+    outer strides has to be enforced here. A strided input is walked along its last
+    axis, so that axis supplies the extent. An axis of extent 1 is exempt: nothing is
+    ever addressed along it, so its stride cannot misalign a row start.
+    """
+    align = _align_elems(tensor.dtype, tensor.shape[-1])
+    for axis, stride in enumerate(tensor.stride()[:-1]):
+        if tensor.shape[axis] != 1 and stride % align != 0:
+            raise RuntimeError(
+                f"{name} stride({axis}) must be a multiple of {align} elements "
+                f"({align * tensor.element_size()}-byte alignment for "
+                f"{tensor.dtype}); got {stride}."
+            )
+
+
 @tilelang.jit(pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS)
 def tilelang_ssd_chunk_cumsum(
     heads,
@@ -87,11 +126,21 @@ def tilelang_ssd_chunk_cumsum(
     dt_shape = (num_tokens, heads)
     out_shape = (heads, nchunks, block_S)
 
+    #: ``dt`` is a read-only input, so it is declared strided: its token axis may be a
+    #: strided view of a wider buffer while the head axis the staged copy walks is
+    #: pinned to stride 1, which the launcher enforces. ``A`` and ``dt_bias`` are
+    #: per-head vectors -- there is no outer axis to stride, so their single axis
+    #: carries the literal stride the kernel reads them with. ``dA_cumsum`` and
+    #: ``dt_out`` are written in full and ``cu_chunk_seqlens`` is caller-built
+    #: metadata: both stay ``T.Tensor`` as dense spans.
+    dt_strides = (T.dynamic("dt_stride_token"), 1)
+    dt_align = _align_elems(dt_dtype, heads)
+
     @T.prim_func
     def tilelang_ssd_chunk_cumsum_kernel(
-        dt: T.Tensor(dt_shape, dtype=dt_dtype),
-        A: T.Tensor((heads,), dtype=param_dtype),
-        dt_bias: T.Tensor((heads,), dtype=param_dtype),
+        dt: T.StridedTensor(dt_shape, dt_strides, dt_dtype),
+        A: T.StridedTensor((heads,), (1,), param_dtype),
+        dt_bias: T.StridedTensor((heads,), (1,), param_dtype),
         cu_chunk_seqlens: T.Tensor((nchunks + 1,), dtype=seqlen_dtype),
         dA_cumsum: T.Tensor(out_shape, dtype=out_dtype),
         dt_out: T.Tensor(out_shape, dtype=out_dtype),
@@ -101,6 +150,7 @@ def tilelang_ssd_chunk_cumsum(
         dt_max: T.float32,
     ):
         with T.Kernel(nchunks, threads=_THREADS) as (bc,):
+            T.assume(dt_stride_token % dt_align == 0)
             chunk_start = T.alloc_var("int32")
             chunk_end = T.alloc_var("int32")
             chunk_start = cu_chunk_seqlens[bc]
@@ -212,25 +262,35 @@ def chunk_cumsum_launch(
     reuse caller-owned scratch (the orchestration does, so a captured graph
     allocates nothing).
 
-    ``dt`` may be fp32 or low precision; the scan itself is fp32.
+    ``dt`` may be fp32 or low precision; the scan itself is fp32. It may be a
+    strided view of a wider buffer as long as its head axis is dense and its token
+    stride keeps the alignment the kernel's staged copy assumes.
     """
     if dt.dim() != 2:
         raise RuntimeError("dt must be [tokens, heads].")
-    if not dt.is_contiguous():
-        raise RuntimeError("dt must be contiguous.")
+    if dt.stride(-1) != 1:
+        raise RuntimeError(
+            "dt must have a dense head axis (stride(-1) == 1); its token axis may be "
+            "strided."
+        )
+    _require_aligned("dt", dt)
     heads = dt.shape[1]
     if A.numel() != heads or A.dim() != 1:
         raise RuntimeError("A must be [heads].")
+    if A.stride(-1) != 1:
+        raise RuntimeError("A must be a dense [heads] vector (stride(-1) == 1).")
     if A.dtype != torch.float32:
         raise RuntimeError("A must be fp32.")
     if dt_bias is not None and (dt_bias.numel() != heads or dt_bias.dtype != torch.float32):
         raise RuntimeError("dt_bias must be fp32 [heads].")
-    if dt_bias is not None and not dt_bias.is_contiguous():
-        raise RuntimeError("dt_bias must be contiguous.")
+    if dt_bias is not None and dt_bias.stride(-1) != 1:
+        raise RuntimeError("dt_bias must be a dense [heads] vector (stride(-1) == 1).")
     if cu_chunk_seqlens.dtype != torch.int32:
         raise RuntimeError("cu_chunk_seqlens must be int32.")
     if cu_chunk_seqlens.dim() != 1 or cu_chunk_seqlens.numel() < 2:
         raise RuntimeError("cu_chunk_seqlens must be [nchunks + 1].")
+    # The caller builds the chunk offsets dense, and the kernel reads them as a dense
+    # span, so this one is checked with is_contiguous() rather than a stride gate.
     if not cu_chunk_seqlens.is_contiguous():
         raise RuntimeError("cu_chunk_seqlens must be contiguous.")
     nchunks = cu_chunk_seqlens.numel() - 1
@@ -249,6 +309,8 @@ def chunk_cumsum_launch(
         )
     if dA_cumsum.dtype != torch.float32 or dt_out.dtype != torch.float32:
         raise RuntimeError("dA_cumsum and dt_out must be fp32.")
+    # Both are written in full -- every cell of the padded chunk -- so they stay dense
+    # buffers and keep their contiguity gate.
     if not dA_cumsum.is_contiguous() or not dt_out.is_contiguous():
         raise RuntimeError("dA_cumsum and dt_out must be contiguous.")
 
