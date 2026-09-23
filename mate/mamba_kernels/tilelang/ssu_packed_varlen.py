@@ -13,7 +13,7 @@ would tax a path that cannot use them, so the two stay separate and
 
 Contract, as the stock Triton ``selective_state_update`` defines it (see
 ``vllm/model_executor/layers/mamba/ops/mamba_ssm.py``) and as
-``mate.mamba_kernels.reference`` mirrors it:
+``mate.testing.operators.mamba`` mirrors it:
 
 - ``N`` sequences are packed into the row axis of ``x``/``dt``/``B``/``C``/``z``/
   ``out``: sequence ``b`` owns rows ``[cu_seqlens[b], cu_seqlens[b + 1])``. A
