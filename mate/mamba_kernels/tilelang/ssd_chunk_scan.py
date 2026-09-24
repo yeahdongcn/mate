@@ -353,9 +353,28 @@ def chunk_scan_launch(
         raise RuntimeError("D must be fp32.")
     if z is not None and z.shape != x.shape:
         raise RuntimeError("z must match x's shape.")
-    for tensor in (x, C, CB, dt_out, dA_cumsum, states, seq_idx, cu_chunk_seqlens, out):
-        if not tensor.is_contiguous():
-            raise RuntimeError("x, C, CB, dt_out, dA_cumsum, states, metadata and out must be contiguous.")
+    # ``z``, ``D`` and ``initial_states`` are read as dense spans too, so they are gated with
+    # the rest instead of being trusted: a strided ``z`` used to pass this check and was then
+    # addressed as if it were dense. The optional ones are skipped when absent.
+    for tensor in (
+        x,
+        C,
+        z,
+        D_param,
+        initial_states,
+        CB,
+        dt_out,
+        dA_cumsum,
+        states,
+        seq_idx,
+        cu_chunk_seqlens,
+        out,
+    ):
+        if tensor is not None and not tensor.is_contiguous():
+            raise RuntimeError(
+                "x, C, z, D, initial_states, CB, dt_out, dA_cumsum, states, metadata and "
+                "out must be contiguous."
+            )
     if out.dtype != x.dtype:
         raise RuntimeError("out must share x's dtype.")
     if block_M <= 0 or chunk_size % block_M:
