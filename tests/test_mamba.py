@@ -3105,12 +3105,16 @@ def test_ssd_state_passing_kernel_reads_strided_initial_states():
 def test_ssd_chunk_scan_kernel_keeps_its_dense_contract():
     """``chunk_scan`` is the one stage that kept its dense input contract.
 
-    Its strided declaration was tried on the device and dropped there: TileLang's GEMM
-    lowering rejected the warp partition it produced ("m_warp * n_warp must equal
-    num_warps, m_warp: 1, n_warp: 1, num_warps: 4"), and with the declaration in place a
-    strided view returned different values than the same data read contiguously, while
-    the identical pattern leaves the other stages bit-identical. So this kernel keeps
-    what the campaign measured - contiguous inputs - and refuses anything else.
+    Its strided declaration was tried on the device and dropped there: with the declaration
+    and its hints in place a strided view returned different values than the same data read
+    contiguously, while the identical pattern leaves the other stages bit-identical.
+
+    The kernel is deliberately not executed here. Under the pinned TileLang its ``T.gemm``
+    cannot be lowered at this test's shape - "m_warp * n_warp must equal num_warps, m_warp: 1,
+    n_warp: 1, num_warps: 4" (gemm.cc:196) - and the dense baseline fails identically, so the
+    shape is the limitation and not this contract. The production shapes compile and serve:
+    the campaign's six rounds all ran this kernel. What this test holds is the contract, and
+    the checks it asserts run before any kernel is built.
     """
     launcher = mate.mamba._stage("chunk_scan")
     heads, groups, dim, dstate, chunk = 4, 2, 8, 16, 8
@@ -3121,7 +3125,10 @@ def test_ssd_chunk_scan_kernel_keeps_its_dense_contract():
 
     x_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
     c_wide = torch.randn(tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device)
+    z_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
+    d_wide = torch.randn(heads, 2 * dim, dtype=torch.float32, device=device)
     x, C = x_wide[:, :, :dim], c_wide[:, :, :dstate]
+    z, D_param = z_wide[:, :, :dim], d_wide[:, :dim]
     assert x.stride(-1) == 1 and not x.is_contiguous()
 
     CB = torch.rand(nchunks, groups, chunk, chunk, dtype=torch.float32, device=device)
@@ -3131,7 +3138,7 @@ def test_ssd_chunk_scan_kernel_keeps_its_dense_contract():
     seq_idx = torch.zeros(nchunks, dtype=torch.int32, device=device)
     cu_chunk_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device=device)
 
-    def run(x_, C_):
+    def run(x_, C_, z_=None, D_=None):
         return launcher(
             x_,
             C_,
@@ -3143,18 +3150,25 @@ def test_ssd_chunk_scan_kernel_keeps_its_dense_contract():
             seq_idx,
             cu_chunk_seqlens,
             torch.empty(tokens, heads, dim, dtype=torch.bfloat16, device=device),
-            D_param=None,
-            z=None,
+            D_param=D_,
+            z=z_,
             block_M=chunk,
         )
 
-    # The dense contract: the same values through contiguous copies serve as the control,
-    # and every strided operand is refused rather than read with the wrong addressing.
-    run(x.contiguous(), C.contiguous())
+    # Every strided operand is refused rather than read with the wrong addressing.
     with pytest.raises(RuntimeError, match="must be contiguous"):
         run(x, C.contiguous())
     with pytest.raises(RuntimeError, match="must be contiguous"):
         run(x.contiguous(), C)
+    with pytest.raises(RuntimeError, match="must be contiguous"):
+        run(x.contiguous(), C.contiguous(), z_=z)
+    with pytest.raises(RuntimeError, match="must be contiguous"):
+        run(x.contiguous(), C.contiguous(), D_=D_param)
+    # A dense call passes the contract checks and only then reaches the kernel, which this
+    # shape cannot lower: the failure is the kernel's, and it is not a contract violation.
+    with pytest.raises(Exception) as excinfo:
+        run(x.contiguous(), C.contiguous())
+    assert "must be contiguous" not in str(excinfo.value)
 
 
 @supported_musa_compute_capability([31])
