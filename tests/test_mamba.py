@@ -3178,16 +3178,20 @@ def test_ssu_one_token_kernel_reads_strided_operands():
         SSU_BATCH, SSU_GROUPS, 2 * SSU_DSTATE, dtype=torch.bfloat16, device=device
     )
     c_wide = torch.randn_like(b_wide)
-    strided_case = dict(
+    b_view, c_view = b_wide[:, :, :SSU_DSTATE], c_wide[:, :, :SSU_DSTATE]
+    assert b_view.stride(-1) == 1 and not b_view.is_contiguous()
+
+    strided_out = _ssu_run_kernel(
+        dict(case, state=case["state"].clone(), B=b_view, C=c_view)
+    )
+    # The dense arm reads the same values through a contiguous copy. Sampling a second tensor
+    # here would compare different data and fail whatever the kernel did.
+    dense_case = dict(
         case,
         state=case["state"].clone(),
-        B=b_wide[:, :, :SSU_DSTATE],
-        C=c_wide[:, :, :SSU_DSTATE],
+        B=b_view.contiguous(),
+        C=c_view.contiguous(),
     )
-    assert strided_case["B"].stride(-1) == 1 and not strided_case["B"].is_contiguous()
-
-    strided_out = _ssu_run_kernel(strided_case)
-    dense_case = dict(case, state=case["state"].clone())
     dense_out = _ssu_run_kernel(dense_case)
     assert torch.equal(strided_out, dense_out)
     assert torch.equal(strided_case["state"], dense_case["state"])
@@ -3217,17 +3221,24 @@ def test_ssu_packed_kernel_reads_strided_operands():
     )
     c_wide = torch.randn_like(b_wide)
     x_wide = torch.randn(rows, MTP_HEADS, 2 * MTP_DIM, dtype=MTP_IO_DTYPE, device=device)
-    strided_case = dict(
+    x_view, b_view, c_view = (
+        x_wide[:, :, :MTP_DIM],
+        b_wide[:, :, :MTP_DSTATE],
+        c_wide[:, :, :MTP_DSTATE],
+    )
+    assert x_view.stride(-1) == 1 and not x_view.is_contiguous()
+
+    strided_out = _mtp_run_kernel(
+        dict(case, state=case["state"].clone(), x=x_view, B=b_view, C=c_view)
+    )
+    # Same values through contiguous copies: the view is the only difference between the arms.
+    dense_case = dict(
         case,
         state=case["state"].clone(),
-        x=x_wide[:, :, :MTP_DIM],
-        B=b_wide[:, :, :MTP_DSTATE],
-        C=c_wide[:, :, :MTP_DSTATE],
+        x=x_view.contiguous(),
+        B=b_view.contiguous(),
+        C=c_view.contiguous(),
     )
-    assert strided_case["x"].stride(-1) == 1 and not strided_case["x"].is_contiguous()
-
-    strided_out = _mtp_run_kernel(strided_case)
-    dense_case = dict(case, state=case["state"].clone())
     dense_out = _mtp_run_kernel(dense_case)
     assert torch.equal(strided_out, dense_out)
     assert torch.equal(strided_case["state"], dense_case["state"])
@@ -3278,4 +3289,4 @@ def test_every_assumed_stride_symbol_is_bound():
                     "but that module never binds it"
                 )
         checked += 1
-    assert checked >= 7, f"only {checked} kernel modules declare T.assume hints"
+    assert checked >= 6, f"only {checked} kernel modules declare T.assume hints"

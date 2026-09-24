@@ -151,6 +151,12 @@ def tilelang_ssd_chunk_scan(
     #: are declared strided: their outer axes may be views of a wider buffer while the
     #: axis each block load walks (``dim`` for ``x``/``z``/``D``, ``dstate`` for
     #: ``C``/``initial_states``) is pinned to stride 1, which the launcher enforces.
+    #:
+    #: No ``T.assume`` here, unlike the other kernels. On the device the hinted build of
+    #: this kernel returned different values for a strided view than for the same values
+    #: in a contiguous tensor, while the same hint pattern leaves the other kernels
+    #: bit-identical. The declaration and the launcher's stride checks stay; the hint is
+    #: what awaits an explanation, and the suite tracks it.
     #: ``CB``, ``dt_out``, ``dA_cumsum`` and ``states`` are the dense buffers the
     #: earlier stages write, ``out`` is written in place here, and ``seq_idx`` /
     #: ``cu_chunk_seqlens`` are caller-built metadata: all stay ``T.Tensor``.
@@ -200,16 +206,6 @@ def tilelang_ssd_chunk_scan(
         has_z: T.int32,
     ):
         with T.Kernel(m_tiles, nchunks, heads, threads=threads) as (bm, bc, bh):
-            T.assume(x_stride_token % io_align == 0)
-            T.assume(x_stride_head % io_align == 0)
-            T.assume(c_stride_token % c_align == 0)
-            T.assume(c_stride_group % c_align == 0)
-            T.assume(init_stride_seq % init_align == 0)
-            T.assume(init_stride_head % init_align == 0)
-            T.assume(init_stride_dim % init_align == 0)
-            T.assume(d_stride_head % d_align == 0)
-            T.assume(z_stride_token % io_align == 0)
-            T.assume(z_stride_head % io_align == 0)
 
             row0 = bm * block_M
             chunk_start = cu_chunk_seqlens[bc]
