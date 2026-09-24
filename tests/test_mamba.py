@@ -3102,7 +3102,16 @@ def test_ssd_state_passing_kernel_reads_strided_initial_states():
 
 @supported_musa_compute_capability([31])
 @torch.inference_mode
-def test_ssd_chunk_scan_kernel_reads_strided_inputs():
+def test_ssd_chunk_scan_kernel_keeps_its_dense_contract():
+    """``chunk_scan`` is the one stage that kept its dense input contract.
+
+    Its strided declaration was tried on the device and dropped there: TileLang's GEMM
+    lowering rejected the warp partition it produced ("m_warp * n_warp must equal
+    num_warps, m_warp: 1, n_warp: 1, num_warps: 4"), and with the declaration in place a
+    strided view returned different values than the same data read contiguously, while
+    the identical pattern leaves the other stages bit-identical. So this kernel keeps
+    what the campaign measured - contiguous inputs - and refuses anything else.
+    """
     launcher = mate.mamba._stage("chunk_scan")
     heads, groups, dim, dstate, chunk = 4, 2, 8, 16, 8
     nchunks = 1
@@ -3112,23 +3121,17 @@ def test_ssd_chunk_scan_kernel_reads_strided_inputs():
 
     x_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
     c_wide = torch.randn(tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device)
-    z_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
-    init_wide = torch.randn(1, heads, dim, 2 * dstate, dtype=torch.bfloat16, device=device)
-    d_wide = torch.randn(heads, 2 * dim, dtype=torch.float32, device=device)
-    x, C, z = x_wide[:, :, :dim], c_wide[:, :, :dstate], z_wide[:, :, :dim]
-    initial, D_param = init_wide[:, :, :, :dstate], d_wide[:, :dim]
-    assert x.stride(-1) == 1 and not x.is_contiguous() and not C.is_contiguous()
+    x, C = x_wide[:, :, :dim], c_wide[:, :, :dstate]
+    assert x.stride(-1) == 1 and not x.is_contiguous()
 
     CB = torch.rand(nchunks, groups, chunk, chunk, dtype=torch.float32, device=device)
     dt_out = torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device)
     dA_cumsum = -torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device)
-    states = torch.randn(
-        nchunks, heads, dim, dstate, dtype=torch.bfloat16, device=device
-    )
+    states = torch.randn(nchunks, heads, dim, dstate, dtype=torch.bfloat16, device=device)
     seq_idx = torch.zeros(nchunks, dtype=torch.int32, device=device)
     cu_chunk_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device=device)
 
-    def run(x_, C_, z_, initial_, D_):
+    def run(x_, C_):
         return launcher(
             x_,
             C_,
@@ -3136,33 +3139,20 @@ def test_ssd_chunk_scan_kernel_reads_strided_inputs():
             dt_out,
             dA_cumsum,
             states,
-            initial_,
+            None,
             seq_idx,
             cu_chunk_seqlens,
             torch.empty(tokens, heads, dim, dtype=torch.bfloat16, device=device),
-            D_param=D_,
-            z=z_,
             block_M=chunk,
         )
 
-    strided = run(x, C, z, initial, D_param)
-    dense = run(
-        x.contiguous(),
-        C.contiguous(),
-        z.contiguous(),
-        initial.contiguous(),
-        D_param.contiguous(),
-    )
-    assert torch.equal(strided, dense)
-
-    with pytest.raises(RuntimeError, match="dense innermost axis"):
-        run(x_wide[:, :, ::2], C, z, initial, D_param)
-    odd_c = torch.randn(tokens, groups, dstate + 4, dtype=torch.bfloat16, device=device)
-    with pytest.raises(RuntimeError, match="multiple of 8"):
-        run(x, odd_c[:, :, :dstate], z, initial, D_param)
-    odd_d = torch.randn(heads, dim + 2, dtype=torch.float32, device=device)
-    with pytest.raises(RuntimeError, match="multiple of 4"):
-        run(x, C, z, initial, odd_d[:, :dim])
+    # The dense contract: the same values through contiguous copies serve as the control,
+    # and every strided operand is refused rather than read with the wrong addressing.
+    run(x.contiguous(), C.contiguous())
+    with pytest.raises(RuntimeError, match="must be contiguous"):
+        run(x, C.contiguous())
+    with pytest.raises(RuntimeError, match="must be contiguous"):
+        run(x.contiguous(), C)
 
 
 @supported_musa_compute_capability([31])
@@ -3181,17 +3171,16 @@ def test_ssu_one_token_kernel_reads_strided_operands():
     b_view, c_view = b_wide[:, :, :SSU_DSTATE], c_wide[:, :, :SSU_DSTATE]
     assert b_view.stride(-1) == 1 and not b_view.is_contiguous()
 
-    strided_out = _ssu_run_kernel(
-        dict(case, state=case["state"].clone(), B=b_view, C=c_view)
-    )
-    # The dense arm reads the same values through a contiguous copy. Sampling a second tensor
-    # here would compare different data and fail whatever the kernel did.
+    # Both arms read the same values; the view is the only difference. Sampling a second tensor
+    # for the dense arm would compare different data and fail whatever the kernel did.
+    strided_case = dict(case, state=case["state"].clone(), B=b_view, C=c_view)
     dense_case = dict(
         case,
         state=case["state"].clone(),
         B=b_view.contiguous(),
         C=c_view.contiguous(),
     )
+    strided_out = _ssu_run_kernel(strided_case)
     dense_out = _ssu_run_kernel(dense_case)
     assert torch.equal(strided_out, dense_out)
     assert torch.equal(strided_case["state"], dense_case["state"])
@@ -3228,10 +3217,8 @@ def test_ssu_packed_kernel_reads_strided_operands():
     )
     assert x_view.stride(-1) == 1 and not x_view.is_contiguous()
 
-    strided_out = _mtp_run_kernel(
-        dict(case, state=case["state"].clone(), x=x_view, B=b_view, C=c_view)
-    )
-    # Same values through contiguous copies: the view is the only difference between the arms.
+    # Same values in both arms; the view is the only difference between them.
+    strided_case = dict(case, state=case["state"].clone(), x=x_view, B=b_view, C=c_view)
     dense_case = dict(
         case,
         state=case["state"].clone(),
@@ -3239,6 +3226,7 @@ def test_ssu_packed_kernel_reads_strided_operands():
         B=b_view.contiguous(),
         C=c_view.contiguous(),
     )
+    strided_out = _mtp_run_kernel(strided_case)
     dense_out = _mtp_run_kernel(dense_case)
     assert torch.equal(strided_out, dense_out)
     assert torch.equal(strided_case["state"], dense_case["state"])
