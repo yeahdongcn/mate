@@ -3143,6 +3143,8 @@ def test_ssd_chunk_scan_kernel_keeps_its_dense_contract():
             seq_idx,
             cu_chunk_seqlens,
             torch.empty(tokens, heads, dim, dtype=torch.bfloat16, device=device),
+            D_param=None,
+            z=None,
             block_M=chunk,
         )
 
