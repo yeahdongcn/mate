@@ -100,6 +100,20 @@ def tilelang_ssd_chunk_scan(
     head_ratio = heads // groups
     threads = 128
 
+    #: ``x``, ``C``, ``z``, ``D`` and ``initial_states`` stay dense, unlike the other
+    #: stages: their stride contract was tried here and dropped on the device's evidence.
+    #: With the declaration and its hints in place, a strided view returned different
+    #: values than the same data read contiguously, while the identical pattern leaves the
+    #: other kernels bit-identical - so the conversion is not safe for this kernel and the
+    #: launcher's contiguity gate is the contract.
+    #:
+    #: Separately, and not caused by that conversion: this kernel's ``T.gemm`` cannot be
+    #: lowered at small test shapes under the pinned TileLang ("m_warp * n_warp must equal
+    #: num_warps, m_warp: 1, n_warp: 1, num_warps: 4", gemm.cc:196). The dense declaration
+    #: fails the same way, which is why the contract is asserted without executing the
+    #: kernel at that shape: tests/test_mamba.py::test_ssd_chunk_scan_kernel_keeps_its_dense_contract.
+    #: The production shapes compile and serve - the campaign's rounds all ran this kernel -
+    #: so the limitation is the test shape's, not this change's.
     @T.prim_func
     def tilelang_ssd_chunk_scan_kernel(
         x: T.Tensor((num_tokens, heads, dim), dtype=io_dtype),
@@ -334,11 +348,33 @@ def chunk_scan_launch(
         raise RuntimeError("seq_idx and cu_chunk_seqlens must be int32.")
     if D_param is not None and D_param.shape != (heads, dim):
         raise RuntimeError("D must be [heads, dim].")
+    if D_param is not None and D_param.dtype != torch.float32:
+        # The kernel declares D fp32; a lower-precision D would be read as fp32.
+        raise RuntimeError("D must be fp32.")
     if z is not None and z.shape != x.shape:
         raise RuntimeError("z must match x's shape.")
-    for tensor in (x, C, CB, dt_out, dA_cumsum, states, seq_idx, cu_chunk_seqlens, out):
-        if not tensor.is_contiguous():
-            raise RuntimeError("x, C, CB, dt_out, dA_cumsum, states, metadata and out must be contiguous.")
+    # ``z``, ``D`` and ``initial_states`` are read as dense spans too, so they are gated with
+    # the rest instead of being trusted: a strided ``z`` used to pass this check and was then
+    # addressed as if it were dense. The optional ones are skipped when absent.
+    for tensor in (
+        x,
+        C,
+        z,
+        D_param,
+        initial_states,
+        CB,
+        dt_out,
+        dA_cumsum,
+        states,
+        seq_idx,
+        cu_chunk_seqlens,
+        out,
+    ):
+        if tensor is not None and not tensor.is_contiguous():
+            raise RuntimeError(
+                "x, C, z, D, initial_states, CB, dt_out, dA_cumsum, states, metadata and "
+                "out must be contiguous."
+            )
     if out.dtype != x.dtype:
         raise RuntimeError("out must share x's dtype.")
     if block_M <= 0 or chunk_size % block_M:
