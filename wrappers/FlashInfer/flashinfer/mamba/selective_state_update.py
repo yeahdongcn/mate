@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from . import _backend
 
 __all__ = ["selective_state_update"]
@@ -20,22 +22,42 @@ __all__ = ["selective_state_update"]
 #: (``vllm.v1.attention.backends.utils.NULL_BLOCK_ID``).
 NULL_BLOCK_ID = 0
 
+#: Widest vector load MATE's SSU kernels issue, in bytes.
+_VECTOR_BYTES = 16
 
-import torch
 
+def _vector_aligned(tensor: Any) -> bool:
+    """Whether every row of ``tensor`` starts where MATE's vector loads may begin.
 
-def _materialized(tensor: Any) -> Any:
-    """Return a contiguous tensor, copying only when vLLM passed a view.
-
-    x and dt both arrive as views of the mixer's projected states. dt keeps its
-    broadcast form and is read per head, so this only ever copies x, and only when
-    the reshape vLLM performed did not already leave it contiguous.
+    The alignment is 16 bytes in elements, narrowed to the last axis's extent, and
+    holds for the storage offset and for the stride of every non-unit outer axis.
     """
-    if tensor is None or not hasattr(tensor, "is_contiguous"):
+    extent = tensor.shape[-1]
+    align = min(_VECTOR_BYTES // tensor.element_size(), (extent & -extent) or 1)
+    if tensor.storage_offset() % align:
+        return False
+    return all(
+        size == 1 or stride % align == 0
+        for size, stride in zip(tensor.shape[:-1], tensor.stride()[:-1])
+    )
+
+
+def _readable(tensor: Any, *, vector_loads: bool = False) -> Any:
+    """Return ``tensor`` unchanged when MATE's SSU kernels can read it in place.
+
+    The kernels read x, B and C through their strides, so vLLM's views of the
+    projected states pass as they are. A copy is made only when the last axis is
+    not dense or, for the vector-loaded B and C, a row start is misaligned.
+    """
+    if tensor is None or not hasattr(tensor, "stride"):
         return tensor
-    if tensor.is_contiguous():
-        return tensor
-    return tensor.contiguous()
+    if tensor.stride(-1) != 1:
+        return tensor.contiguous()
+    if vector_loads and not _vector_aligned(tensor):
+        # contiguous() keeps a dense tensor whose start is off the grid; a fresh
+        # allocation is aligned.
+        return tensor.clone(memory_format=torch.contiguous_format)
+    return tensor
 
 
 def _flat_slots(indices: Any) -> Any:
@@ -91,9 +113,9 @@ def _dt_input(tensor: Any) -> Any:
 
     vLLM expands dt across head_dim, so it arrives as a zero-stride view in the
     model dtype. MATE reads one step value per head and widens it inside the
-    kernel, so the broadcast's base -- a contiguous [batch, heads] buffer -- is
-    handed over as [batch, heads, 1]. The values are identical by construction,
-    and the decode path loses a per-layer cast launch.
+    kernel, so the broadcast's base -- a [batch, heads] view with a dense head
+    axis -- is handed over as [batch, heads, 1]. The values are identical by
+    construction, and the decode path loses a per-layer cast launch.
     """
     if tensor is None or not hasattr(tensor, "stride"):
         return tensor
@@ -174,20 +196,13 @@ def selective_state_update(
     # reason the caller could not act on: vLLM has no fp32 D to pass.
     D = _per_head_fp32(D)
     dt_bias = _per_head_fp32(dt_bias)
-    x = _materialized(x)
-    # B and C come from splitting the mixer's fused B_C projection. A plain decode step
-    # passes a one-row slice, which the reshape leaves packed; a speculative step passes
-    # the multi-token slice, whose rows are separated by the fused width and so violate
-    # the kernel's packed-input ABI ("input B strides[0] violates packed ABI
-    # constraint"). This is the same division of labour as x above: vLLM chooses the
-    # layout, the adapter restores it, and the copy is a no-op when it is already packed.
-    B = _materialized(B)
-    C = _materialized(C)
+    x = _readable(x)
+    B = _readable(B, vector_loads=True)
+    C = _readable(C, vector_loads=True)
     dt = _dt_input(dt)
-    if hasattr(dt, "is_contiguous") and not dt.is_contiguous():
-        # The zero-stride trick only returns a contiguous view when the head stride is
-        # already 1, which is how vLLM builds it. Any other layout is materialized
-        # instead of handed to a kernel that requires contiguity.
+    if hasattr(dt, "stride") and dt.shape[-1] != 1 and dt.stride(-1) != 1:
+        # The per-head [rows, heads, 1] form never advances its last axis; any other
+        # dt is read along it and needs it dense.
         dt = dt.contiguous()
     state_batch_indices = _flat_slots(state_batch_indices)
     dst_state_batch_indices = _flat_slots(dst_state_batch_indices)

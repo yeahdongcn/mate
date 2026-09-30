@@ -294,6 +294,48 @@ def test_selective_state_update_flattens_only_one_slot_per_sequence(recording_ba
     assert forwarded[DST_SLOTS] is per_step
 
 
+def test_selective_state_update_reads_projection_views_in_place(recording_backend):
+    calls, _ = recording_backend
+    sentinels = [object() for _ in range(7)]
+    # vLLM slices x, B, C and dt out of one projection buffer: each is dense along
+    # its last axis and its rows are one projection width apart.
+    rows, heads, head_dim, state_dim = 7, 8, 64, 128
+    x_end, b_end = heads * head_dim, heads * head_dim + state_dim
+    proj = torch.zeros(rows, b_end + state_dim + heads, dtype=torch.bfloat16)
+    x = proj[:, :x_end].view(rows, heads, head_dim)
+    B = proj[:, x_end:b_end].view(rows, 1, state_dim)
+    C = proj[:, b_end : b_end + state_dim].view(rows, 1, state_dim)
+    dt = proj[:, -heads:].unsqueeze(-1).expand(rows, heads, head_dim)
+
+    selective_state_update(sentinels[0], x, dt, sentinels[3], B, C, sentinels[6])
+
+    _, forwarded, _ = calls[-1]
+    assert forwarded[1] is x
+    assert forwarded[4] is B
+    assert forwarded[5] is C
+    # dt reaches MATE as its per-head [rows, heads, 1] base, still a view.
+    assert forwarded[2].shape == (rows, heads, 1)
+    assert forwarded[2].data_ptr() == dt.data_ptr()
+
+
+def test_selective_state_update_copies_what_the_kernels_cannot_read(recording_backend):
+    calls, _ = recording_backend
+    sentinels = [object() for _ in range(7)]
+    torch.manual_seed(0)
+    # A dense B that starts one element off the 16-byte grid of the vector loads.
+    shifted = torch.randn(7 * 128 + 1).to(torch.bfloat16)[1:].view(7, 1, 128)
+    # A C whose last axis is not dense.
+    strided = torch.randn(7, 1, 256).to(torch.bfloat16)[..., ::2]
+
+    selective_state_update(*sentinels[:4], shifted, strided, sentinels[6])
+
+    _, forwarded, _ = calls[-1]
+    B, C = forwarded[4], forwarded[5]
+    assert B is not shifted and B.storage_offset() == 0
+    assert torch.equal(B, shifted)
+    assert C.is_contiguous() and torch.equal(C, strided)
+
+
 def test_replayssm_materialize_keeps_keyword_only_shape(recording_backend):
     calls, _ = recording_backend
     positional = [object() for _ in range(16)]
