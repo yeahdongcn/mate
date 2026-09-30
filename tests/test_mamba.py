@@ -3042,6 +3042,44 @@ def test_ssd_chunk_cumsum_kernel_reads_a_strided_dt():
 
 
 @supported_musa_compute_capability([31])
+def test_ssd_chunk_cumsum_packs_heads_only_while_the_grid_stays_wide():
+    from mate.mamba_kernels.tilelang import ssd_chunk_cumsum
+
+    pick = ssd_chunk_cumsum._heads_per_block
+    # 64 heads: one head per CTA up to four chunks, two at eight, four from sixteen.
+    assert [pick(64, n) for n in (1, 4, 8, 16, 32)] == [1, 1, 2, 4, 4]
+    assert pick(6, 1000) == 2
+    assert pick(5, 1000) == 1
+    assert pick(64, 32, requested=8) == 8
+    with pytest.raises(RuntimeError, match="divisor"):
+        pick(64, 4, requested=3)
+
+
+@supported_musa_compute_capability([31])
+@torch.inference_mode
+def test_ssd_chunk_cumsum_output_does_not_depend_on_heads_per_block():
+    launcher = mate.mamba._stage("cumsum")
+    heads, chunk = 64, 128
+    device = torch.device("musa")
+    torch.manual_seed(0)
+    # Full, partial, single-token, full and partial chunks.
+    cu_chunk_seqlens = torch.tensor(
+        [0, 128, 200, 201, 329, 400], dtype=torch.int32, device=device
+    )
+    dt = torch.randn(400, heads, dtype=torch.bfloat16, device=device)
+    A = -torch.rand(heads, dtype=torch.float32, device=device)
+    dt_bias = torch.rand(heads, dtype=torch.float32, device=device)
+
+    args = (dt, A, dt_bias, cu_chunk_seqlens, chunk)
+    dA, dt_out = launcher(*args, dt_softplus=True)
+    for hb in (1, 2, 4, 8):
+        other = launcher(*args, dt_softplus=True, heads_per_block=hb)
+        assert torch.equal(other[0], dA) and torch.equal(other[1], dt_out), hb
+    with pytest.raises(RuntimeError, match="divisor"):
+        launcher(*args, dt_softplus=True, heads_per_block=3)
+
+
+@supported_musa_compute_capability([31])
 @torch.inference_mode
 def test_ssd_chunk_state_kernel_reads_strided_operands():
     launcher = mate.mamba._stage("chunk_state")
