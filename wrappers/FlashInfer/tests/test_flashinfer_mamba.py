@@ -9,6 +9,7 @@ family's own tests.
 
 import importlib
 import inspect
+import logging
 import sys
 import types
 
@@ -188,6 +189,22 @@ def test_varlen_call_is_forwarded_by_name_with_every_argument(recording_backend)
     assert list(kwargs) == mate_parameters
     assert list(kwargs.values()) == args
     assert result == "ssd_combined_fwd_varlen:result"
+
+
+def test_varlen_copies_strided_inputs_without_logging(recording_backend, caplog):
+    calls, _ = recording_backend
+    # A strided x, as vLLM's projected states arrive on every prefill chunk.
+    x = torch.randn(16, 2, 32)[:, :, ::2]
+    args = [x] + [object() for _ in range(10)] + [None] * 11
+
+    with caplog.at_level(logging.DEBUG):
+        ssd_combined_fwd_varlen(*args)
+
+    _, _, kwargs = calls[0]
+    assert kwargs["x"].is_contiguous()
+    assert torch.equal(kwargs["x"], x)
+    # The copy is routine on this path; it must not cost a log record per call.
+    assert caplog.records == []
 
 
 # The consumer (vLLM's Mamba2 SSD routing) calls this entry point by keyword,

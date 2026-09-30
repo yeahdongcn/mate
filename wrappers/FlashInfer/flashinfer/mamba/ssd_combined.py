@@ -18,14 +18,11 @@ belong to the MATE implementation or its environment.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
 
 from . import _backend
-
-_LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "mamba_chunk_scan_combined_varlen",
@@ -33,21 +30,22 @@ __all__ = [
 ]
 
 
-def _contiguous(name: str, tensor: Any) -> Any:
+def _contiguous(tensor: Any) -> Any:
     """Give MATE a contiguous tensor, copying only when it is not already one.
 
     MATE's packed entry point rejects strided inputs, and vLLM hands it views: the
     projected states are slices of one projection buffer, and the chunk metadata can
     be a strided slice of the scheduler's own arrays. Copying unconditionally would
     add an allocation to every prefill step, so the copy is skipped in the common
-    contiguous case and named in the log when it happens.
+    contiguous case.
     """
     if tensor is None or not hasattr(tensor, "is_contiguous"):
         return tensor
     if tensor.is_contiguous():
         return tensor
-    _LOGGER.info("SSD argument %s arrived non-contiguous; copied to contiguous.", name)
     return tensor.contiguous()
+
+
 # vLLM hands D and dt_bias in the model dtype; MATE's stages take fp32 per-head
 # vectors. Widening bf16/fp16 to fp32 is exact, and the copies are cached because
 # these are loaded parameters rather than per-step tensors -- the same treatment
@@ -131,14 +129,14 @@ def ssd_combined_fwd_varlen(
     D = _skip_matrix(D, out)
 
     implementation = _backend.resolve("ssd_combined_fwd_varlen")
-    x = _contiguous("x", x)
-    dt = _contiguous("dt", dt)
-    B = _contiguous("B", B)
-    C = _contiguous("C", C)
-    cu_seqlens = _contiguous("cu_seqlens", cu_seqlens)
-    cu_chunk_seqlens = _contiguous("cu_chunk_seqlens", cu_chunk_seqlens)
-    last_chunk_indices = _contiguous("last_chunk_indices", last_chunk_indices)
-    seq_idx = _contiguous("seq_idx", seq_idx)
+    x = _contiguous(x)
+    dt = _contiguous(dt)
+    B = _contiguous(B)
+    C = _contiguous(C)
+    cu_seqlens = _contiguous(cu_seqlens)
+    cu_chunk_seqlens = _contiguous(cu_chunk_seqlens)
+    last_chunk_indices = _contiguous(last_chunk_indices)
+    seq_idx = _contiguous(seq_idx)
 
     # Forwarded by name, not by position: upstream FlashInfer orders
     # `initial_states, dt_softplus, dt_limit` while MATE's family orders
