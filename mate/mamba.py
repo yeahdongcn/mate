@@ -749,29 +749,44 @@ def reset_ssd_workspaces() -> None:
     _WORKSPACES.clear()
 
 
+_STAGE_LAUNCHERS: dict | None = None
+
+
 def _stage(name: str):
     """Resolve one stage launcher.
 
     Imported lazily so that a partial checkout fails with the name of the missing
     stage rather than an ImportError at module import, and so the stage table
-    stays patchable for tests.
+    stays patchable for tests. The table is built once; each stage's compiled
+    kernel is then reused across calls instead of being re-resolved by the JIT.
     """
-    from mate.mamba_kernels.tilelang import (
-        ssd_bmm,
-        ssd_chunk_cumsum,
-        ssd_chunk_scan,
-        ssd_chunk_state,
-        ssd_state_passing,
-    )
+    global _STAGE_LAUNCHERS
+    if _STAGE_LAUNCHERS is None:
+        from mate.mamba_kernels.tilelang import (
+            ssd_bmm,
+            ssd_chunk_cumsum,
+            ssd_chunk_scan,
+            ssd_chunk_state,
+            ssd_state_passing,
+        )
+        from mate.mamba_kernels.tilelang._kernel_cache import reuse_compiled
 
-    launchers = {
-        "cumsum": ssd_chunk_cumsum.chunk_cumsum_launch,
-        "chunk_state": ssd_chunk_state.ssd_chunk_state_launch,
-        "state_passing": ssd_state_passing.ssd_state_passing_launch,
-        "bmm": ssd_bmm.ssd_bmm_launch,
-        "chunk_scan": ssd_chunk_scan.chunk_scan_launch,
-    }
-    return launchers[name]
+        for module, factory in (
+            (ssd_chunk_cumsum, "tilelang_ssd_chunk_cumsum"),
+            (ssd_chunk_state, "tilelang_ssd_chunk_state"),
+            (ssd_state_passing, "tilelang_ssd_state_passing"),
+            (ssd_bmm, "tilelang_ssd_bmm"),
+            (ssd_chunk_scan, "tilelang_ssd_chunk_scan"),
+        ):
+            reuse_compiled(module, factory)
+        _STAGE_LAUNCHERS = {
+            "cumsum": ssd_chunk_cumsum.chunk_cumsum_launch,
+            "chunk_state": ssd_chunk_state.ssd_chunk_state_launch,
+            "state_passing": ssd_state_passing.ssd_state_passing_launch,
+            "bmm": ssd_bmm.ssd_bmm_launch,
+            "chunk_scan": ssd_chunk_scan.chunk_scan_launch,
+        }
+    return _STAGE_LAUNCHERS[name]
 
 
 @mate_api

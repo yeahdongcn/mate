@@ -33,6 +33,7 @@ import itertools
 import os
 import pathlib
 import re
+import types
 
 import pytest
 import torch
@@ -2922,6 +2923,30 @@ def test_workspace_is_reused_across_calls(combined_oracle):
         assert space.dt_out is second[key].dt_out
         assert space.states is second[key].states
         assert space.CB is second[key].CB
+
+
+def test_stage_factories_reuse_the_kernel_compiled_for_the_same_arguments():
+    """A stage launcher asks its factory for the kernel on every call; the factory
+    must build it once per argument set and hand the same kernel back after that."""
+    from mate.mamba_kernels.tilelang._kernel_cache import reuse_compiled
+
+    built = []
+
+    def factory(*args, **kwargs):
+        built.append(args)
+        return object()
+
+    factory.symbol = "tilelang_ssd_stage"
+    module = types.SimpleNamespace(tilelang_ssd_stage=factory)
+    reuse_compiled(module, "tilelang_ssd_stage")
+    reuse_compiled(module, "tilelang_ssd_stage")
+
+    first = module.tilelang_ssd_stage(64, 128, torch.bfloat16)
+    assert module.tilelang_ssd_stage(64, 128, torch.bfloat16) is first
+    assert module.tilelang_ssd_stage(64, 128, torch.float32) is not first
+    assert built == [(64, 128, torch.bfloat16), (64, 128, torch.float32)]
+    # Attributes of the factory stay reachable through the cache.
+    assert module.tilelang_ssd_stage.symbol == "tilelang_ssd_stage"
 
 
 # ---------------------------------------------------------------------------
