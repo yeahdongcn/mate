@@ -950,7 +950,8 @@ def ssd_combined_fwd_varlen(
     )
     if return_intermediate_states:
         return space.states
-    return space.states.index_select(0, last_chunk_indices)
+    # MUSA: index_select runs this gather about five times slower than indexing.
+    return space.states[last_chunk_indices]
 
 
 @mate_api
