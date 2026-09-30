@@ -38,18 +38,16 @@ def _materialized(tensor: Any) -> Any:
     return tensor.contiguous()
 
 
-def _flat_slots(indices: Any, batch: int) -> Any:
-    """Return the slot vector MATE expects, or leave it for MATE to refuse.
+def _flat_slots(indices: Any) -> Any:
+    """Return a slot table in the form MATE addresses.
 
-    vLLM hands over `state_indices_tensor_d[:num_decode_tokens]`, which arrives
-    shaped [rows, width]. Flattening is only correct when the tensor carries one
-    slot per row; a speculative call carries one slot per accepted token, and
-    guessing there would pair rows with the wrong state. Those calls keep their
-    shape and MATE refuses them explicitly.
+    A ``[sequences, 1]`` table is the one-slot-per-sequence vector and is passed
+    flat. A ``[sequences, steps]`` table keeps its shape: MATE reads entry
+    ``[b, t]`` through the table's strides, as the Triton kernel does.
     """
-    if indices is None or batch is None or not hasattr(indices, "dim"):
+    if indices is None or not hasattr(indices, "dim"):
         return indices
-    if indices.dim() > 1 and indices.numel() == batch:
+    if indices.dim() == 2 and indices.shape[1] == 1:
         return indices.reshape(-1)
     return indices
 
@@ -191,11 +189,8 @@ def selective_state_update(
         # already 1, which is how vLLM builds it. Any other layout is materialized
         # instead of handed to a kernel that requires contiguity.
         dt = dt.contiguous()
-    # x can be a non-tensor sentinel on the pure-forwarding path, in which case
-    # there is no batch to compare against and the indices pass through.
-    batch = x.shape[0] if hasattr(x, "shape") else None
-    state_batch_indices = _flat_slots(state_batch_indices, batch)
-    dst_state_batch_indices = _flat_slots(dst_state_batch_indices, batch)
+    state_batch_indices = _flat_slots(state_batch_indices)
+    dst_state_batch_indices = _flat_slots(dst_state_batch_indices)
     return implementation(
         state,
         x,

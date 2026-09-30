@@ -13,6 +13,7 @@ import sys
 import types
 
 import pytest
+import torch
 
 from flashinfer.mamba import (
     allocate_checkpointing_ssu_scratch,
@@ -256,6 +257,41 @@ def test_selective_state_update_forwards_keyword_capabilities(recording_backend)
     assert len(forwarded) == len(mate_parameters)
     assert kwargs == {}
     assert result == "selective_state_update:result"
+
+
+# Positions of the two slot tables in the call forwarded to MATE.
+SLOTS, DST_SLOTS = 10, 22
+
+
+def test_selective_state_update_flattens_only_one_slot_per_sequence(recording_backend):
+    calls, _ = recording_backend
+    sentinels = [object() for _ in range(7)]
+
+    per_sequence = torch.arange(4).reshape(4, 1)
+    selective_state_update(
+        *sentinels,
+        state_batch_indices=per_sequence,
+        dst_state_batch_indices=per_sequence,
+    )
+    _, forwarded, _ = calls[-1]
+    assert forwarded[SLOTS].shape == (4,)
+    assert forwarded[DST_SLOTS].shape == (4,)
+
+    # A speculative step carries one slot per draft position. The table keeps its
+    # [sequences, steps] shape even when its size equals the number of token rows,
+    # so every row stays paired with its own sequence's slots.
+    per_step = torch.arange(4 * 7).reshape(4, 7)
+    tokens = torch.zeros(4 * 7, 2, 8)
+    selective_state_update(
+        sentinels[0],
+        tokens,
+        *sentinels[2:],
+        state_batch_indices=per_step,
+        dst_state_batch_indices=per_step,
+    )
+    _, forwarded, _ = calls[-1]
+    assert forwarded[SLOTS] is per_step
+    assert forwarded[DST_SLOTS] is per_step
 
 
 def test_replayssm_materialize_keeps_keyword_only_shape(recording_backend):
