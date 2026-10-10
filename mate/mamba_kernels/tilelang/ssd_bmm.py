@@ -78,6 +78,53 @@ def _dot_dtype(a_dtype: torch.dtype, b_dtype: torch.dtype) -> torch.dtype:
     return torch.float32
 
 
+#: Elements per 16-byte vector -- the widest load the target issues -- by dtype.
+_ALIGN_ELEMS = {torch.float16: 8, torch.bfloat16: 8, torch.float32: 4}
+
+
+def _align_elems(dtype: torch.dtype, extent: int) -> int:
+    """The stride alignment, in elements, the kernel asserts for one input.
+
+    ``extent`` is the length of the axis a strided input is walked along. A 16-byte
+    load is the widest this target issues and a load is never wider than the axis it
+    walks, so the alignment a row start has to keep is the narrower of the two: a
+    bf16 axis of 12 elements is read in 8-byte steps, not 16-byte ones.
+    """
+    align = _ALIGN_ELEMS.get(dtype)
+    if align is None:
+        raise RuntimeError(
+            f"a strided input of dtype {dtype} has no defined 16-byte alignment."
+        )
+    return min(align, (extent & -extent) or 1)
+
+
+def _require_aligned(name: str, tensor: torch.Tensor) -> None:
+    """Refuse an outer stride that the kernel's ``T.assume`` lines would deny.
+
+    ``T.assume`` is a compiler hint rather than a check, and a hint that does not
+    hold is undefined behaviour, so the alignment the kernel asserts for ``tensor``'s
+    outer strides has to be enforced here. A strided input is walked along its last
+    axis, so that axis supplies the extent. An axis of extent 1 is exempt: nothing is
+    ever addressed along it, so its stride cannot misalign a row start. Aligned
+    strides over a misaligned base would still issue misaligned vector loads, so
+    the storage offset is checked too.
+    """
+    align = _align_elems(tensor.dtype, tensor.shape[-1])
+    if tensor.storage_offset() % align != 0:
+        raise RuntimeError(
+            f"{name} must start at a storage offset that is a multiple of {align} "
+            f"elements ({align * tensor.element_size()}-byte alignment for "
+            f"{tensor.dtype}); got offset {tensor.storage_offset()}."
+        )
+    for axis, stride in enumerate(tensor.stride()[:-1]):
+        if tensor.shape[axis] != 1 and stride % align != 0:
+            raise RuntimeError(
+                f"{name} stride({axis}) must be a multiple of {align} elements "
+                f"({align * tensor.element_size()}-byte alignment for "
+                f"{tensor.dtype}); got {stride}."
+            )
+
+
 @tilelang.jit(pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS)
 def tilelang_ssd_bmm(
     chunk_size,
@@ -105,10 +152,29 @@ def tilelang_ssd_bmm(
     ab_shape = (num_tokens, groups, dstate)
     cb_shape = (nchunks, groups, chunk_size, chunk_size)
 
+    #: ``cmat`` and ``bmat`` are read-only inputs, so they are declared strided: their
+    #: outer axes may be strided views into a larger buffer. The innermost axis (dstate)
+    #: is the one the block loads walk, so it is pinned to stride 1 and the launcher
+    #: enforces it -- the one layout requirement this kernel cannot relax. ``cb`` is the
+    #: output it writes and ``cu_chunk_seqlens`` is caller-built metadata; both are used
+    #: as dense spans, so they stay ``T.Tensor``.
+    bmat_stride_group = T.dynamic("bmat_stride_group")
+    bmat_stride_token = T.dynamic("bmat_stride_token")
+    cmat_stride_group = T.dynamic("cmat_stride_group")
+    cmat_stride_token = T.dynamic("cmat_stride_token")
+    cmat_strides = (cmat_stride_token, cmat_stride_group, 1)
+    bmat_strides = (bmat_stride_token, bmat_stride_group, 1)
+    #: The operand loads walk dstate with a vectorized copy, so every outer stride has
+    #: to keep the start of a row aligned to the vector those loads can use. That is
+    #: what the ``T.assume`` lines below tell the compiler, and what
+    #: ``ssd_bmm_launch`` validates before launching.
+    cmat_align = _align_elems(a_dtype, dstate)
+    bmat_align = _align_elems(b_dtype, dstate)
+
     @T.prim_func
     def tilelang_ssd_bmm_kernel(
-        cmat: T.Tensor(ab_shape, dtype=a_dtype),
-        bmat: T.Tensor(ab_shape, dtype=b_dtype),
+        cmat: T.StridedTensor(ab_shape, cmat_strides, a_dtype),
+        bmat: T.StridedTensor(ab_shape, bmat_strides, b_dtype),
         cu_chunk_seqlens: T.Tensor((nchunks + 1,), dtype=seqlen_dtype),
         cb: T.Tensor(cb_shape, dtype=out_dtype),
     ):
@@ -117,6 +183,11 @@ def tilelang_ssd_bmm(
             chunk,
             group,
         ):
+            T.assume(cmat_stride_token % cmat_align == 0)
+            T.assume(cmat_stride_group % cmat_align == 0)
+            T.assume(bmat_stride_token % bmat_align == 0)
+            T.assume(bmat_stride_group % bmat_align == 0)
+
             m_block = block // num_n_blocks
             n_block = block % num_n_blocks
             row = m_block * block_m
@@ -197,6 +268,10 @@ def ssd_bmm_launch(
     Returns ``cb``, ``[nchunks, groups, chunk_size, chunk_size]`` fp32. Pass
     ``cb`` to reuse caller-owned scratch (the orchestration does, so a captured
     graph allocates nothing).
+
+    ``cmat`` and ``bmat`` may be strided views of a wider buffer as long as their
+    dstate axis is dense and their outer strides keep the alignment the kernel's
+    vector loads assume -- see ``_align_elems``.
     """
     if cmat.dim() != 3 or bmat.dim() != 3:
         raise RuntimeError("cmat and bmat must be [tokens, groups, dstate].")
@@ -205,8 +280,13 @@ def ssd_bmm_launch(
             f"cmat and bmat must share a shape, got {tuple(cmat.shape)} and "
             f"{tuple(bmat.shape)}."
         )
-    if not cmat.is_contiguous() or not bmat.is_contiguous():
-        raise RuntimeError("cmat and bmat must be contiguous.")
+    if cmat.stride(-1) != 1 or bmat.stride(-1) != 1:
+        raise RuntimeError(
+            "cmat and bmat must have a dense dstate axis (stride(-1) == 1); their "
+            "outer axes may be strided."
+        )
+    _require_aligned("cmat", cmat)
+    _require_aligned("bmat", bmat)
     num_tokens, groups, dstate = cmat.shape
     if groups < 1 or dstate < 1:
         raise RuntimeError("cmat's group and dstate axes must be non-empty.")
