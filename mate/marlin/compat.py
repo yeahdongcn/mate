@@ -109,9 +109,11 @@ def marlin_pad_scales(
 def marlin_pad_dim(x, size: int, padded: int):
     """``marlin_utils.py:285-289``: zero-pad an activation's last dim from ``size`` to ``padded``.
 
-    Padding works through zero *scales*, not zero weights: for symmetric ``uint4b8`` a stored code of
-    0 decodes to -8, so a pad made of zero weights would contribute. Zero for the extents above is
-    what makes the padded region vanish in both the GPTQ and the AWQ arms.
+    Padding works through zero *scales*, not zero weights: a pad made of zero weights decodes to
+    whatever that code means, which for a symmetric checkpoint is not zero, so it would contribute.
+    Zero for the extents above is what makes the padded region vanish in both the GPTQ and the AWQ
+    arms. (The exact value a code decodes to depends on the presentation; see
+    ``mate.marlin.linear.marlin_weight_to_musa`` for that convention and its authority.)
     """
     torch_mod = _require_torch()
     if padded == size:

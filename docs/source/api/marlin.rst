@@ -19,10 +19,14 @@ Two names. Load-time work happens in the first and nowhere else:
 * :func:`mate.marlin.apply_gptq_marlin_linear` runs a forward with no branch on ``M``, so nothing is
   frozen at trace time.
 
-The conversion is not a stride trick. Hardware measurement on the existing MATE kernel showed its
-int4 B operand is consumed with consecutive ``k``, even ``k`` in the low nibble and read as signed
-two's complement, while upstream's words are a 16x64 tile map; no TMA stride descriptor expresses
-that difference, so one load-time pass is paid.
+The conversion is not a stride trick, for two independent reasons. MATE's int4 B operand is consumed
+with consecutive ``k``, even ``k`` in the low nibble, while upstream's words are a 16x64 tile map; no
+TMA stride descriptor expresses that. And the two sides disagree about what a nibble *means*: MATE's
+declared operand frame decodes a presented nibble ``v`` as ``v - 8`` (``mate/gemm.py:1503-1507``,
+``mate/jit/gemm/dense_w4a16_gemm.py:28-31,46-49``), while the measured atom reads two's complement,
+so upstream's ``uint4b8`` codes must have their sign bit flipped — ``s(u ^ 0x8) = u - 8`` for all 16
+codes. Presenting them verbatim is a uniform ``8 * scale`` error per element, which no shape-based
+comparison detects. One load-time pass pays for both.
 
 .. currentmodule:: mate.marlin
 
