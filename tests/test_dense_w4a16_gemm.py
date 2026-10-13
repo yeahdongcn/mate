@@ -1,0 +1,130 @@
+"""Host-side contract tests for the dense W4A16 GEMM.
+
+These exercise the parts that need no device: the packed-weight layout contract, the zero-point
+algebra, the act-order gate, input validation, and the JIT source rendering. Everything below the
+rendered source is covered by the on-device tests.
+"""
+
+import pytest
+import torch
+
+from mate.jit.gemm.dense_w4a16_gemm import (
+    DENSE_W4A16_GEMM_NIBBLE_BIAS,
+    MATE_W4A16_WEIGHT_LAYOUT,
+    apply_gidx_permutation,
+    dense_w4a16_gemm_dispatch_name,
+    dense_w4a16_gemm_mutlass,
+    fold_zero_points,
+    render_dense_w4a16_gemm_source,
+)
+
+
+def test_weight_layout_contract_is_explicit() -> None:
+    assert MATE_W4A16_WEIGHT_LAYOUT.even_k_low_nibble
+    assert MATE_W4A16_WEIGHT_LAYOUT.nibble_bias == DENSE_W4A16_GEMM_NIBBLE_BIAS
+    assert MATE_W4A16_WEIGHT_LAYOUT.scale_group_size == 128
+
+
+def test_dispatch_name_does_not_depend_on_m() -> None:
+    # One compiled op serves every M, so the name is a function of the dtypes and the zero-point mode
+    # only. A name that grew with M would mean a shape-independent trace had been frozen somewhere.
+    assert dense_w4a16_gemm_dispatch_name(torch.float16, False) == (
+        "mp31_dense_w4a16_gemm_fp16_32x256x256_s3_sym"
+    )
+    assert dense_w4a16_gemm_dispatch_name(torch.float16, True) == (
+        "mp31_dense_w4a16_gemm_fp16_32x256x256_s3_zp"
+    )
+    assert dense_w4a16_gemm_dispatch_name(torch.bfloat16, True) != (
+        dense_w4a16_gemm_dispatch_name(torch.float16, True)
+    )
+
+
+def test_symmetric_zero_points_produce_no_correction() -> None:
+    # GPTQ uint4b8 decodes as nibble - 8 with no further bias, so a zero point equal to the nibble
+    # bias is the symmetric case and its rank-1 correction has to vanish exactly.
+    scale = torch.rand(4, 3, dtype=torch.float16) + 0.5
+    symmetric = torch.full_like(scale, float(DENSE_W4A16_GEMM_NIBBLE_BIAS))
+    assert torch.equal(fold_zero_points(symmetric, scale), torch.zeros_like(scale))
+
+
+def test_asymmetric_zero_points_fold_to_scaled_offset() -> None:
+    scale = torch.tensor([[2.0, 0.5]], dtype=torch.float16)
+    zero_points = torch.tensor([[6, 10]], dtype=torch.int32)
+    folded = fold_zero_points(zero_points, scale)
+    assert torch.equal(folded, torch.tensor([[4.0, -1.0]], dtype=torch.float16))
+
+
+def test_padded_group_column_contributes_nothing() -> None:
+    # The odd group column needed by the paired 16-bit scale words is filled with the nibble bias, so
+    # the extra group folds to an exact zero instead of a spurious offset.
+    padded_zero = torch.full(
+        (2, 4), float(DENSE_W4A16_GEMM_NIBBLE_BIAS), dtype=torch.int32
+    )
+    padded_zero[:, :3] = 7
+    folded = fold_zero_points(padded_zero, torch.ones(2, 4, dtype=torch.float16))
+    assert folded[0, 3].item() == 0.0
+    assert folded[0, 0].item() == 1.0
+
+
+def test_naive_dequant_is_wrong_by_the_bias() -> None:
+    # A reference dequant that ignores the stored bias is off by bias * sum(scale) per group, which is
+    # exactly the correction the kernel applies for a zero point of zero.
+    scale = torch.tensor([[1.0, 2.0]], dtype=torch.float16)
+    zero_points = torch.zeros((1, 2), dtype=torch.int32)
+    correction = fold_zero_points(zero_points, scale)
+    assert torch.equal(correction, float(DENSE_W4A16_GEMM_NIBBLE_BIAS) * scale)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("zero_points", [False, True])
+def test_rendered_source_selects_the_kernel(
+    out_dtype: torch.dtype, zero_points: bool
+) -> None:
+    func_name = dense_w4a16_gemm_dispatch_name(out_dtype, zero_points)
+    source = render_dense_w4a16_gemm_source(out_dtype, zero_points)
+    assert f"void {func_name}(" in source
+    assert "mate::gemm::dense_w4a16_gemm::Mp31DenseW4A16Gemm<" in source
+    assert "using ElementB = mute::int4_t;" in source
+    assert (
+        f"constexpr bool kZeroPoints = {'true' if zero_points else 'false'};" in source
+    )
+    # Every variant must reach the dense scheduler, never a grouped one.
+    assert "mate::deep_gemm::GemmType::Normal" in source
+    assert "get_grid_shape_persistent(params)" in source
+
+
+def test_act_order_is_rejected_until_the_layout_is_defined() -> None:
+    packed = torch.zeros(2, 4, dtype=torch.int8)
+    ident = torch.arange(8, dtype=torch.int32)
+    assert apply_gidx_permutation(packed, None) is packed
+    assert apply_gidx_permutation(packed, ident) is packed
+    with pytest.raises(NotImplementedError):
+        apply_gidx_permutation(packed, ident.flip(0))
+    with pytest.raises(ValueError):
+        apply_gidx_permutation(packed, torch.zeros(2, 4, dtype=torch.int32))
+
+
+def test_input_validation_rejects_a_broken_contract() -> None:
+    m, n, k = 4, 8, 256
+    a = torch.zeros(m, k, dtype=torch.float16)
+    b = torch.zeros(n, k // 2, dtype=torch.int8)
+    scale = torch.ones(n, k // 128, dtype=torch.float16)
+    out = torch.zeros(m, n, dtype=torch.float16)
+
+    # A K that the K256 tile cannot cover would make the group count ambiguous.
+    with pytest.raises(ValueError):
+        dense_w4a16_gemm_mutlass(
+            torch.zeros(m, k // 2, dtype=torch.float16), b, scale, out
+        )
+    with pytest.raises(ValueError):
+        dense_w4a16_gemm_mutlass(a, b, scale[:, :1], out)
+    with pytest.raises(ValueError):
+        dense_w4a16_gemm_mutlass(
+            a, b, scale, torch.zeros(m, n + 1, dtype=torch.float16)
+        )
+    with pytest.raises(ValueError):
+        dense_w4a16_gemm_mutlass(a.to(torch.bfloat16), b, scale, out)
+    with pytest.raises(ValueError):
+        dense_w4a16_gemm_mutlass(a, b.to(torch.float16), scale, out)
+    with pytest.raises(ValueError):
+        dense_w4a16_gemm_mutlass(a, b, scale, torch.zeros(m, n, dtype=torch.float32))

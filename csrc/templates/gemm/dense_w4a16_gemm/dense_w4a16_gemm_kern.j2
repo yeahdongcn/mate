@@ -1,0 +1,100 @@
+#include <algorithm>
+#include <cstdint>
+
+#include <mutlass/device_kernel.h>
+#include <mutlass/half.h>
+#include <mutlass/kernel_hardware_info.h>
+#include <mutlass/mutlass.h>
+
+#include <mute/tensor.hpp>
+
+#include "mate/gemm/deep_gemm/gemm_type.hpp"
+#include "mate/gemm/deep_gemm/mp31_dense_w4a16_gemm.hpp"
+
+#include "op_utils.hpp"
+
+void {{ func_name }}(
+    ffi::TensorView a,
+    ffi::TensorView b,
+    ffi::TensorView scale_b,
+    ffi::TensorView zero_b,
+    ffi::TensorView d,
+    int num_mps) {
+  using namespace mute;
+
+  using ElementA = {{ element_a }};
+  using ElementB = mute::int4_t;
+  using ElementScaleB = {{ element_scale_b }};
+  using ElementZeroB = {{ element_zero_b }};
+  using ElementRowSum = float;
+  using ElementD = {{ element_d }};
+  constexpr uint32_t kStages = {{ stages }};
+  constexpr bool kZeroPoints = {{ "true" if zero_points else "false" }};
+  using TileShape = mute::Shape<mute::Int<{{ tile_m }}>, mute::Int<{{ tile_n }}>, mute::Int<{{ tile_k }}>>;
+  using Kernel = mate::gemm::dense_w4a16_gemm::Mp31DenseW4A16Gemm<
+      ElementA, ElementB, ElementScaleB, ElementZeroB, ElementRowSum, ElementD, TileShape, kStages,
+      kZeroPoints>;
+
+  // The Normal schedule addresses a dense (M, N, K) problem with no leading group dimension, so every
+  // operand is rank 2 and its group stride is free.
+  constexpr auto kType = mate::deep_gemm::GemmType::Normal;
+  using TensorGroup = mate::deep_gemm::detail::GemmTensorGroupTraits<kType>;
+  static_assert(!TensorGroup::kA && !TensorGroup::kB && !TensorGroup::kD,
+                "The dense W4A16 kernel takes no grouped operand");
+
+  const int64_t m = a.size(0);
+  const int64_t k = a.size(1);
+  const int64_t n = b.size(0);
+
+  TVM_FFI_ICHECK_EQ(b.size(1) * 2, k) << "the packed weight must hold two INT4 values per byte of K";
+  TVM_FFI_ICHECK_EQ(scale_b.size(0), n) << "scale_b must hold one row per output column";
+  TVM_FFI_ICHECK_EQ(scale_b.size(1), mutlass::ceil_div(int64_t(k), int64_t(128)))
+      << "scale_b must hold one scale per K128 weight group";
+  if constexpr (kZeroPoints) {
+    TVM_FFI_ICHECK_EQ(zero_b.size(0), n) << "zero_b must hold one row per output column";
+    TVM_FFI_ICHECK_EQ(zero_b.size(1), scale_b.size(1))
+        << "zero_b must hold one correction per K128 weight group";
+  }
+  TVM_FFI_ICHECK_EQ(d.size(0), m) << "d.shape[0] must match the M dimension of a";
+  TVM_FFI_ICHECK_EQ(d.size(1), n) << "d.shape[1] must match the N dimension of b";
+
+  if (m == 0 || n == 0 || k == 0) {
+    return;
+  }
+
+  check_mp31(a.device(), "{{ func_name }}");
+  ffi::MUSADeviceGuard device_guard(a.device().device_id);
+  const int mp_count       = mutlass::KernelHardwareInfo::query_device_multiprocessor_count();
+  const int launch_num_mps = num_mps > 0 ? std::min(num_mps, mp_count) : mp_count;
+  musaStream_t stream      = get_stream(a.device());
+
+  // A is (M, K) fp16, the packed weight is (N, K/2) int8 with two signed INT4 values per byte, and the
+  // logical K extent is recovered by the factor-of-two stride that addresses whole bytes.
+  auto stride_a = make_stride(a.stride(0), _1{}, m * k);
+  auto stride_b = make_stride(b.stride(0) * 2, _1{}, n * k);
+  auto stride_scale_b = make_stride(scale_b.stride(0), _1{}, n * scale_b.size(1));
+  auto stride_zero_b  = make_stride(zero_b.stride(0), _1{}, n * std::max<int64_t>(zero_b.size(1), 1));
+  auto stride_d       = make_stride(d.stride(0), _1{}, m * n);
+
+  typename Kernel::Arguments args{
+      .ptr_a        = reinterpret_cast<ElementA const*>(a.data_ptr()),
+      .ptr_b        = reinterpret_cast<ElementB const*>(b.data_ptr()),
+      .ptr_scale_b  = reinterpret_cast<ElementScaleB const*>(scale_b.data_ptr()),
+      .ptr_zero_b   = kZeroPoints ? reinterpret_cast<ElementZeroB const*>(zero_b.data_ptr()) : nullptr,
+      .ptr_d        = reinterpret_cast<ElementD*>(d.data_ptr()),
+      .stride_a     = stride_a,
+      .stride_b     = stride_b,
+      .stride_scale_b = stride_scale_b,
+      .stride_zero_b  = stride_zero_b,
+      .stride_d       = stride_d,
+      .m            = static_cast<int>(m),
+      .n            = static_cast<int>(n),
+      .k            = static_cast<int>(k),
+      .num_mps      = launch_num_mps,
+  };
+
+  auto params = Kernel::to_underlying_arguments(args);
+  dim3 grid   = Kernel::get_grid_shape_persistent(params);
+  mutlass::device_kernel<Kernel><<<grid, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
