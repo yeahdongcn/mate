@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shippable MUSA repack for the upstream Marlin W4A16 weight layout (the GPTQ one the model uses).
+"""MATE's repack for the upstream Marlin W4A16 weight layout (the GPTQ one the model uses).
 
-``layout_ref.py`` holds a *scalar* transcription of ``gptq_marlin_repack_kernel`` and stays the
-oracle. This module is the form MATE would ship: the index arithmetic is vectorised per 16x64 tile
+``mate.marlin.reference`` holds a *scalar* transcription of ``gptq_marlin_repack_kernel`` and stays
+the oracle. This module is the form MATE ships: the index arithmetic is vectorised per 16x64 tile
 and the outer loops are over tiles, which is exactly the grid a device kernel wants — there is no
-Python loop over elements. ``check_repack_musa.py`` asserts the two agree byte-for-byte on the map
-and on values, so this file is a port candidate while the oracle stays independent evidence.
+Python loop over elements. ``tests/test_w4a16_marlin.py`` gates the two against each other byte-for-byte on the map and on
+values, so the oracle stays independent evidence rather than a second copy of this code.
 
 Offset equation, 4-bit non-a8bit path (one tile; ``w`` is the unpacked ``[size_k, size_n]`` nibbles)::
 
@@ -23,7 +23,8 @@ a permutation of the 1024 ``(k, n)`` slots — asserted, not assumed, by the che
 
 Model path: always this repack. AWQ checkpoints and their zero points are converted to the GPTQ
 packed layout at load, so there is no second repack (contract §0 item 7). Values here are unsigned
-nibbles; ``uint4b8``'s fused ``-8`` belongs to the dequant, not to the repack.
+nibbles; ``uint4b8``'s fused ``-8`` belongs to the dequant, not to the repack. The device
+kernel reads those same nibbles as signed two's complement, which is the identical bit pattern.
 """
 
 from __future__ import annotations
@@ -62,6 +63,35 @@ def _require_tiles(size_k: int, size_n: int) -> tuple[int, int]:
     return size_k // TILE_K, size_n // TILE_N
 
 
+def resolve_perm(perm, size_k: int) -> np.ndarray | None:
+    """Normalise ``perm`` to upstream's *global* k permutation, or ``None`` for the identity.
+
+    Two frames share the name ``perm`` upstream and they are not interchangeable:
+
+    * the **op frame** — ``gptq_marlin_repack``'s argument, which the model passes as
+      ``layer.g_idx_sort_indices``: one entry per k, indexing the whole GPTQ weight
+      (``gptq_marlin_repack.cu:146-151``: ``src_k`` goes straight into ``b_q_weight_ptr``).
+    * the **test frame** — ``marlin_utils_test.get_weight_perm(4)``: 16 entries, the 16x64 tile's own
+      permutation, applied identically to every tile (``marlin_utils_test.py:49``).
+
+    The two agree only when ``size_k == TILE_K``, which is exactly why a checker that only tried
+    K == 16 could not tell them apart. Accepting both explicitly, and expanding the test frame into
+    the global one, is the difference between "we know which is which" and a latent wrong answer on
+    the act-order path.
+    """
+    if perm is None:
+        return None
+    perm = np.asarray(perm, dtype=np.int64).reshape(-1)
+    if perm.shape[0] == size_k:
+        return perm
+    if perm.shape[0] == TILE_K:
+        return np.concatenate([perm + k_tile * TILE_K for k_tile in range(size_k // TILE_K)])
+    raise ValueError(
+        f"perm has {perm.shape[0]} entries; expected {size_k} (the op frame: one per k, e.g. "
+        f"argsort(g_idx)) or {TILE_K} (the test frame: get_weight_perm)"
+    )
+
+
 def unpack_rows(qweight: np.ndarray, size_k: int, size_n: int) -> np.ndarray:
     """GPTQ input layout ``[size_k/8, size_n]`` int words -> ``[size_k, size_n]`` nibble values."""
     w = np.asarray(qweight, dtype=np.int64)
@@ -96,13 +126,17 @@ def repack_gptq(
     ``perm[k]`` — a pure k-axis gather inside the tile (``gptq_marlin_repack.cu:61-70, 146-162``).
     """
     kt, nt = _require_tiles(size_k, size_n)
+    perm = resolve_perm(perm, size_k)
     w = unpack_rows(qweight, size_k, size_n)
     k_local, n_local, word, nib = tile_index_arrays()
     out = np.zeros((kt, 2 * size_n), dtype=np.int64)
     for k_tile in range(kt):
-        k_src = k_tile * TILE_K + k_local
-        if perm is not None:
-            k_src = k_tile * TILE_K + np.asarray(perm, dtype=np.int64)[k_src]
+        k_dst = k_tile * TILE_K + k_local
+        # ``perm`` is upstream's *global* k permutation (g_idx_sort_indices, one entry per k, as
+        # gptq_marlin_repack.cu:146-151 uses it: src_k indexes the whole GPTQ weight), so it is a
+        # direct lookup -- not a per-tile offset. Getting this wrong is invisible at K == TILE_K,
+        # which is why the gate below compares against the oracle with a full-K perm at K > 16.
+        k_src = k_dst if perm is None else np.asarray(perm, dtype=np.int64)[k_dst]
         for n_tile in range(nt):
             vals = w[k_src, n_tile * TILE_N + n_local]
             np.bitwise_or.at(out[k_tile], n_tile * TILE_WORDS + word, vals << (4 * nib))
@@ -114,15 +148,52 @@ def unpack_gptq(
 ) -> np.ndarray:
     """Inverse of :func:`repack_gptq`: ``[size_k/16, 2*size_n]`` -> ``[size_k/8, size_n]`` words."""
     kt, nt = _require_tiles(size_k, size_n)
+    perm = resolve_perm(perm, size_k)
     k_local, n_local, word, nib = tile_index_arrays()
     r = np.asarray(repacked, dtype=np.int64)
     w = np.zeros((size_k, size_n), dtype=np.int64)
     for k_tile in range(kt):
         k_dst = k_tile * TILE_K + k_local
-        k_src = k_dst
-        if perm is not None:
-            k_src = k_tile * TILE_K + np.asarray(perm, dtype=np.int64)[k_dst]
+        # inverse of the above: the value written into destination k came from source perm[k]
+        k_src = k_dst if perm is None else np.asarray(perm, dtype=np.int64)[k_dst]
         for n_tile in range(nt):
             vals = (r[k_tile, n_tile * TILE_WORDS + word] >> (4 * nib)) & 0xF
             w[k_src, n_tile * TILE_N + n_local] = vals  # exactly-once slots
     return pack_rows(w)
+
+
+def gptq_marlin_repack(qweight, perm, size_k: int, size_n: int, num_bits: int = 4):
+    """Upstream's ``gptq_marlin_repack(b_q_weight, perm, size_k, size_n, num_bits)``.
+
+    Same name, same argument order, same result as the NVIDIA op — MATE's implementation instead of a
+    CUDA kernel. ``perm`` is upstream's act-order / ``g_idx`` order (``argsort(g_idx)``); pass an
+    ``arange`` when there is none, exactly as upstream's call sites do.
+
+    ``num_bits`` must be 4: MATE's kernel is int4 x fp16, so the 8-bit arm is refused rather than
+    approximated. Sizes must already be tile-aligned; call
+    :func:`mate.marlin.compat.marlin_padded_nk` and the pad helpers first, as upstream does.
+    """
+    if num_bits != 4:
+        raise NotImplementedError(
+            f"MATE's Marlin wrapper is int4 x fp16 only, so num_bits must be 4; got {num_bits}"
+        )
+    # resolve_perm accepts both upstream frames and rejects anything else with a reason
+    return repack_gptq(np.asarray(qweight), size_k, size_n, resolve_perm(perm, size_k))
+
+
+def awq_marlin_repack(qweight, size_k: int, size_n: int, num_bits: int = 4):
+    """Upstream's ``awq_marlin_repack(b_q_weight, size_k, size_n, num_bits)``.
+
+    Kept for API compatibility and for the gates, and deliberately implemented from the reference
+    transcription rather than duplicated here: **this is not on the serving path.** AWQ checkpoints
+    are converted into the GPTQ packed layout at load time, so ``gptq_marlin_repack`` above is the
+    only repack the model ever runs. If that ever changes, this function must move to the shipping
+    form and be gated the same way.
+    """
+    if num_bits != 4:
+        raise NotImplementedError(
+            f"MATE's Marlin wrapper is int4 x fp16 only, so num_bits must be 4; got {num_bits}"
+        )
+    from . import reference
+
+    return reference.cuda_repack_awq(np.asarray(qweight), size_k, size_n)

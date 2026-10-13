@@ -75,7 +75,6 @@ from __future__ import annotations
 
 import importlib.util
 import math
-import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
@@ -200,48 +199,54 @@ def synthetic_weight(
 # =============================================================================================
 # Section A - numpy only. No torch, no MUSA device. These gates run anywhere.
 # =============================================================================================
-def _artifact_dir() -> Optional[Path]:
-    """Locate the verified layout artifacts this port checks its own helpers against.
+def _load_mate_marlin():
+    """Import ``mate.marlin`` — the reference and the shipped repack are the package's own modules.
 
-    ``MATE_MARLIN_LAYOUT_ARTIFACTS`` wins. The default candidates are the authoring workspace path
-    and a copy vendored next to the MATE test tree, so MATE CI can pin them without this file
-    knowing about an absolute host path. When the artifacts are absent the parity gates skip with a
-    reason instead of silently weakening to "no reference" - vendoring them into MATE's ``tests/``
-    is the follow-up recorded in the ticket.
+    The oracle used to be vendored next to this test, which made a third copy of the index maps and
+    meant these gates guarded something other than the code that ships. They now import the package:
+    ``LAYOUT_REF`` is ``mate.marlin.reference`` and ``REPACK_MUSA`` is ``mate.marlin.layout``.
+
+    ``import mate.marlin`` is preferred, but MATE's top-level ``mate/__init__.py`` imports torch while
+    both modules are numpy-only by design. On a host without torch the import would fail for a reason
+    that has nothing to do with this code, so the fallback registers a synthetic ``mate`` parent and
+    loads the package by path. Same modules, same gates, no torch needed.
     """
-    candidates = []
-    env = os.environ.get("MATE_MARLIN_LAYOUT_ARTIFACTS")
-    if env:
-        candidates.append(Path(env))
-    # No authoring-host absolute path here on purpose: this file is committed to MATE, where the
-    # artifacts live under tests/marlin_artifacts/ (or wherever MATE_MARLIN_LAYOUT_ARTIFACTS points).
-    # tests-port/tests/ -> tests-port/ -> the artifact bundle root
-    candidates.append(Path(__file__).resolve().parents[2])
-    candidates.append(Path(__file__).resolve().parent / "marlin_artifacts")
-    for candidate in candidates:
-        if (candidate / "layout_ref.py").is_file() and (candidate / "repack_musa.py").is_file():
-            return candidate
-    return None
+    import sys
+    import types
 
+    try:
+        import mate.marlin as marlin_module
 
-def _load_module(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None, f"cannot load {path}"
+        return marlin_module
+    except Exception:
+        pass
+
+    root = Path(__file__).resolve().parents[1]
+    package = root / "mate" / "marlin"
+    if not (package / "__init__.py").is_file():
+        return None
+    if "mate" not in sys.modules:
+        parent = types.ModuleType("mate")
+        parent.__path__ = [str(root / "mate")]
+        sys.modules["mate"] = parent
+    spec = importlib.util.spec_from_file_location(
+        "mate.marlin", package / "__init__.py", submodule_search_locations=[str(package)]
+    )
+    assert spec is not None and spec.loader is not None, f"cannot load {package}"
     module = importlib.util.module_from_spec(spec)
+    sys.modules["mate.marlin"] = module
     spec.loader.exec_module(module)
     return module
 
 
-_ARTIFACTS = _artifact_dir()
-LAYOUT_REF = _load_module(_ARTIFACTS / "layout_ref.py", "mate_marlin_layout_ref") if _ARTIFACTS else None
-REPACK_MUSA = _load_module(_ARTIFACTS / "repack_musa.py", "mate_marlin_repack_musa") if _ARTIFACTS else None
+_MATE_MARLIN = _load_mate_marlin()
+_ARTIFACTS = _MATE_MARLIN is not None  # kept as the "reference available" sentinel
+LAYOUT_REF = _MATE_MARLIN.reference if _ARTIFACTS else None
+REPACK_MUSA = _MATE_MARLIN.layout if _ARTIFACTS else None
 
 needs_artifacts = pytest.mark.skipif(
-    _ARTIFACTS is None,
-    reason=(
-        "layout oracle artifacts not found (expected layout_ref.py + repack_musa.py; set "
-        "MATE_MARLIN_LAYOUT_ARTIFACTS or vendor them next to this test)"
-    ),
+    not _ARTIFACTS,
+    reason="mate.marlin is not importable (the numpy-only reference lives in that package)",
 )
 
 
@@ -1122,3 +1127,198 @@ def _self_check_without_torch() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_self_check_without_torch())
+
+
+# =============================================================================================
+# Section E - the Marlin wrapper's own gates (mate.marlin): upstream frame in, MATE frame out.
+# =============================================================================================
+WRAPPER_SHAPES = [(256, 64), (384, 256), (512, 128), (1024, 320)]
+
+
+@pytest.mark.parametrize("size_k,size_n", WRAPPER_SHAPES)
+def test_wrapper_shuffle_agrees_with_this_files_mate_packer(size_k, size_n):
+    """``marlin_weight_to_musa`` against the independent MATE-frame packer defined in this file.
+
+    One is written from upstream's repacked words, the other from the kernel's documented ``(N, K//2)``
+    contract. Byte-for-byte agreement between two implementations written from different frames is the
+    point: a bug would have to be the same bug in both.
+    """
+    codes = np.random.default_rng(size_k + size_n).integers(0, 16, (size_k, size_n)).astype(np.int64)
+    repacked = REPACK_MUSA.repack_gptq(REPACK_MUSA.pack_rows(codes), size_k, size_n)
+    mine = np.asarray(_MATE_MARLIN.marlin_weight_to_musa(repacked, size_k, size_n))
+    assert mine.shape == (size_n, size_k // 2)
+    assert np.array_equal(mine.view(np.uint8), pack_mate_weight_b(codes).view(np.uint8))
+    assert np.array_equal(unpack_mate_weight_b(mine, size_k), codes)
+
+
+@pytest.mark.parametrize("size_k,size_n", WRAPPER_SHAPES)
+def test_wrapper_perm_frames_and_global_parity(size_k, size_n):
+    """Both of upstream's ``perm`` frames, and the global lookup the CUDA kernel really performs.
+
+    The test frame is ``get_weight_perm(4)``'s 16 entries; the op frame is one entry per k. They
+    coincide exactly when ``K == 16``, which is how a tile-offset bug hides: the oracle here carried
+    ``k_tile * TILE_K`` on top of a value that is already a global k, and every checker that used
+    ``K == 16`` agreed with it. A non-trivial global shuffle is what makes this gate bite.
+    """
+    rng = np.random.default_rng(size_k)
+    words = REPACK_MUSA.pack_rows(rng.integers(0, 16, (size_k, size_n)).astype(np.int64))
+    local = rng.permutation(16)
+    global_perm = np.concatenate([local + t * 16 for t in range(size_k // 16)])
+
+    assert np.array_equal(
+        REPACK_MUSA.repack_gptq(words, size_k, size_n, local),
+        REPACK_MUSA.repack_gptq(words, size_k, size_n, global_perm),
+    ), "the 16-entry test frame must equal the per-tile repetition of the global perm"
+
+    for perm in (global_perm, rng.permutation(size_k)):
+        assert np.array_equal(
+            REPACK_MUSA.repack_gptq(words, size_k, size_n, perm),
+            LAYOUT_REF.cuda_repack_gptq(words, size_k, size_n, perm),
+        ), "shipped repack and the CUDA transcription must agree under a global k permutation"
+
+    with pytest.raises(ValueError):
+        REPACK_MUSA.repack_gptq(words, size_k, size_n, np.arange(8))
+
+
+def test_wrapper_padding_agrees_with_the_reference():
+    """``compat.marlin_padded_nk`` vs ``reference.marlin_padded_nk``: two transcriptions, one table."""
+    grid = [(64, 128), (200, 288), (256, 256), (1536, 1536), (4608, 4096), (4672, 512), (8960, 1536)]
+    for size_n, size_k in grid:
+        for group in (128, -1):
+            assert tuple(_MATE_MARLIN.marlin_padded_nk(size_n, size_k, group)) == tuple(
+                LAYOUT_REF.marlin_padded_nk(size_n, size_k, group)
+            ), f"marlin_padded_nk({size_n}, {size_k}, {group}) diverged"
+
+
+def test_wrapper_shape_gate_accepts_the_checkpoint_and_refuses_tp2_down():
+    """The four checkpoint shapes are servable; rank-local K=4480 (TP=2 ``down``) is refused, with why."""
+    for size_k, size_n in [(1536, 2048), (1536, 1536), (1536, 17920), (8960, 1536)]:
+        ok, reason = _MATE_MARLIN.check_musa_marlin_supports_shape(size_k, size_n, 128)
+        assert ok, f"K={size_k} N={size_n} should be servable, got: {reason}"
+    ok, reason = _MATE_MARLIN.check_musa_marlin_supports_shape(4480, 1536, 128)
+    assert not ok and "multiple of 256" in reason and "4480" in reason
+    ok, reason = _MATE_MARLIN.check_musa_marlin_supports_shape(1536, 1536, 64)
+    assert not ok and "group size" in reason
+
+
+@pytest.mark.parametrize("group_size", [128, -1])
+def test_wrapper_scale_inverse_is_the_inverse(group_size):
+    """``marlin_unpermute_scales`` o ``marlin_permute_scales`` is the identity in *both* branches.
+
+    A wrong inverse is still shape-correct, so only a round trip catches it. Both branches are gated
+    because upstream picks between two different permutations.
+    """
+    size_k, size_n = 1024, 256
+    rows = 1 if group_size == -1 else size_k // group_size
+    plain = np.random.default_rng(group_size + 7).standard_normal((rows, size_n)).astype(np.float32)
+    permuted = LAYOUT_REF.marlin_permute_scales(plain, size_k, size_n, group_size)
+    back = LAYOUT_REF.marlin_unpermute_scales(permuted, size_k, size_n, group_size)
+    assert back.shape == plain.shape
+    assert np.array_equal(back, plain), "the host-direction inverse must recover the plain frame"
+
+
+def test_wrapper_zero_point_inverse_is_the_inverse():
+    """``unpack_marlin_zero_points`` o ``marlin_zero_points`` is the identity and the frame is (G, N)."""
+    size_k, size_n = 1024, 512
+    group = GROUP_SIZE
+    zp = np.random.default_rng(11).integers(0, 16, (size_k // group, size_n)).astype(np.int64)
+    packed = LAYOUT_REF.marlin_zero_points(zp, size_k, size_n, 4)
+    assert packed.shape == (size_k // group, size_n // 8), "zero points pack along N"
+    assert np.array_equal(LAYOUT_REF.unpack_marlin_zero_points(packed, size_k, size_n, 4), zp)
+
+
+def _torch_or_none():
+    try:
+        import torch  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+needs_torch = pytest.mark.skipif(not _torch_or_none(), reason="torch is not installed")
+
+
+@needs_torch
+def test_wrapper_torch_conversions_match_the_reference():
+    """The torch-side frame conversions against the numpy oracle, including the (N, G) orientation."""
+    import torch
+
+    m = _MATE_MARLIN
+    size_k, size_n, group = 512, 256, 128
+    rng = np.random.default_rng(3)
+
+    scales = torch.from_numpy(rng.standard_normal((size_k // group, size_n)).astype(np.float32))
+    permuted = m.quant.marlin_permute_scales(scales, size_k, size_n, group)
+    assert np.array_equal(
+        permuted.numpy(), LAYOUT_REF.marlin_permute_scales(scales.numpy(), size_k, size_n, group)
+    )
+    plain = m.marlin_scales_to_musa(permuted, size_k, size_n, group)
+    assert plain.shape == (size_n, size_k // group) and plain.dtype == torch.float16
+    assert np.allclose(plain.numpy().T, scales.numpy(), atol=1e-3), "transpose + fp16 cast"
+
+    zp = torch.from_numpy(rng.integers(0, 16, (size_k // group, size_n)).astype(np.int32))
+    packed = m.quant.marlin_zero_points(zp, size_k, size_n, 4)
+    assert np.array_equal(
+        m.quant.unpack_marlin_zero_points(packed, size_k, size_n).numpy(), zp.numpy()
+    )
+    zp_b = m.marlin_zero_points_to_musa(packed, size_k, size_n, group)
+    assert zp_b.shape == (size_n, size_k // group) and zp_b.dtype == torch.float16
+
+
+@needs_torch
+def test_wrapper_prepare_frame_is_kernel_ready():
+    """``prepare_marlin_w4a16`` hands back the exact shapes and dtypes the kernel's FFI documents."""
+    import torch
+
+    m = _MATE_MARLIN
+    size_k, size_n, group = 512, 256, 128
+    padded_n, padded_k = m.marlin_padded_nk(size_n, size_k, group)
+    codes = np.random.default_rng(13).integers(0, 16, (padded_k, padded_n)).astype(np.int64)
+
+    qweight = torch.from_numpy(
+        LAYOUT_REF.cuda_repack_gptq(
+            (REPACK_MUSA.pack_rows(codes) if padded_n == size_n else
+             pack_mate_weight_b(codes).T.astype(np.int32) * 0 + REPACK_MUSA.pack_rows(codes)),
+            padded_k, padded_n,
+        ).astype(np.int32)
+    )
+    scales = torch.from_numpy(
+        LAYOUT_REF.marlin_permute_scales(
+            np.random.default_rng(17).standard_normal((padded_k // group, padded_n)).astype(np.float32),
+            padded_k, padded_n, group,
+        )
+    )
+    zp = torch.from_numpy(
+        LAYOUT_REF.marlin_zero_points(
+            np.random.default_rng(19).integers(0, 16, (padded_k // group, padded_n)).astype(np.int64),
+            padded_k, padded_n, 4,
+        ).astype(np.int32)
+    )
+
+    frame = m.prepare_marlin_w4a16(qweight, scales, zp, size_k, size_n, group_size=group)
+    assert frame.weight_b.shape == (padded_n, padded_k // 2) and frame.weight_b.dtype == torch.int8
+    assert frame.scale_b.shape == (padded_n, padded_k // group) and frame.scale_b.dtype == torch.float16
+    assert frame.zero_points_b.shape == (padded_n, padded_k // group)
+    assert frame.has_zero_points and frame.logical_n == size_n and frame.padded_k == padded_k
+
+    # the weight conversion must also match this file's independent MATE-frame packer
+    assert np.array_equal(
+        frame.weight_b.numpy().view(np.uint8), pack_mate_weight_b(codes).view(np.uint8)
+    )
+    # symmetric path: no zero-point tensor, and the kernel's sym instantiation ignores it
+    symmetric = m.prepare_marlin_w4a16(qweight, scales, None, size_k, size_n, group_size=group)
+    assert symmetric.zero_points_b is None and not symmetric.has_zero_points
+
+    # refusals: the TP=2 down casualty, and an unmaterialised act order
+    with pytest.raises(ValueError, match="multiple of 256"):
+        m.prepare_marlin_w4a16(
+            torch.zeros((4480 // 16, 2 * 1536), dtype=torch.int32),
+            torch.zeros((4480 // group, 1536), dtype=torch.float32),
+            None, 4480, 1536, group_size=group,
+        )
+    with pytest.raises(ValueError, match="act order"):
+        m.prepare_marlin_w4a16(
+            qweight, scales, None, size_k, size_n, group_size=group,
+            g_idx=torch.arange(padded_k - 1, -1, -1, dtype=torch.int32),
+        )
