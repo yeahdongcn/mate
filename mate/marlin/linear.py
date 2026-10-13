@@ -33,8 +33,10 @@ packed + permuted zp         plain ``(N, G)``, fp16 or None   :func:`marlin_zero
 
 Why the weight needs a real conversion and not a stride trick: hardware measurement on the existing
 MATE kernel showed its int4 B operand is consumed as **consecutive k**, even k in the low nibble, odd
-k in the high nibble, read as signed two's complement — while upstream's words are a 16x64 tile map.
-No TME stride descriptor expresses that difference, so route B pays one load-time pass here.
+k in the high nibble — while upstream's words are a 16x64 tile map. On top of that the two sides
+disagree about what a nibble *means* (upstream: GPTQ ``uint4b8``; MATE's atom: two's complement, which
+the declared frame reconciles by ``u ^ 0x8``); see :func:`marlin_weight_to_musa`. No TME stride
+descriptor expresses either difference, so route B pays one load-time pass.
 
 Act order (``g_idx``): supported by *materialisation*, not by a kernel feature. The weight must have
 been repacked with ``perm=argsort(g_idx)`` (upstream's own convention), which makes the permuted k
@@ -90,20 +92,46 @@ class MarlinW4A16KernelFrame:
         return compat.marlin_unpad_output(output, self.logical_n, self.padded_n)
 
 
-def marlin_weight_to_musa(repacked, size_k: int, size_n: int, num_bits: int = 4) -> np.ndarray:
+def marlin_weight_to_musa(
+    repacked, size_k: int, size_n: int, num_bits: int = 4, biased_codes: bool = True
+) -> np.ndarray:
     """Upstream ``[size_k/16, 2*size_n]`` int32 words -> MATE ``(size_n, size_k//2)`` int8.
 
-    The byte pattern is what matters, not the dtype: the kernel reads each nibble as signed two's
-    complement (a stored 8 decodes to -8), which is exactly GPTQ's ``uint4b8`` value, so the same
-    bits serve both the GPTQ and the symmetric reading. Returns numpy because the conversion is
-    pure index arithmetic; :func:`prepare_marlin_w4a16` moves it to the device once, at load time.
+    Two layouts differ, and so do two *conventions* about what a nibble means; both have to be handled
+    here, and only the second one is subtle.
+
+    Layout: consecutive k, even k in the low nibble, odd k in the high nibble, against upstream's
+    16x64 tile map. That is index arithmetic.
+
+    Convention, and the reason for ``^ 0x8``. MATE's declared operand frame is *biased*: the
+    documented dequant is ``w = scale * (q + nibble_bias - zero_point)`` and the packed-weight contract
+    says each nibble "already holds the signed INT4 value ``unsigned_nibble - nibble_bias``"
+    (``mate/gemm.py:1503-1507``, ``mate/jit/gemm/dense_w4a16_gemm.py:28-31,46-49``), with
+    ``nibble_bias = 8`` and a symmetric checkpoint's zero point equal to it
+    (``tests/test_dense_w4a16_gemm.py:42-47``: "GPTQ uint4b8 decodes as ``nibble - 8`` with no further
+    bias", and the symmetric correction must vanish). So the atom is expected to read a presented
+    nibble ``v`` as ``v - 8``. The atom actually reads two's complement -- measured on hardware:
+    code 0 reads 0 and code 8 reads -8, which is why the neighbouring ``-8`` for code 8 was mistaken
+    for ``u - 8``: that identity holds only *at* ``u == 8``. Upstream's words carry GPTQ ``uint4b8``
+    codes ``u``, whose value is ``u - 8``, so presenting them verbatim is wrong for the whole negative
+    half by ``+8 * scale`` per element -- a uniform error that no shape-based comparison catches, and
+    one that shows up as exactly ``8 * scale * sum_k(a)`` per group in the R3 sensitivity gate.
+    The unique presentation satisfying the declared frame is ``v = u ^ 0x8``, since
+    ``s(u ^ 0x8) = u - 8`` for all 16 codes. That identity is asserted as a gate, not trusted.
+
+    ``biased_codes=False`` is for words that are already in MATE's frame (two's-complement patterns
+    whose signed read is the dequantized integer), e.g. a MATE-native packer; it is not a tolerance
+    knob. Returns numpy because the conversion is pure index arithmetic;
+    :func:`prepare_marlin_w4a16` moves it to the device once, at load time.
     """
     if num_bits != 4:
         raise NotImplementedError(f"MATE's Marlin wrapper is int4 only; got num_bits={num_bits}")
     from . import layout
 
     words = layout.unpack_gptq(repacked, size_k, size_n)  # (size_k//8, size_n) packed words
-    codes = layout.unpack_rows(words, size_k, size_n)  # (size_k, size_n) nibble values
+    codes = layout.unpack_rows(words, size_k, size_n)  # (size_k, size_n) uint4b8 codes
+    if biased_codes:
+        codes = codes ^ 0x8  # uint4b8 code -> the two's-complement pattern the atom must see
 
     half = codes.reshape(size_k // 2, 2, size_n)
     packed_kn = (half[:, 0, :] | (half[:, 1, :] << 4)).astype(np.uint8)  # even k low, odd k high
@@ -142,8 +170,13 @@ def marlin_zero_points_to_musa(packed_zp, size_k: int, size_n: int, group_size: 
     ``quant.unpack_marlin_zero_points`` undoes both the column packing and the permutation and
     returns ``(G, size_n)`` in the same K-major frame as upstream's scales, which is what the
     kernel's zero-point operand mirrors; this adds the transpose and the fp16 cast the staging
-    expects. The values are upstream's unsigned zero-point codes: the kernel forms
-    ``(kWeightNibbleBias - zero_point) * scale`` and bit patterns matter more than the dtype.
+    expects. The values are upstream's **raw** per-group zero points -- the ``zero_point`` term of
+    the documented ``w = scale * (q + nibble_bias - zero_point)``, with the same shape and dtype
+    contract as ``scale_b`` (``mate/gemm.py:1512-1515``). Pass them raw: the op applies the
+    ``(nibble_bias - zero_point)`` term itself, so a stream already folded by
+    ``fold_zero_points`` would be folded twice, and a *symmetric* checkpoint's zero point is
+    ``nibble_bias`` (8), which folds to exactly zero. Passing 0 where 8 belongs is the double-fold
+    error in its most common shape.
     """
     if torch is None:  # pragma: no cover - exercised on the numpy-only gate host
         raise RuntimeError("marlin_zero_points_to_musa needs torch")

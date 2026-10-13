@@ -47,8 +47,10 @@ Deliberate divergences, each with its reason:
   and tested instead of being implied.
 * **A real weight conversion.** ``marlin_weight_to_musa`` is not a stride trick: hardware measurement
   on the existing MATE kernel showed the int4 B operand is consumed with consecutive k, even k in the
-  low nibble, read as signed two's complement, while upstream's words are a 16x64 tile map. Route B
-  therefore pays one load-time pass. See ``mate.marlin.linear`` for the measurement's consequences.
+  low nibble, while upstream's words are a 16x64 tile map -- *and* upstream's ``uint4b8`` codes must
+  have their sign bit flipped, because the declared operand frame decodes a nibble as ``v - 8`` while
+  the atom reads two's complement. Route B therefore pays one load-time pass. See
+  ``mate.marlin.linear.marlin_weight_to_musa`` for the file:line authority and the measurement.
 * **Act order by materialisation.** ``prepare_marlin_w4a16`` accepts ``g_idx`` only as a contract
   check; the permutation must already be baked into the repacked words, which is upstream's own
   convention. The landed device kernel asserts identity-only act order.

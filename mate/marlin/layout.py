@@ -23,8 +23,9 @@ a permutation of the 1024 ``(k, n)`` slots — asserted, not assumed, by the che
 
 Model path: always this repack. AWQ checkpoints and their zero points are converted to the GPTQ
 packed layout at load, so there is no second repack (contract §0 item 7). Values here are unsigned
-nibbles; ``uint4b8``'s fused ``-8`` belongs to the dequant, not to the repack. The device
-kernel reads those same nibbles as signed two's complement, which is the identical bit pattern.
+nibbles; ``uint4b8``'s fused ``-8`` belongs to the dequant, not to the repack. Presenting those codes
+to the device kernel is a separate step with its own convention -- see
+``mate.marlin.linear.marlin_weight_to_musa``, which must flip the sign bit.
 """
 
 from __future__ import annotations

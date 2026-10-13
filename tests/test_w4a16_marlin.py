@@ -1147,8 +1147,13 @@ def test_wrapper_shuffle_agrees_with_this_files_mate_packer(size_k, size_n):
     repacked = REPACK_MUSA.repack_gptq(REPACK_MUSA.pack_rows(codes), size_k, size_n)
     mine = np.asarray(_MATE_MARLIN.marlin_weight_to_musa(repacked, size_k, size_n))
     assert mine.shape == (size_n, size_k // 2)
-    assert np.array_equal(mine.view(np.uint8), pack_mate_weight_b(codes).view(np.uint8))
-    assert np.array_equal(unpack_mate_weight_b(mine, size_k), codes)
+
+    # The wrapper presents the declared operand frame, which flips the sign bit of every nibble, so it
+    # must differ from the verbatim MATE-frame packer by exactly 0x8 in both nibbles -- no more, no less.
+    verbatim = pack_mate_weight_b(codes).view(np.uint8)
+    assert np.array_equal(mine.view(np.uint8), verbatim ^ 0x88)
+    assert np.array_equal(unpack_mate_weight_b(mine, size_k) ^ 0x8, codes)
+    assert not np.array_equal(mine.view(np.uint8), verbatim), "no XOR would be a silent +8*scale"
 
 
 @pytest.mark.parametrize("size_k,size_n", WRAPPER_SHAPES)
@@ -1302,9 +1307,10 @@ def test_wrapper_prepare_frame_is_kernel_ready():
     assert frame.zero_points_b.shape == (padded_n, padded_k // group)
     assert frame.has_zero_points and frame.logical_n == size_n and frame.padded_k == padded_k
 
-    # the weight conversion must also match this file's independent MATE-frame packer
+    # the weight conversion must also match this file's independent MATE-frame packer, up to the
+    # sign-bit presentation the declared operand frame requires
     assert np.array_equal(
-        frame.weight_b.numpy().view(np.uint8), pack_mate_weight_b(codes).view(np.uint8)
+        frame.weight_b.numpy().view(np.uint8), pack_mate_weight_b(codes).view(np.uint8) ^ 0x88
     )
     # symmetric path: no zero-point tensor, and the kernel's sym instantiation ignores it
     symmetric = m.prepare_marlin_w4a16(qweight, scales, None, size_k, size_n, group_size=group)
@@ -1322,3 +1328,52 @@ def test_wrapper_prepare_frame_is_kernel_ready():
             qweight, scales, None, size_k, size_n, group_size=group,
             g_idx=torch.arange(padded_k - 1, -1, -1, dtype=torch.int32),
         )
+
+
+def test_wrapper_sign_bit_presentation_is_the_declared_frame():
+    """The authority for ``^ 0x8``, made executable, plus the half-range error verbatim would cause.
+
+    MATE's packed-weight contract says a nibble "already holds the signed INT4 value
+    ``unsigned_nibble - nibble_bias``" (mate/jit/gemm/dense_w4a16_gemm.py:46-49) and its public
+    dequant is ``w = scale * (q + nibble_bias - zero_point)`` (mate/gemm.py:1503-1507), while the
+    atom reads two's complement -- so the presented nibble must satisfy ``s(v) = u - 8`` for *every*
+    ``u``, and ``v = u ^ 0x8`` is the unique such presentation. ``s(u ^ 0x8) = u - 8`` is an identity,
+    which is exactly why verbatim is only accidentally right at one code and wrong everywhere below 8.
+    """
+    def two_complement(code):
+        """The atom's measured read: plain two's complement, no `-8` bias of its own."""
+        code = np.asarray(code, dtype=np.int64)
+        return np.where(code >= 8, code - 16, code)
+
+    for u in range(16):
+        assert two_complement(u ^ 0x8) == u - 8, f"the identity must hold at u={u}"
+
+    low_half = np.arange(8)
+    assert not np.all(two_complement(low_half) == low_half - 8), "verbatim must fail below u=8"
+    assert two_complement(8) == -8, "the case that made -8 look like 'u - 8'"
+    assert two_complement(0) == 0, "the case that falsifies it"
+
+
+def test_wrapper_zero_points_are_raw_and_a_double_fold_is_visible():
+    """The zero-point stream is raw, and a symmetric checkpoint's zero point is ``nibble_bias``.
+
+    MATE's op applies the ``(nibble_bias - zero_point)`` term itself (mate/gemm.py:1512-1515), so a
+    stream already folded by ``fold_zero_points`` would be folded twice. The detector here is sharp
+    because a symmetric checkpoint must carry 8, and ``8 - 8`` is exactly the zero correction: a
+    double fold shows up as a zero-point tensor where 8s belong, and every asymmetric weight moves by
+    ``8 * scale`` per element.
+    """
+    size_k, size_n = 512, 256
+    group = GROUP_SIZE
+    nibble_bias = NIBBLE_BIAS
+
+    symmetric = np.full((size_k // group, size_n), nibble_bias, dtype=np.int64)
+    packed = LAYOUT_REF.marlin_zero_points(symmetric, size_k, size_n, 4)
+    back = LAYOUT_REF.unpack_marlin_zero_points(packed, size_k, size_n, 4)
+    assert np.array_equal(back, symmetric), "raw values must survive packing unchanged"
+    assert np.all(back == nibble_bias), "a symmetric checkpoint's zero point is the nibble bias"
+
+    # what a double fold would look like: the already-folded factor is what must NOT be stored
+    folded = (nibble_bias - symmetric) * np.ones_like(symmetric, dtype=np.float32)
+    assert np.all(folded == 0.0), "the symmetric correction is exactly zero, not 8"
+    assert not np.array_equal(back.astype(np.float32), folded), "stored zeros means a double fold"
