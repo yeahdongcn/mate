@@ -45,6 +45,28 @@ What is under test (MATE, mid-draft as of 2026-10-13):
     ``zp_eff = 8`` for the symmetric path (``IsZeroPoints == false``, where the zero-point tensor is
     not even TME-loaded: ``TmeTransactionBytesZeroB == 0``).
 
+Hardware-verified premises (MUSA probe, 2026-10-13, on a leased mp_31 S5000). These were measured by
+driving the existing ``mp31_masked_moe_gemm_mixed_dtype`` kernel with an fp8 identity over k and unit
+scales, so ``out[0, m, n]`` is the value the hardware decodes for output column n at k = m:
+
+    * the int4 B operand is read as **signed two's complement**: nibble ``0x8`` decodes to -8 and
+      ``0xF`` to -1, with **no implicit -8 and no +1024** anywhere in that operand. So a stored nibble
+      in 0..15 decodes to exactly ``stored - 8``, which is *why* the symmetric path is
+      ``scale * (stored - 8)`` and why the host's ``else scale_b_padded`` on that path is an inert
+      filler rather than a second semantics (the ``sym`` instantiation never loads the tensor).
+      Do not weaken these gates to ``scale * stored``.
+    * byte ``j`` of row ``n`` carries k = 2j in the low nibble and k = 2j + 1 in the high nibble, with
+      consecutive k: a probe with ``low = j % 16`` read k = 16 from byte 8, which rules out NVIDIA's
+      {r, r+1, r+8, r+9} grouping. So ``pack_mate_weight_b``'s assertion and the 8-bias above are
+      measured facts, not documentation.
+    * route B (consuming Marlin's ``[K // 16, 2N]`` word-tiled buffer) needs a **real load-time
+      shuffle**, not a static address permutation, because this atom consumes consecutive k while
+      Marlin's buffer is word-tiled. That corrects the earlier "static permutation" note in
+      ``MateW4A16WeightLayout``.
+
+Still unverified, and not implied by any gate here: the smem/atom internals (the register -> C
+fragment map of ``MP31_16x16x32_F32F16S4F32``).
+
 Gate table (gate | test | expected observable | owning rule/skill)
     byte parity (CPU)  | test_repack_byte_parity_*        | oracle == repack_musa, maxdiff 0 | kernel-dashboard byte-parity override
     repack round trip  | test_mate_weight_b_round_trip    | codes survive pack->unpack      | shape-indexing-walkthrough
@@ -52,8 +74,24 @@ Gate table (gate | test | expected observable | owning rule/skill)
     quantization gate  | test_w4a16_symmetric_*          | relative mean error < 0.04      | upstream test_marlin_gemm
     zero-point gate    | test_w4a16_asymmetric_*         | relative mean error < 0.04      | upstream test_marlin_gemm
     padding gate (R5)  | test_w4a16_padded_round_trip_*  | assert_close rtol/atol 2e-2     | upstream test_marlin_tile_padding
+    order + bias       | test_mate_weight_b_nibble_order_* | even k low / odd k high, 8-bias | MUSA probe 2026-10-13 (measured)
     contract boundary  | test_w4a16_contract_*           | ValueError / NotImplementedError| dense_w4a16_gemm.py validation
     poison inputs      | test_w4a16_poison_*             | no crash, documented value      | write-kernel-test-plan
+
+Scope gaps a reader must know about before promising coverage:
+
+    * **K-side tile padding is unreachable under the group-128 contract**, so ``padded_k == size_k``
+      whenever ``size_k % 128 == 0`` (proved in
+      ``test_padding_cannot_grow_k_under_the_group_128_contract``; upstream only pads K for shapes the
+      group does not divide, and its own test skips those). ``test_w4a16_padded_k_is_not_expressible_yet``
+      is the honest encoding of the refusal, not a placeholder for coverage that exists.
+    * **The draft op requires ``K % 256 == 0``**, so a TP-sharded ``down`` projection at TP=2
+      (K = 8960 / 2 = **4480**, and 4480 % 256 = 128) is **refused**. Upstream serves that shape by
+      padding K to a tile-aligned extent; MATE cannot yet. Not blocking for Qwen2-1.5B-AWQ at TP=1
+      (1536 and 8960 are both multiples of 256), but it is a real scope limit for sharded serving, and
+      it is the reason the padding gate asserts a ``ValueError`` there.
+    * The byte-parity gates need the layout artifacts outside this tree; without them they skip with
+      the searched paths in the reason (see ``_artifact_dir``). Everything else still runs.
 
 Not covered here (must not be over-read):
     * The Marlin ``[K // 16, 2 * N]`` int32 repacked layout. The draft op consumes MATE's native
@@ -69,6 +107,11 @@ Not covered here (must not be over-read):
 Two portability notes: this module imports torch lazily so the numpy-only gates run on a box without
 torch (verified on the authoring host, which has numpy 1.26.0 and no torch), and the fp32 (not fp64)
 reference is forced by MUSA having no device float64; fp32 accumulation is the documented fallback.
+
+Installability: nothing here depends on the authoring workspace. The only external dependency is the
+layout-artifact directory for the byte-parity gates, resolved from ``$MUSA_W4A16_LAYOUT_REF`` (see
+``_artifact_dir``), and its absence skips those gates with the searched paths printed - it never fails
+the suite and never silently weakens a gate into a pass.
 """
 
 from __future__ import annotations
@@ -200,24 +243,36 @@ def synthetic_weight(
 # =============================================================================================
 # Section A - numpy only. No torch, no MUSA device. These gates run anywhere.
 # =============================================================================================
-def _artifact_dir() -> Optional[Path]:
-    """Locate the verified layout artifacts this port checks its own helpers against.
+ARTIFACT_ENV = "MUSA_W4A16_LAYOUT_REF"
+_ARTIFACT_ENV_ALIASES = ("MATE_MARLIN_LAYOUT_ARTIFACTS",)
 
-    ``MATE_MARLIN_LAYOUT_ARTIFACTS`` wins. The default candidates are the authoring workspace path
-    and a copy vendored next to the MATE test tree, so MATE CI can pin them without this file
-    knowing about an absolute host path. When the artifacts are absent the parity gates skip with a
-    reason instead of silently weakening to "no reference" - vendoring them into MATE's ``tests/``
-    is the follow-up recorded in the ticket.
+
+def _artifact_dir() -> Optional[Path]:
+    """Locate the layout artifacts the parity gates compare against, or ``None``.
+
+    Resolution order:
+      1. ``$MUSA_W4A16_LAYOUT_REF`` (alias: ``$MATE_MARLIN_LAYOUT_ARTIFACTS``) - the supported way to
+         point this file at the artifacts, because they live outside MATE's tree by construction.
+      2. ``<this file's dir>/marlin_artifacts/`` - for a copy vendored into ``tests/``.
+      3. This file's grandparent - only so the port could be self-checked on the authoring host.
+
+    The parity gates need ``layout_ref.py`` (the scalar transcription of ``gptq_marlin_repack.cu`` +
+    ``marlin_utils.marlin_permute_scales``/``marlin_zero_points``) and ``repack_musa.py`` (the shipping
+    per-tile repack), because a byte-parity claim is only as good as the reference it is made against.
+    Re-transcribing a third copy of those helpers into this file was rejected: it would be a new
+    unverified oracle, and it would stop the gate from watching the artifact that was actually
+    verified against the CUDA source. So when the directory is missing, **only** the parity gates skip
+    (with the path and the env var in the reason); every shape, accuracy, R3, padding and contract gate
+    still runs. Vendoring the two files as ``tests/marlin_artifacts/`` is the follow-up that makes the
+    parity gates run in MATE CI.
     """
     candidates = []
-    env = os.environ.get("MATE_MARLIN_LAYOUT_ARTIFACTS")
-    if env:
-        candidates.append(Path(env))
-    # No authoring-host absolute path here on purpose: this file is committed to MATE, where the
-    # artifacts live under tests/marlin_artifacts/ (or wherever MATE_MARLIN_LAYOUT_ARTIFACTS points).
-    # tests-port/tests/ -> tests-port/ -> the artifact bundle root
-    candidates.append(Path(__file__).resolve().parents[2])
+    for name in (ARTIFACT_ENV, *_ARTIFACT_ENV_ALIASES):
+        value = os.environ.get(name)
+        if value:
+            candidates.append(Path(value))
     candidates.append(Path(__file__).resolve().parent / "marlin_artifacts")
+    candidates.append(Path(__file__).resolve().parents[2])
     for candidate in candidates:
         if (candidate / "layout_ref.py").is_file() and (candidate / "repack_musa.py").is_file():
             return candidate
@@ -236,13 +291,15 @@ _ARTIFACTS = _artifact_dir()
 LAYOUT_REF = _load_module(_ARTIFACTS / "layout_ref.py", "mate_marlin_layout_ref") if _ARTIFACTS else None
 REPACK_MUSA = _load_module(_ARTIFACTS / "repack_musa.py", "mate_marlin_repack_musa") if _ARTIFACTS else None
 
-needs_artifacts = pytest.mark.skipif(
-    _ARTIFACTS is None,
-    reason=(
-        "layout oracle artifacts not found (expected layout_ref.py + repack_musa.py; set "
-        "MATE_MARLIN_LAYOUT_ARTIFACTS or vendor them next to this test)"
-    ),
+_ARTIFACT_HINT = (
+    f"byte-parity gate skipped: no layout artifacts. Set ${ARTIFACT_ENV}=<dir> containing "
+    "layout_ref.py and repack_musa.py (or vendor them as tests/marlin_artifacts/). Searched: "
+    + ", ".join(
+        [f"${name}" for name in (ARTIFACT_ENV, *_ARTIFACT_ENV_ALIASES)]
+        + ["<test dir>/marlin_artifacts", str(Path(__file__).resolve().parents[2])]
+    )
 )
+needs_artifacts = pytest.mark.skipif(_ARTIFACTS is None, reason=_ARTIFACT_HINT)
 
 
 def pack_mate_weight_b(stored_kN: np.ndarray) -> np.ndarray:
@@ -889,8 +946,10 @@ def test_w4a16_padded_k_is_not_expressible_yet(size_n, size_k):
 
     These are upstream's K-padded shapes. Under the group-128 contract they cannot be padded to a
     multiple of 256 (an odd shape is skipped upstream too), and with no group contract the padded K
-    lands on 320/384. Either way MATE's draft op raises, and the ticket records that the kernel needs
-    a smaller K tile (or a relaxed tile-K check) to serve TP-sharded shapes. When that lands, this
+    lands on 320/384. Either way MATE's draft op raises, and the concrete serving casualty is a
+    TP-sharded ``down`` projection: at TP=2 the rank-local K is 8960 / 2 = 4480, and 4480 % 256 = 128,
+    so the shape is refused even though upstream serves it by padding K to a tile-aligned extent.
+    The kernel needs a smaller K tile (or a relaxed tile-K check) before that works; when it lands this
     test is expected to be *replaced* by a real round trip, not deleted.
     """
     module = pytest.importorskip("mate.jit.gemm.dense_w4a16_gemm")
@@ -1077,8 +1136,11 @@ def _self_check_without_torch() -> int:
     if not np.array_equal(unpack_mate_weight_b(packed, 512), codes):
         failures.append("mate_weight_b round trip")
     if _ARTIFACTS is None:
-        failures.append("layout artifacts not found (parity gates did not run)")
+        # Not a failure: the parity gates are the only thing that needs the artifacts, and a clean
+        # skip is the contract. Say which gate did not run and where it looked.
+        print(f"SKIPPED (not failed): {_ARTIFACT_HINT}")
     else:
+        print(f"artifacts: {_ARTIFACTS}")
         qweight = gptq_layout_pack(codes)
         reference = np.asarray(LAYOUT_REF.cuda_repack_gptq(qweight, 512, 128), dtype=np.int64)
         shipped = np.asarray(REPACK_MUSA.repack_gptq(qweight, 512, 128), dtype=np.int64)
