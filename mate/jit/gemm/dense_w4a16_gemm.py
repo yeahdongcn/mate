@@ -22,12 +22,20 @@ from . import gemm_utils
 
 # The K256 tile carries exactly two K128 weight-scale blocks, which is the group size W4A16
 # checkpoints are quantized with; a different group size needs a different tile, not a flag.
-DENSE_W4A16_GEMM_TILE = (32, 256, 256, 3)
+#
+# Two stages is the most this tile can stage. Each stage costs about 68 KB: the fp16 A tile, its copy
+# in the MMA atom layout, the packed INT4 B tile and the paired group scales. The fixed cost is about
+# 68 KB more, and the MP31 per-block limit is 192 KB, so a third stage cannot fit for either the
+# symmetric or the zero-point instantiation.
+DENSE_W4A16_GEMM_TILE = (32, 256, 256, 2)
 DENSE_W4A16_GEMM_GROUP_SIZE = 128
 
-# Signed INT4 nibbles are stored biased so that a zero point of kWeightNibbleBias is a no-op, which is
-# what the symmetric GPTQ (uint4b8) checkpoints use and what the atom's signed product already
-# computes. Any other zero point needs the rank-1 correction the kernel applies.
+# The MMA atom reads each 4-bit weight field as a signed two's-complement integer; measured on the
+# K256 tile, nibble 0x0 yields 0, 0x3 yields +3 and 0x8 yields -8. A checkpoint whose unsigned nibble
+# `u` decodes as `u - nibble_bias` must therefore be packed as `u ^ 0x8` (the packed byte XOR 0x88),
+# which is the two's-complement encoding of `u - nibble_bias`. With that packing the atom's product
+# already carries the bias, so a zero point equal to the bias needs no correction at all and every
+# other zero point needs only the rank-1 term the kernel applies.
 DENSE_W4A16_GEMM_NIBBLE_BIAS = 8
 
 DENSE_W4A16_GEMM_OUTPUT_DTYPE_TAGS = {
@@ -45,14 +53,16 @@ class MateW4A16WeightLayout:
 
     Contract: `b_packed[n, k // 2]` is one byte holding the pair of K-adjacent weights of output
     column `n`: the even K index occupies the low nibble, the odd K index the high nibble, and each
-    nibble already holds the signed INT4 value `unsigned_nibble - nibble_bias`, so the atom's signed
-    product needs no per-element correction. `scale_b` and the folded `zero_b` are `(N, K // 128)`.
+    nibble holds `unsigned_nibble ^ 0x8`, the two's-complement encoding of `unsigned_nibble -
+    nibble_bias`. The atom multiplies those fields signed, so the bias is already inside the product
+    and no per-element correction is needed. `scale_b` and the folded `zero_b` are `(N, K // 128)`.
 
-    TODO: the Marlin layout contract (upstream `[K // 16, 2 * N]` int32 words) replaces this. Upstream
-    stores the same logical `(k, n) -> (word, nibble)` index map in a different physical order, so
-    consuming it means translating its nibble addresses into this atom's fragment addresses by a
-    static permutation, plus re-deriving the group-scale and zero-point layouts that ride with it.
-    Nothing else in this module depends on the physical order, so that permutation is the only change.
+    TODO: consuming an upstream checkpoint needs both halves of the same translation. Upstream's
+    Marlin layout (`[K // 16, 2 * N]` int32 words) holds the same logical `(k, n) -> (word, nibble)`
+    index map in a different physical order, and its nibbles are the raw unsigned values, so the
+    packing has to permute the nibble addresses into this atom's fragment addresses and XOR each byte
+    with 0x88 on the way. Nothing else in this module depends on the physical order or on the raw
+    encoding, so that translation is the only change.
     """
 
     even_k_low_nibble: bool = True
@@ -168,12 +178,11 @@ def fold_zero_points(
 ) -> torch.Tensor:
     """Fold per-group zero points into the single correction stream the kernel consumes.
 
-    `w = scale * (q + nibble_bias - zero_point)` splits into the atom's signed product `scale * q` plus
-    the rank-1 term `(nibble_bias - zero_point) * scale * reduce_k(a)`. The kernel takes the second
-    factor, so this function returns `(nibble_bias - zero_point) * scale` in fp16.
-
-    A plain INT4 to fp16 dequant that ignores the bias is wrong by a constant `nibble_bias * sum(scale)`
-    per group, so any parity test must compare against the biased reference, not a naive dequant.
+    With the packed nibbles holding the two's-complement value `q`, the atom computes `reduce_k(a * q)`
+    and the true weight is `w = scale * (q + nibble_bias - zero_point)`. The residual is the rank-1 term
+    `(nibble_bias - zero_point) * scale * reduce_k(a)`, whose second factor this function returns in
+    fp16. A reference that dequantizes the packed nibbles without that term is off by
+    `(nibble_bias - zero_point) * sum(scale)` per group, so parity tests must use the folded reference.
     """
     if zero_points.shape != scale_b.shape:
         raise ValueError(
@@ -256,6 +265,15 @@ def dense_w4a16_gemm_mutlass(
         (out, "out"),
     ):
         _check_contiguous_last_dim(tensor, name)
+        if tensor.device != input_a.device:
+            raise ValueError(
+                f"{name} is on {tensor.device} while input_a is on {input_a.device}; every operand "
+                "is read by the kernel through a device pointer"
+            )
+    if zero_points is not None and zero_points.device != input_a.device:
+        raise ValueError(
+            f"zero_points is on {zero_points.device} while input_a is on {input_a.device}"
+        )
 
     weight_b = apply_gidx_permutation(weight_b, g_idx)
 

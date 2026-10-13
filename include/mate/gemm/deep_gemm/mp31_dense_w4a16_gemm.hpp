@@ -10,6 +10,7 @@
 #include <mute/atom/copy_atom.hpp>
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
+#include <type_traits>
 
 #include "mate/attention/fmha/pipeline_ws.hpp"
 #include "mate/common/mma_mp31_sqmma.hpp"
@@ -213,12 +214,29 @@ struct Mp31DenseW4A16Gemm {
                     mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers,
                 "Async barrier storage exceeds the MP31 hardware limit");
 
+  // The rank-1 zero-point correction stages its own operands: the per-K128 reductions of A and the
+  // folded correction that multiplies them. The symmetric build has no correction, so it must not pay
+  // shared memory for one. The empty alternative keeps the member names present without storage, which
+  // turns any access that escapes its `if constexpr` into a compile error instead of a write into a
+  // placeholder.
+  struct ZeroPointStorage {
+    MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementRowSum, cosize_v<SmemLayoutRowSum>> smem_row_sum;
+    MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementZeroB, cosize_v<SmemLayoutZeroB>> smem_zero_b;
+  };
+  struct EmptyZeroPointStorage {
+    struct Unavailable {
+      MUTLASS_DEVICE void* begin() = delete;
+    };
+    Unavailable smem_row_sum;
+    Unavailable smem_zero_b;
+  };
+  using ZeroPointStorageT = std::conditional_t<IsZeroPoints, ZeroPointStorage, EmptyZeroPointStorage>;
+
   struct SharedStorage {
     MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementMmaA, cosize_v<SmemLayoutMmaA>> smem_mma_a;
     MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementB, cosize_v<SmemLayoutB>> smem_b;
-    MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementRowSum, cosize_v<SmemLayoutRowSum>> smem_row_sum;
+    MUTE_ALIGNAS(SmemAlignmentBytes) ZeroPointStorageT zero_point;
     MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementScaleB, cosize_v<SmemLayoutScaleB>> smem_scale_b;
-    MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementZeroB, cosize_v<SmemLayoutZeroB>> smem_zero_b;
     MUTE_ALIGNAS(SmemAlignmentBytes) ArrayEngine<ElementA, cosize_v<SmemLayoutA>> smem_a;
   };
 
@@ -317,7 +335,6 @@ struct Mp31DenseW4A16Gemm {
     Tensor sA      = make_tensor(make_smem_ptr(shared_storage.smem_a.begin()), SmemLayoutA{});
     Tensor sB      = make_tensor(make_smem_ptr(shared_storage.smem_b.begin()), SmemLayoutB{});
     Tensor sScaleB = make_tensor(make_smem_ptr(shared_storage.smem_scale_b.begin()), SmemLayoutScaleB{});
-    Tensor sZeroB  = make_tensor(make_smem_ptr(shared_storage.smem_zero_b.begin()), SmemLayoutZeroB{});
 
     auto cta_tme_a       = params.tme_a.get_slice(0);
     auto cta_tme_b       = params.tme_b.get_slice(0);
@@ -344,8 +361,7 @@ struct Mp31DenseW4A16Gemm {
     auto   mScaleB   = params.tme_scale_b.get_tme_tensor(make_shape(params.n, params.scale_k_blocks, 1))(_, _, _0{});
     Tensor tSsScaleB = cta_tme_scale_b.partition_D(sScaleB);
 
-    auto   mZeroB   = params.tme_zero_b.get_tme_tensor(make_shape(params.n, params.scale_k_blocks, 1))(_, _, _0{});
-    Tensor tSsZeroB = cta_tme_zero_b.partition_D(sZeroB);
+    auto mZeroB = params.tme_zero_b.get_tme_tensor(make_shape(params.n, params.scale_k_blocks, 1))(_, _, _0{});
 
     MUTLASS_PRAGMA_NO_UNROLL
     for (int k_block = 0; k_block < params.k_blocks; ++k_block) {
@@ -363,6 +379,8 @@ struct Mp31DenseW4A16Gemm {
         copy(params.tme_scale_b.with(barrier_id_b), tSgScaleB, tSsScaleB(_, _, _, int(pipe_b_write.index())));
 
         if constexpr (IsZeroPoints) {
+          Tensor sZeroB = make_tensor(make_smem_ptr(shared_storage.zero_point.smem_zero_b.begin()), SmemLayoutZeroB{});
+          Tensor tSsZeroB  = cta_tme_zero_b.partition_D(sZeroB);
           auto   mZeroBAtK = domain_offset(make_coord(_0{}, k_block * ScaleBlocksPerTile), mZeroB);
           Tensor gZeroB =
               local_tile(mZeroBAtK, make_shape(Int<BlockN>{}, Int<TmeScaleKBlocks>{}), make_coord(n_block_idx, _0{}));
@@ -389,9 +407,8 @@ struct Mp31DenseW4A16Gemm {
                         PipelineLoadAState& pipe_a_read,
                         PipelineCastAState& pipe_cast_a_write,
                         int                 caster_thread_idx) {
-    Tensor sA      = make_tensor(make_smem_ptr(shared_storage.smem_a.begin()), SmemLayoutA{});
-    Tensor sMmaA   = make_tensor(make_smem_ptr(shared_storage.smem_mma_a.begin()), SmemLayoutMmaA{});
-    Tensor sRowSum = make_tensor(make_smem_ptr(shared_storage.smem_row_sum.begin()), SmemLayoutRowSum{});
+    Tensor sA    = make_tensor(make_smem_ptr(shared_storage.smem_a.begin()), SmemLayoutA{});
+    Tensor sMmaA = make_tensor(make_smem_ptr(shared_storage.smem_mma_a.begin()), SmemLayoutMmaA{});
 
     using StoreVector               = uint128_t;
     constexpr int ElementsPerVector = sizeof(StoreVector) / sizeof(ElementA);
@@ -448,24 +465,30 @@ struct Mp31DenseW4A16Gemm {
         rMmaAArray(vector_idx) = rA(vector_idx);
       }
 
-      float row_sum = 0.0f;
-      MUTE_UNROLL
-      for (int element_idx = 0; element_idx < ElementsPerThread; ++element_idx) {
-        row_sum += float(rAArray(element_idx));
-      }
-      MUTLASS_PRAGMA_UNROLL
-      for (int offset = 1; offset < ThreadsPerGroup; offset <<= 1) {
-        row_sum += __shfl_xor_sync(0xffffffff, row_sum, offset);
-      }
-
       pipeline_cast_a.producer_acquire(pipe_cast_a_write);
 
       const int stage        = int(pipe_cast_a_write.index());
       auto      tCsMmaAStore = thr_copy_store.partition_D(sMmaA(_, _, stage));
       copy(tiled_copy_store, tCrMmaAStore, tCsMmaAStore);
 
-      if (thread_idx_in_row % ThreadsPerGroup == 0) {
-        sRowSum(m_idx, thread_idx_in_row / ThreadsPerGroup, stage) = row_sum;
+      // The reduction feeds the zero-point correction alone, so the symmetric build neither computes nor
+      // stages it. It is published before the stage is committed, so the consumer reads it together with
+      // the tile it belongs to.
+      if constexpr (IsZeroPoints) {
+        float row_sum = 0.0f;
+        MUTE_UNROLL
+        for (int element_idx = 0; element_idx < ElementsPerThread; ++element_idx) {
+          row_sum += float(rAArray(element_idx));
+        }
+        MUTLASS_PRAGMA_UNROLL
+        for (int offset = 1; offset < ThreadsPerGroup; offset <<= 1) {
+          row_sum += __shfl_xor_sync(0xffffffff, row_sum, offset);
+        }
+        if (thread_idx_in_row % ThreadsPerGroup == 0) {
+          Tensor sRowSum =
+              make_tensor(make_smem_ptr(shared_storage.zero_point.smem_row_sum.begin()), SmemLayoutRowSum{});
+          sRowSum(m_idx, thread_idx_in_row / ThreadsPerGroup, stage) = row_sum;
+        }
       }
 
       __syncwarp();
@@ -539,22 +562,30 @@ struct Mp31DenseW4A16Gemm {
   }
 
   // Rank-1 term of the asymmetric dequant, `(kWeightNibbleBias - zero_point) * reduce_k(a)`, for the
-  // K128 group selected by ScaleIndex. Adding it to the scaled accumulator of every output column is
-  // exact, because the atom already produced the signed INT4 product of the same group.
+  // K128 group selected by ScaleIndex. `row_sum` is that reduction for the single tile row this
+  // thread's C fragment covers, and the zero-point stream holds `(bias - zero_point) * scale` per
+  // output column, so the product is the whole correction for every element of the group. The atom
+  // already produced the signed INT4 product of the same group, so adding it is exact.
   template <int ScaleIndex, class CorrTensor, class RowSumTensor, class PackedZeroBTensor>
   MUTLASS_DEVICE static void calculate_correction_bst4(CorrTensor&              corr,
                                                        RowSumTensor const&      row_sum,
                                                        PackedZeroBTensor const& zero_b_packed) {
     static_assert(ScaleIndex == 0 || ScaleIndex == 1);
     static_assert(size(CorrTensor{}) % 4 == 0, "BST4 scaling requires groups of four accumulators");
+    static_assert(size(CorrTensor{}) % size(RowSumTensor{}) == 0,
+                  "the reduction must divide the accumulator fragment it corrects");
+
+    // `row_sum` holds one reduction per row of the C fragment this thread owns, and the fragment
+    // covers several columns of each of those rows, so each reduction is repeated across its columns.
+    constexpr int ColumnsPerRow = size(CorrTensor{}) / size(RowSumTensor{});
 
     MUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(corr); i += 4) {
       const float4 zero_vec = unpack_packed_bst4<ElementZeroB, ScaleIndex>(zero_b_packed, i);
-      corr(i + 0)           = row_sum(i + 0) * zero_vec.x;
-      corr(i + 1)           = row_sum(i + 1) * zero_vec.y;
-      corr(i + 2)           = row_sum(i + 2) * zero_vec.z;
-      corr(i + 3)           = row_sum(i + 3) * zero_vec.w;
+      corr(i + 0)           = float(row_sum((i + 0) / ColumnsPerRow)) * zero_vec.x;
+      corr(i + 1)           = float(row_sum((i + 1) / ColumnsPerRow)) * zero_vec.y;
+      corr(i + 2)           = float(row_sum((i + 2) / ColumnsPerRow)) * zero_vec.z;
+      corr(i + 3)           = float(row_sum((i + 3) / ColumnsPerRow)) * zero_vec.w;
     }
   }
 
@@ -595,9 +626,7 @@ struct Mp31DenseW4A16Gemm {
 
     Tensor sMmaA   = make_tensor(make_smem_ptr(shared_storage.smem_mma_a.begin()), SmemLayoutMmaA{});
     Tensor sB      = make_tensor(make_smem_ptr(shared_storage.smem_b.begin()), SmemLayoutB{});
-    Tensor sRowSum = make_tensor(make_smem_ptr(shared_storage.smem_row_sum.begin()), SmemLayoutRowSum{});
     Tensor sScaleB = make_tensor(make_smem_ptr(shared_storage.smem_scale_b.begin()), SmemLayoutScaleB{});
-    Tensor sZeroB  = make_tensor(make_smem_ptr(shared_storage.smem_zero_b.begin()), SmemLayoutZeroB{});
 
     auto rAcc           = partition_fragment_C(tiled_mma, take<0, 2>(TileShape{}));
     auto rAccTempFirst  = make_fragment_like(rAcc);
@@ -618,27 +647,19 @@ struct Mp31DenseW4A16Gemm {
     using RowSumViewAsCLayout = Layout<Shape<Shape<_1, Int<BlockM>>, Int<BlockN>>, Stride<Stride<_0, _1>, _0>>;
     using ScaleBViewAsCLayout = Layout<Shape<Int<BlockM>, Shape<_1, Int<BlockN>>>, Stride<_0, Stride<_0, _1>>>;
 
-    // The A reduction is published on the cast pipeline together with the tile it belongs to, so it is
-    // read per stage rather than software-prefetched like the weight streams.
-    Tensor tCsRowSumTemplate   = thr_mma.partition_C(sRowSum(_, _0{}, _0{}).compose(RowSumViewAsCLayout{}));
-    Tensor tCrRowSumFirst      = make_tensor_like<ElementRowSum>(tCsRowSumTemplate);
-    Tensor tCrRowSumSecond     = make_tensor_like<ElementRowSum>(tCsRowSumTemplate);
-    auto   tCrRowSumFirstFlat  = filter_zeros(tCrRowSumFirst);
-    auto   tCrRowSumSecondFlat = filter_zeros(tCrRowSumSecond);
-
     Tensor tCsScaleBTemplate       = thr_mma.partition_C(sScaleB(_, _0{}, _0{}).compose(ScaleBViewAsCLayout{}));
     Tensor tCrScaleBPacked         = make_tensor_like<uint32_t>(tCsScaleBTemplate);
     Tensor tCrScaleBNextPacked     = make_tensor_like<uint32_t>(tCsScaleBTemplate);
     auto   tCrScaleBPackedFlat     = filter_zeros(tCrScaleBPacked);
     auto   tCrScaleBNextPackedFlat = filter_zeros(tCrScaleBNextPacked);
 
-    Tensor tCsZeroBTemplate       = thr_mma.partition_C(sZeroB(_, _0{}, _0{}).compose(ScaleBViewAsCLayout{}));
-    Tensor tCrZeroBPacked         = make_tensor_like<uint32_t>(tCsZeroBTemplate);
-    Tensor tCrZeroBNextPacked     = make_tensor_like<uint32_t>(tCsZeroBTemplate);
+    // The correction stream has the scale stream's shape, so its register state is derived from the
+    // scale state and needs no shared-memory view of its own.
+    Tensor tCrZeroBPacked         = make_tensor_like<uint32_t>(tCrScaleBPacked);
+    Tensor tCrZeroBNextPacked     = make_tensor_like<uint32_t>(tCrScaleBPacked);
     auto   tCrZeroBPackedFlat     = filter_zeros(tCrZeroBPacked);
     auto   tCrZeroBNextPackedFlat = filter_zeros(tCrZeroBNextPacked);
 
-    MUTE_STATIC_ASSERT_V(size(rAcc) == size(tCrRowSumFirst));
     MUTE_STATIC_ASSERT_V(size(rAcc) == size(tCrScaleBPacked));
     MUTE_STATIC_ASSERT_V(size(rAcc) == size(tCrZeroBPacked));
 
@@ -651,6 +672,7 @@ struct Mp31DenseW4A16Gemm {
       UniversalCopy<uint32_t>::copy(reinterpret_cast<uint32_t const&>(tCsScaleBFirstFlat(i)), tCrScaleBPackedFlat(i));
     }
     if constexpr (IsZeroPoints) {
+      Tensor sZeroB = make_tensor(make_smem_ptr(shared_storage.zero_point.smem_zero_b.begin()), SmemLayoutZeroB{});
       Tensor tCsZeroBFirst = thr_mma.partition_C(sZeroB(_, _0{}, initial_scale_stage).compose(ScaleBViewAsCLayout{}));
       auto   tCsZeroBFirstFlat = filter_zeros(tCsZeroBFirst);
       MUTLASS_PRAGMA_UNROLL
@@ -674,6 +696,7 @@ struct Mp31DenseW4A16Gemm {
                                         tCrScaleBNextPackedFlat(i));
         }
         if constexpr (IsZeroPoints) {
+          Tensor sZeroB = make_tensor(make_smem_ptr(shared_storage.zero_point.smem_zero_b.begin()), SmemLayoutZeroB{});
           Tensor tCsZeroBNextFirst =
               thr_mma.partition_C(sZeroB(_, _0{}, next_scale_stage).compose(ScaleBViewAsCLayout{}));
           auto tCsZeroBNextFirstFlat = filter_zeros(tCsZeroBNextFirst);
@@ -692,17 +715,20 @@ struct Mp31DenseW4A16Gemm {
       const int stage_a = int(pipe_cast_a_read.index());
       const int stage_b = int(pipe_b_read.index());
 
-      // The reduction of the A tile stages currently in the MMA buffer, one pair per K128 group.
+      // The reduction of the A stage in the MMA buffer and the correction it feeds both belong to that
+      // stage, so they are consumed before the pipeline may reuse the buffer.
       if constexpr (IsZeroPoints) {
+        Tensor sRowSum = make_tensor(make_smem_ptr(shared_storage.zero_point.smem_row_sum.begin()), SmemLayoutRowSum{});
+        // The reduction lives in shared memory, so its broadcast into the accumulator fragment is
+        // expressed as a C-shaped view: filtering the zero strides leaves one reduction per row that
+        // this thread's fragment covers.
         Tensor tCsRowSumFirst      = thr_mma.partition_C(sRowSum(_, _0{}, stage_a).compose(RowSumViewAsCLayout{}));
         Tensor tCsRowSumSecond     = thr_mma.partition_C(sRowSum(_, _1{}, stage_a).compose(RowSumViewAsCLayout{}));
         auto   tCsRowSumFirstFlat  = filter_zeros(tCsRowSumFirst);
         auto   tCsRowSumSecondFlat = filter_zeros(tCsRowSumSecond);
-        MUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tCrRowSumFirstFlat); ++i) {
-          UniversalCopy<ElementRowSum>::copy(tCsRowSumFirstFlat(i), tCrRowSumFirstFlat(i));
-          UniversalCopy<ElementRowSum>::copy(tCsRowSumSecondFlat(i), tCrRowSumSecondFlat(i));
-        }
+        MUTE_STATIC_ASSERT_V(size(rCorrFirst) % size(tCsRowSumFirstFlat) == _0{});
+        calculate_correction_bst4<0>(rCorrFirst, tCsRowSumFirstFlat, tCrZeroBPacked);
+        calculate_correction_bst4<1>(rCorrSecond, tCsRowSumSecondFlat, tCrZeroBPacked);
       }
 
       tiled_mma.accumulate_ = MP31::SQMMA::ScaleOut::Zero;
@@ -723,10 +749,6 @@ struct Mp31DenseW4A16Gemm {
 
       unpack_scale_bst4<0>(rScaleFirst, tCrScaleBPacked);
       unpack_scale_bst4<1>(rScaleSecond, tCrScaleBPacked);
-      if constexpr (IsZeroPoints) {
-        calculate_correction_bst4<0>(rCorrFirst, tCrRowSumFirst, tCrZeroBPacked);
-        calculate_correction_bst4<1>(rCorrSecond, tCrRowSumSecond, tCrZeroBPacked);
-      }
       if (k_block < params.k_blocks - 1) {
         copy(tCrScaleBNextPackedFlat, tCrScaleBPackedFlat);
         if constexpr (IsZeroPoints) {

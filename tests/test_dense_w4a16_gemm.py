@@ -29,10 +29,10 @@ def test_dispatch_name_does_not_depend_on_m() -> None:
     # One compiled op serves every M, so the name is a function of the dtypes and the zero-point mode
     # only. A name that grew with M would mean a shape-independent trace had been frozen somewhere.
     assert dense_w4a16_gemm_dispatch_name(torch.float16, False) == (
-        "mp31_dense_w4a16_gemm_fp16_32x256x256_s3_sym"
+        "mp31_dense_w4a16_gemm_fp16_32x256x256_s2_sym"
     )
     assert dense_w4a16_gemm_dispatch_name(torch.float16, True) == (
-        "mp31_dense_w4a16_gemm_fp16_32x256x256_s3_zp"
+        "mp31_dense_w4a16_gemm_fp16_32x256x256_s2_zp"
     )
     assert dense_w4a16_gemm_dispatch_name(torch.bfloat16, True) != (
         dense_w4a16_gemm_dispatch_name(torch.float16, True)
@@ -40,8 +40,8 @@ def test_dispatch_name_does_not_depend_on_m() -> None:
 
 
 def test_symmetric_zero_points_produce_no_correction() -> None:
-    # GPTQ uint4b8 decodes as nibble - 8 with no further bias, so a zero point equal to the nibble
-    # bias is the symmetric case and its rank-1 correction has to vanish exactly.
+    # The packed nibble already carries the bias, so a zero point equal to the nibble bias is the
+    # symmetric GPTQ (uint4b8) case and its rank-1 correction has to vanish exactly.
     scale = torch.rand(4, 3, dtype=torch.float16) + 0.5
     symmetric = torch.full_like(scale, float(DENSE_W4A16_GEMM_NIBBLE_BIAS))
     assert torch.equal(fold_zero_points(symmetric, scale), torch.zeros_like(scale))
@@ -67,12 +67,23 @@ def test_padded_group_column_contributes_nothing() -> None:
 
 
 def test_naive_dequant_is_wrong_by_the_bias() -> None:
-    # A reference dequant that ignores the stored bias is off by bias * sum(scale) per group, which is
-    # exactly the correction the kernel applies for a zero point of zero.
+    # A reference that drops the rank-1 term is off by (bias - zero_point) * sum(scale) per group,
+    # which is exactly the correction the kernel applies for a zero point of zero.
     scale = torch.tensor([[1.0, 2.0]], dtype=torch.float16)
     zero_points = torch.zeros((1, 2), dtype=torch.int32)
     correction = fold_zero_points(zero_points, scale)
     assert torch.equal(correction, float(DENSE_W4A16_GEMM_NIBBLE_BIAS) * scale)
+
+
+def test_host_operand_is_rejected() -> None:
+    # A host tensor would be dereferenced as device memory, so mixing placements must be refused
+    # before the kernel is launched.
+    a = torch.zeros((1, 256), dtype=torch.float16, device="meta")
+    w = torch.zeros((64, 128), dtype=torch.int8, device="cpu")
+    s = torch.zeros((64, 2), dtype=torch.float16, device="meta")
+    out = torch.zeros((1, 64), dtype=torch.float16, device="meta")
+    with pytest.raises(ValueError, match="device pointer"):
+        dense_w4a16_gemm_mutlass(a, w, s, out)
 
 
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
