@@ -49,32 +49,47 @@ Hardware-verified premises (MUSA probe, 2026-10-13, on a leased mp_31 S5000). Th
 driving the existing ``mp31_masked_moe_gemm_mixed_dtype`` kernel with an fp8 identity over k and unit
 scales, so ``out[0, m, n]`` is the value the hardware decodes for output column n at k = m:
 
-    * the int4 B operand is read as **signed two's complement**: nibble ``0x8`` decodes to -8 and
-      ``0xF`` to -1, with **no implicit -8 and no +1024** anywhere in that operand. So a stored nibble
-      in 0..15 decodes to exactly ``stored - 8``, which is *why* the symmetric path is
-      ``scale * (stored - 8)`` and why the host's ``else scale_b_padded`` on that path is an inert
-      filler rather than a second semantics (the ``sym`` instantiation never loads the tensor).
-      Do not weaken these gates to ``scale * stored``.
+    * the int4 B operand's 4-bit field is read as **two's complement**: code ``0`` decodes to 0, ``8``
+      to -8 and ``15`` to -1, with **no implicit -8 and no +1024** anywhere in that operand. The
+      tempting reading "a stored nibble decodes to exactly ``stored - 8``" is true **only at
+      ``stored == 8``** -- the single code a probe naturally picks. It is false for the whole lower
+      half, and no checker that only ever used code 8 could tell the difference. That is the trap this
+      note exists to close; do not weaken these gates to ``scale * stored``.
+    * the presentation MATE's frame requires follows from MATE's own contract, not from the atom's
+      incidental behaviour. The packed-weight contract says each nibble "already holds the signed INT4
+      value ``unsigned_nibble - nibble_bias``" and the public dequant is
+      ``w = scale * (q + nibble_bias - zero_point)`` (``mate/gemm.py:1503-1507``,
+      ``mate/jit/gemm/dense_w4a16_gemm.py:28-31,46-49``), while
+      ``tests/test_dense_w4a16_gemm.py:42-47`` states that GPTQ uint4b8 "decodes as ``nibble - 8``
+      with no further bias" and that a symmetric checkpoint's zero point equals the bias, so its rank-1
+      correction vanishes exactly (and the ``sym`` instantiation never loads the zero-point tensor:
+      ``TmeTransactionBytesZeroB == 0``). Requiring that declared decode for *every* code forces the
+      presented code to be ``u ^ 0x8``, because ``s(u ^ 0x8) == u - 8`` for all 16 codes. Presenting
+      upstream's ``uint4b8`` words verbatim instead costs a uniform ``8 * scale`` per element -- which
+      no shape-based comparison detects, and which surfaces as exactly ``8 * scale * sum_k(a)`` per
+      group in the R3 gate.
     * byte ``j`` of row ``n`` carries k = 2j in the low nibble and k = 2j + 1 in the high nibble, with
       consecutive k: a probe with ``low = j % 16`` read k = 16 from byte 8, which rules out NVIDIA's
-      {r, r+1, r+8, r+9} grouping. So ``pack_mate_weight_b``'s assertion and the 8-bias above are
+      {r, r+1, r+8, r+9} grouping. So ``pack_mate_weight_b``'s assertion and the byte order above are
       measured facts, not documentation.
     * route B (consuming Marlin's ``[K // 16, 2N]`` word-tiled buffer) needs a **real load-time
-      shuffle**, not a static address permutation, because this atom consumes consecutive k while
-      Marlin's buffer is word-tiled. That corrects the earlier "static permutation" note in
-      ``MateW4A16WeightLayout``.
+      shuffle**, not a static address permutation: this atom consumes consecutive k while Marlin's
+      buffer is word-tiled, *and* the codes need the ``u ^ 0x8`` presentation above. That corrects the
+      earlier "static permutation" note in ``MateW4A16WeightLayout``.
 
 Still unverified, and not implied by any gate here: the smem/atom internals (the register -> C
 fragment map of ``MP31_16x16x32_F32F16S4F32``).
 
 Gate table (gate | test | expected observable | owning rule/skill)
-    byte parity (CPU)  | test_repack_byte_parity_*        | oracle == repack_musa, maxdiff 0 | kernel-dashboard byte-parity override
+    byte parity (CPU)  | test_repack_byte_parity_*        | oracle == MATE repack, maxdiff 0 | kernel-dashboard byte-parity override
+    order              | test_mate_weight_b_nibble_order_* | even k low / odd k high         | MUSA probe 2026-10-13 (measured)
+    sign-bit frame     | test_wrapper_sign_bit_presentation_* | s(u ^ 0x8) == u - 8, verbatim fails below 8 | mate/gemm.py:1503-1507
+    zero points raw    | test_wrapper_zero_points_are_raw_* | symmetric zp stays 8, folded 0 fails | mate/gemm.py:1512-1515
     repack round trip  | test_mate_weight_b_round_trip    | codes survive pack->unpack      | shape-indexing-walkthrough
     R3 negative ctrl   | test_r3_nibble_bias_*           | analytic 8*sum(s) error, non-zero| MUSA-100077 R3 trap
     quantization gate  | test_w4a16_symmetric_*          | relative mean error < 0.04      | upstream test_marlin_gemm
     zero-point gate    | test_w4a16_asymmetric_*         | relative mean error < 0.04      | upstream test_marlin_gemm
     padding gate (R5)  | test_w4a16_padded_round_trip_*  | assert_close rtol/atol 2e-2     | upstream test_marlin_tile_padding
-    order + bias       | test_mate_weight_b_nibble_order_* | even k low / odd k high, 8-bias | MUSA probe 2026-10-13 (measured)
     contract boundary  | test_w4a16_contract_*           | ValueError / NotImplementedError| dense_w4a16_gemm.py validation
     poison inputs      | test_w4a16_poison_*             | no crash, documented value      | write-kernel-test-plan
 
@@ -85,13 +100,14 @@ Scope gaps a reader must know about before promising coverage:
       ``test_padding_cannot_grow_k_under_the_group_128_contract``; upstream only pads K for shapes the
       group does not divide, and its own test skips those). ``test_w4a16_padded_k_is_not_expressible_yet``
       is the honest encoding of the refusal, not a placeholder for coverage that exists.
-    * **The draft op requires ``K % 256 == 0``**, so a TP-sharded ``down`` projection at TP=2
+    * **The op requires ``K % 256 == 0``**, so a TP-sharded ``down`` projection at TP=2
       (K = 8960 / 2 = **4480**, and 4480 % 256 = 128) is **refused**. Upstream serves that shape by
       padding K to a tile-aligned extent; MATE cannot yet. Not blocking for Qwen2-1.5B-AWQ at TP=1
       (1536 and 8960 are both multiples of 256), but it is a real scope limit for sharded serving, and
       it is the reason the padding gate asserts a ``ValueError`` there.
-    * The byte-parity gates need the layout artifacts outside this tree; without them they skip with
-      the searched paths in the reason (see ``_artifact_dir``). Everything else still runs.
+    * the byte-parity gates need **no** external artifacts: the oracle and the shipping repack are
+      MATE's own ``mate.marlin.reference`` and ``mate.marlin.layout``, imported from the package by
+      ``_load_mate_marlin`` below, so those gates run everywhere numpy does.
 
 Not covered here (must not be over-read):
     * The Marlin ``[K // 16, 2 * N]`` int32 repacked layout. The draft op consumes MATE's native
@@ -108,17 +124,16 @@ Two portability notes: this module imports torch lazily so the numpy-only gates 
 torch (verified on the authoring host, which has numpy 1.26.0 and no torch), and the fp32 (not fp64)
 reference is forced by MUSA having no device float64; fp32 accumulation is the documented fallback.
 
-Installability: nothing here depends on the authoring workspace. The only external dependency is the
-layout-artifact directory for the byte-parity gates, resolved from ``$MUSA_W4A16_LAYOUT_REF`` (see
-``_artifact_dir``), and its absence skips those gates with the searched paths printed - it never fails
-the suite and never silently weakens a gate into a pass.
+Installability: nothing here depends on the authoring workspace. The oracle and the repack live in the
+package itself (``mate.marlin.reference`` / ``mate.marlin.layout``), so the parity gates need no
+artifact directory and no environment variable, and they run wherever numpy does. There is no skip
+path that could silently weaken a gate into a pass.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import math
-import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
@@ -243,63 +258,55 @@ def synthetic_weight(
 # =============================================================================================
 # Section A - numpy only. No torch, no MUSA device. These gates run anywhere.
 # =============================================================================================
-ARTIFACT_ENV = "MUSA_W4A16_LAYOUT_REF"
-_ARTIFACT_ENV_ALIASES = ("MATE_MARLIN_LAYOUT_ARTIFACTS",)
+def _load_mate_marlin():
+    """Import ``mate.marlin`` — the reference and the shipped repack are the package's own modules.
 
+    The oracle used to be vendored next to this test, which made a third copy of the index maps and
+    meant these gates guarded something other than the code that ships. They now import the package:
+    ``LAYOUT_REF`` is ``mate.marlin.reference`` and ``REPACK_MUSA`` is ``mate.marlin.layout``.
 
-def _artifact_dir() -> Optional[Path]:
-    """Locate the layout artifacts the parity gates compare against, or ``None``.
-
-    Resolution order:
-      1. ``$MUSA_W4A16_LAYOUT_REF`` (alias: ``$MATE_MARLIN_LAYOUT_ARTIFACTS``) - the supported way to
-         point this file at the artifacts, because they live outside MATE's tree by construction.
-      2. ``<this file's dir>/marlin_artifacts/`` - for a copy vendored into ``tests/``.
-      3. This file's grandparent - only so the port could be self-checked on the authoring host.
-
-    The parity gates need ``layout_ref.py`` (the scalar transcription of ``gptq_marlin_repack.cu`` +
-    ``marlin_utils.marlin_permute_scales``/``marlin_zero_points``) and ``repack_musa.py`` (the shipping
-    per-tile repack), because a byte-parity claim is only as good as the reference it is made against.
-    Re-transcribing a third copy of those helpers into this file was rejected: it would be a new
-    unverified oracle, and it would stop the gate from watching the artifact that was actually
-    verified against the CUDA source. So when the directory is missing, **only** the parity gates skip
-    (with the path and the env var in the reason); every shape, accuracy, R3, padding and contract gate
-    still runs. Vendoring the two files as ``tests/marlin_artifacts/`` is the follow-up that makes the
-    parity gates run in MATE CI.
+    ``import mate.marlin`` is preferred, but MATE's top-level ``mate/__init__.py`` imports torch while
+    both modules are numpy-only by design. On a host without torch the import would fail for a reason
+    that has nothing to do with this code, so the fallback registers a synthetic ``mate`` parent and
+    loads the package by path. Same modules, same gates, no torch needed.
     """
-    candidates = []
-    for name in (ARTIFACT_ENV, *_ARTIFACT_ENV_ALIASES):
-        value = os.environ.get(name)
-        if value:
-            candidates.append(Path(value))
-    candidates.append(Path(__file__).resolve().parent / "marlin_artifacts")
-    candidates.append(Path(__file__).resolve().parents[2])
-    for candidate in candidates:
-        if (candidate / "layout_ref.py").is_file() and (candidate / "repack_musa.py").is_file():
-            return candidate
-    return None
+    import sys
+    import types
 
+    try:
+        import mate.marlin as marlin_module
 
-def _load_module(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None, f"cannot load {path}"
+        return marlin_module
+    except Exception:
+        pass
+
+    root = Path(__file__).resolve().parents[1]
+    package = root / "mate" / "marlin"
+    if not (package / "__init__.py").is_file():
+        return None
+    if "mate" not in sys.modules:
+        parent = types.ModuleType("mate")
+        parent.__path__ = [str(root / "mate")]
+        sys.modules["mate"] = parent
+    spec = importlib.util.spec_from_file_location(
+        "mate.marlin", package / "__init__.py", submodule_search_locations=[str(package)]
+    )
+    assert spec is not None and spec.loader is not None, f"cannot load {package}"
     module = importlib.util.module_from_spec(spec)
+    sys.modules["mate.marlin"] = module
     spec.loader.exec_module(module)
     return module
 
 
-_ARTIFACTS = _artifact_dir()
-LAYOUT_REF = _load_module(_ARTIFACTS / "layout_ref.py", "mate_marlin_layout_ref") if _ARTIFACTS else None
-REPACK_MUSA = _load_module(_ARTIFACTS / "repack_musa.py", "mate_marlin_repack_musa") if _ARTIFACTS else None
+_MATE_MARLIN = _load_mate_marlin()
+_ARTIFACTS = _MATE_MARLIN is not None  # kept as the "reference available" sentinel
+LAYOUT_REF = _MATE_MARLIN.reference if _ARTIFACTS else None
+REPACK_MUSA = _MATE_MARLIN.layout if _ARTIFACTS else None
 
-_ARTIFACT_HINT = (
-    f"byte-parity gate skipped: no layout artifacts. Set ${ARTIFACT_ENV}=<dir> containing "
-    "layout_ref.py and repack_musa.py (or vendor them as tests/marlin_artifacts/). Searched: "
-    + ", ".join(
-        [f"${name}" for name in (ARTIFACT_ENV, *_ARTIFACT_ENV_ALIASES)]
-        + ["<test dir>/marlin_artifacts", str(Path(__file__).resolve().parents[2])]
-    )
+needs_artifacts = pytest.mark.skipif(
+    not _ARTIFACTS,
+    reason="mate.marlin is not importable (the numpy-only reference lives in that package)",
 )
-needs_artifacts = pytest.mark.skipif(_ARTIFACTS is None, reason=_ARTIFACT_HINT)
 
 
 def pack_mate_weight_b(stored_kN: np.ndarray) -> np.ndarray:
@@ -1136,11 +1143,11 @@ def _self_check_without_torch() -> int:
     if not np.array_equal(unpack_mate_weight_b(packed, 512), codes):
         failures.append("mate_weight_b round trip")
     if _ARTIFACTS is None:
-        # Not a failure: the parity gates are the only thing that needs the artifacts, and a clean
-        # skip is the contract. Say which gate did not run and where it looked.
-        print(f"SKIPPED (not failed): {_ARTIFACT_HINT}")
+        # The oracle is in-tree, so this cannot normally happen: report it as a failure rather than a
+        # clean skip, because a missing reference means the parity gates silently did not run.
+        failures.append("mate.marlin is not importable (byte-parity gates did not run)")
     else:
-        print(f"artifacts: {_ARTIFACTS}")
+        print(f"reference: {Path(_MATE_MARLIN.reference.__file__).resolve()}")
         qweight = gptq_layout_pack(codes)
         reference = np.asarray(LAYOUT_REF.cuda_repack_gptq(qweight, 512, 128), dtype=np.int64)
         shipped = np.asarray(REPACK_MUSA.repack_gptq(qweight, 512, 128), dtype=np.int64)
@@ -1184,3 +1191,253 @@ def _self_check_without_torch() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_self_check_without_torch())
+
+
+# =============================================================================================
+# Section E - the Marlin wrapper's own gates (mate.marlin): upstream frame in, MATE frame out.
+# =============================================================================================
+WRAPPER_SHAPES = [(256, 64), (384, 256), (512, 128), (1024, 320)]
+
+
+@pytest.mark.parametrize("size_k,size_n", WRAPPER_SHAPES)
+def test_wrapper_shuffle_agrees_with_this_files_mate_packer(size_k, size_n):
+    """``marlin_weight_to_musa`` against the independent MATE-frame packer defined in this file.
+
+    One is written from upstream's repacked words, the other from the kernel's documented ``(N, K//2)``
+    contract. Byte-for-byte agreement between two implementations written from different frames is the
+    point: a bug would have to be the same bug in both.
+    """
+    codes = np.random.default_rng(size_k + size_n).integers(0, 16, (size_k, size_n)).astype(np.int64)
+    repacked = REPACK_MUSA.repack_gptq(REPACK_MUSA.pack_rows(codes), size_k, size_n)
+    mine = np.asarray(_MATE_MARLIN.marlin_weight_to_musa(repacked, size_k, size_n))
+    assert mine.shape == (size_n, size_k // 2)
+
+    # The wrapper presents the declared operand frame, which flips the sign bit of every nibble, so it
+    # must differ from the verbatim MATE-frame packer by exactly 0x8 in both nibbles -- no more, no less.
+    verbatim = pack_mate_weight_b(codes).view(np.uint8)
+    assert np.array_equal(mine.view(np.uint8), verbatim ^ 0x88)
+    assert np.array_equal(unpack_mate_weight_b(mine, size_k) ^ 0x8, codes)
+    assert not np.array_equal(mine.view(np.uint8), verbatim), "no XOR would be a silent +8*scale"
+
+
+@pytest.mark.parametrize("size_k,size_n", WRAPPER_SHAPES)
+def test_wrapper_perm_frames_and_global_parity(size_k, size_n):
+    """Both of upstream's ``perm`` frames, and the global lookup the CUDA kernel really performs.
+
+    The test frame is ``get_weight_perm(4)``'s 16 entries; the op frame is one entry per k. They
+    coincide exactly when ``K == 16``, which is how a tile-offset bug hides: the oracle here carried
+    ``k_tile * TILE_K`` on top of a value that is already a global k, and every checker that used
+    ``K == 16`` agreed with it. A non-trivial global shuffle is what makes this gate bite.
+    """
+    rng = np.random.default_rng(size_k)
+    words = REPACK_MUSA.pack_rows(rng.integers(0, 16, (size_k, size_n)).astype(np.int64))
+    local = rng.permutation(16)
+    global_perm = np.concatenate([local + t * 16 for t in range(size_k // 16)])
+
+    assert np.array_equal(
+        REPACK_MUSA.repack_gptq(words, size_k, size_n, local),
+        REPACK_MUSA.repack_gptq(words, size_k, size_n, global_perm),
+    ), "the 16-entry test frame must equal the per-tile repetition of the global perm"
+
+    for perm in (global_perm, rng.permutation(size_k)):
+        assert np.array_equal(
+            REPACK_MUSA.repack_gptq(words, size_k, size_n, perm),
+            LAYOUT_REF.cuda_repack_gptq(words, size_k, size_n, perm),
+        ), "shipped repack and the CUDA transcription must agree under a global k permutation"
+
+    with pytest.raises(ValueError):
+        REPACK_MUSA.repack_gptq(words, size_k, size_n, np.arange(8))
+
+
+def test_wrapper_padding_agrees_with_the_reference():
+    """``compat.marlin_padded_nk`` vs ``reference.marlin_padded_nk``: two transcriptions, one table."""
+    grid = [(64, 128), (200, 288), (256, 256), (1536, 1536), (4608, 4096), (4672, 512), (8960, 1536)]
+    for size_n, size_k in grid:
+        for group in (128, -1):
+            assert tuple(_MATE_MARLIN.marlin_padded_nk(size_n, size_k, group)) == tuple(
+                LAYOUT_REF.marlin_padded_nk(size_n, size_k, group)
+            ), f"marlin_padded_nk({size_n}, {size_k}, {group}) diverged"
+
+
+def test_wrapper_shape_gate_accepts_the_checkpoint_and_refuses_tp2_down():
+    """The four checkpoint shapes are servable; rank-local K=4480 (TP=2 ``down``) is refused, with why."""
+    for size_k, size_n in [(1536, 2048), (1536, 1536), (1536, 17920), (8960, 1536)]:
+        ok, reason = _MATE_MARLIN.check_musa_marlin_supports_shape(size_k, size_n, 128)
+        assert ok, f"K={size_k} N={size_n} should be servable, got: {reason}"
+    ok, reason = _MATE_MARLIN.check_musa_marlin_supports_shape(4480, 1536, 128)
+    assert not ok and "multiple of 256" in reason and "4480" in reason
+    ok, reason = _MATE_MARLIN.check_musa_marlin_supports_shape(1536, 1536, 64)
+    assert not ok and "group size" in reason
+
+
+@pytest.mark.parametrize("group_size", [128, -1])
+def test_wrapper_scale_inverse_is_the_inverse(group_size):
+    """``marlin_unpermute_scales`` o ``marlin_permute_scales`` is the identity in *both* branches.
+
+    A wrong inverse is still shape-correct, so only a round trip catches it. Both branches are gated
+    because upstream picks between two different permutations.
+    """
+    size_k, size_n = 1024, 256
+    rows = 1 if group_size == -1 else size_k // group_size
+    plain = np.random.default_rng(group_size + 7).standard_normal((rows, size_n)).astype(np.float32)
+    permuted = LAYOUT_REF.marlin_permute_scales(plain, size_k, size_n, group_size)
+    back = LAYOUT_REF.marlin_unpermute_scales(permuted, size_k, size_n, group_size)
+    assert back.shape == plain.shape
+    assert np.array_equal(back, plain), "the host-direction inverse must recover the plain frame"
+
+
+def test_wrapper_zero_point_inverse_is_the_inverse():
+    """``unpack_marlin_zero_points`` o ``marlin_zero_points`` is the identity and the frame is (G, N)."""
+    size_k, size_n = 1024, 512
+    group = GROUP_SIZE
+    zp = np.random.default_rng(11).integers(0, 16, (size_k // group, size_n)).astype(np.int64)
+    packed = LAYOUT_REF.marlin_zero_points(zp, size_k, size_n, 4)
+    assert packed.shape == (size_k // group, size_n // 8), "zero points pack along N"
+    assert np.array_equal(LAYOUT_REF.unpack_marlin_zero_points(packed, size_k, size_n, 4), zp)
+
+
+def _torch_or_none():
+    try:
+        import torch  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+needs_torch = pytest.mark.skipif(not _torch_or_none(), reason="torch is not installed")
+
+
+@needs_torch
+def test_wrapper_torch_conversions_match_the_reference():
+    """The torch-side frame conversions against the numpy oracle, including the (N, G) orientation."""
+    import torch
+
+    m = _MATE_MARLIN
+    size_k, size_n, group = 512, 256, 128
+    rng = np.random.default_rng(3)
+
+    scales = torch.from_numpy(rng.standard_normal((size_k // group, size_n)).astype(np.float32))
+    permuted = m.quant.marlin_permute_scales(scales, size_k, size_n, group)
+    assert np.array_equal(
+        permuted.numpy(), LAYOUT_REF.marlin_permute_scales(scales.numpy(), size_k, size_n, group)
+    )
+    plain = m.marlin_scales_to_musa(permuted, size_k, size_n, group)
+    assert plain.shape == (size_n, size_k // group) and plain.dtype == torch.float16
+    assert np.allclose(plain.numpy().T, scales.numpy(), atol=1e-3), "transpose + fp16 cast"
+
+    zp = torch.from_numpy(rng.integers(0, 16, (size_k // group, size_n)).astype(np.int32))
+    packed = m.quant.marlin_zero_points(zp, size_k, size_n, 4)
+    assert np.array_equal(
+        m.quant.unpack_marlin_zero_points(packed, size_k, size_n).numpy(), zp.numpy()
+    )
+    zp_b = m.marlin_zero_points_to_musa(packed, size_k, size_n, group)
+    assert zp_b.shape == (size_n, size_k // group) and zp_b.dtype == torch.float16
+
+
+@needs_torch
+def test_wrapper_prepare_frame_is_kernel_ready():
+    """``prepare_marlin_w4a16`` hands back the exact shapes and dtypes the kernel's FFI documents."""
+    import torch
+
+    m = _MATE_MARLIN
+    size_k, size_n, group = 512, 256, 128
+    padded_n, padded_k = m.marlin_padded_nk(size_n, size_k, group)
+    codes = np.random.default_rng(13).integers(0, 16, (padded_k, padded_n)).astype(np.int64)
+
+    qweight = torch.from_numpy(
+        LAYOUT_REF.cuda_repack_gptq(
+            (REPACK_MUSA.pack_rows(codes) if padded_n == size_n else
+             pack_mate_weight_b(codes).T.astype(np.int32) * 0 + REPACK_MUSA.pack_rows(codes)),
+            padded_k, padded_n,
+        ).astype(np.int32)
+    )
+    scales = torch.from_numpy(
+        LAYOUT_REF.marlin_permute_scales(
+            np.random.default_rng(17).standard_normal((padded_k // group, padded_n)).astype(np.float32),
+            padded_k, padded_n, group,
+        )
+    )
+    zp = torch.from_numpy(
+        LAYOUT_REF.marlin_zero_points(
+            np.random.default_rng(19).integers(0, 16, (padded_k // group, padded_n)).astype(np.int64),
+            padded_k, padded_n, 4,
+        ).astype(np.int32)
+    )
+
+    frame = m.prepare_marlin_w4a16(qweight, scales, zp, size_k, size_n, group_size=group)
+    assert frame.weight_b.shape == (padded_n, padded_k // 2) and frame.weight_b.dtype == torch.int8
+    assert frame.scale_b.shape == (padded_n, padded_k // group) and frame.scale_b.dtype == torch.float16
+    assert frame.zero_points_b.shape == (padded_n, padded_k // group)
+    assert frame.has_zero_points and frame.logical_n == size_n and frame.padded_k == padded_k
+
+    # the weight conversion must also match this file's independent MATE-frame packer, up to the
+    # sign-bit presentation the declared operand frame requires
+    assert np.array_equal(
+        frame.weight_b.numpy().view(np.uint8), pack_mate_weight_b(codes).view(np.uint8) ^ 0x88
+    )
+    # symmetric path: no zero-point tensor, and the kernel's sym instantiation ignores it
+    symmetric = m.prepare_marlin_w4a16(qweight, scales, None, size_k, size_n, group_size=group)
+    assert symmetric.zero_points_b is None and not symmetric.has_zero_points
+
+    # refusals: the TP=2 down casualty, and an unmaterialised act order
+    with pytest.raises(ValueError, match="multiple of 256"):
+        m.prepare_marlin_w4a16(
+            torch.zeros((4480 // 16, 2 * 1536), dtype=torch.int32),
+            torch.zeros((4480 // group, 1536), dtype=torch.float32),
+            None, 4480, 1536, group_size=group,
+        )
+    with pytest.raises(ValueError, match="act order"):
+        m.prepare_marlin_w4a16(
+            qweight, scales, None, size_k, size_n, group_size=group,
+            g_idx=torch.arange(padded_k - 1, -1, -1, dtype=torch.int32),
+        )
+
+
+def test_wrapper_sign_bit_presentation_is_the_declared_frame():
+    """The authority for ``^ 0x8``, made executable, plus the half-range error verbatim would cause.
+
+    MATE's packed-weight contract says a nibble "already holds the signed INT4 value
+    ``unsigned_nibble - nibble_bias``" (mate/jit/gemm/dense_w4a16_gemm.py:46-49) and its public
+    dequant is ``w = scale * (q + nibble_bias - zero_point)`` (mate/gemm.py:1503-1507), while the
+    atom reads two's complement -- so the presented nibble must satisfy ``s(v) = u - 8`` for *every*
+    ``u``, and ``v = u ^ 0x8`` is the unique such presentation. ``s(u ^ 0x8) = u - 8`` is an identity,
+    which is exactly why verbatim is only accidentally right at one code and wrong everywhere below 8.
+    """
+    def two_complement(code):
+        """The atom's measured read: plain two's complement, no `-8` bias of its own."""
+        code = np.asarray(code, dtype=np.int64)
+        return np.where(code >= 8, code - 16, code)
+
+    for u in range(16):
+        assert two_complement(u ^ 0x8) == u - 8, f"the identity must hold at u={u}"
+
+    low_half = np.arange(8)
+    assert not np.all(two_complement(low_half) == low_half - 8), "verbatim must fail below u=8"
+    assert two_complement(8) == -8, "the case that made -8 look like 'u - 8'"
+    assert two_complement(0) == 0, "the case that falsifies it"
+
+
+def test_wrapper_zero_points_are_raw_and_a_double_fold_is_visible():
+    """The zero-point stream is raw, and a symmetric checkpoint's zero point is ``nibble_bias``.
+
+    MATE's op applies the ``(nibble_bias - zero_point)`` term itself (mate/gemm.py:1512-1515), so a
+    stream already folded by ``fold_zero_points`` would be folded twice. The detector here is sharp
+    because a symmetric checkpoint must carry 8, and ``8 - 8`` is exactly the zero correction: a
+    double fold shows up as a zero-point tensor where 8s belong, and every asymmetric weight moves by
+    ``8 * scale`` per element.
+    """
+    size_k, size_n = 512, 256
+    group = GROUP_SIZE
+    nibble_bias = NIBBLE_BIAS
+
+    symmetric = np.full((size_k // group, size_n), nibble_bias, dtype=np.int64)
+    packed = LAYOUT_REF.marlin_zero_points(symmetric, size_k, size_n, 4)
+    back = LAYOUT_REF.unpack_marlin_zero_points(packed, size_k, size_n, 4)
+    assert np.array_equal(back, symmetric), "raw values must survive packing unchanged"
+    assert np.all(back == nibble_bias), "a symmetric checkpoint's zero point is the nibble bias"
+
+    # what a double fold would look like: the already-folded factor is what must NOT be stored
+    folded = (nibble_bias - symmetric) * np.ones_like(symmetric, dtype=np.float32)
+    assert np.all(folded == 0.0), "the symmetric correction is exactly zero, not 8"
+    assert not np.array_equal(back.astype(np.float32), folded), "stored zeros means a double fold"

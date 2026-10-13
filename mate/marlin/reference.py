@@ -4,9 +4,10 @@
 Target: upstream vLLM pin ``2cf0a6915ce544dc493a0990f2ea38d81601128a`` (v0.28.0-dev),
 Marlin sources under ``csrc/libtorch_stable/quantization/marlin/``.
 
-Why numpy only: ``check_layout.py`` must run where vLLM's extension and torch are absent
-(this box has numpy 1.26 but no torch). Every routine below is a transcription of a
-specific upstream function; the docstring of each carries its ``file:line``.
+Why numpy only: the gates that guard the shipping implementation live in
+``tests/test_w4a16_marlin.py`` and must run wherever numpy exists, including a host with no torch.
+Nothing at runtime imports this module; it is evidence, and every routine below is a transcription
+of a specific upstream function whose docstring carries its ``file:line``.
 
 Two independent implementations live here on purpose:
 
@@ -15,8 +16,8 @@ Two independent implementations live here on purpose:
 * ``cuda_repack_*`` -- transcription of the *CUDA* repack kernel index maps
   (``csrc/libtorch_stable/quantization/marlin/{gptq,awq}_marlin_repack.cu``).
 
-They were written from the two different sources, so agreement between them
-(``check_layout.py``) is real evidence, not a tautology.
+They were written from the two different sources, so agreement between them (asserted by
+``tests/test_w4a16_marlin.py``) is real evidence, not a tautology.
 """
 
 from __future__ import annotations
@@ -207,26 +208,39 @@ def cuda_tile_placement(size_k: int, size_n: int, num_bits: int = 4):
                         )
 
 
+def _global_perm(perm: np.ndarray, size_k: int) -> np.ndarray:
+    """Expand either upstream perm frame to the global one; see ``layout.resolve_perm``."""
+    perm = np.asarray(perm, dtype=np.int64).reshape(-1)
+    if perm.shape[0] == size_k:
+        return perm
+    if perm.shape[0] == TILE_K:
+        return np.concatenate([perm + t * TILE_K for t in range(size_k // TILE_K)])
+    raise ValueError(f"perm has {perm.shape[0]} entries; expected {size_k} or {TILE_K}")
+
+
 def cuda_repack_gptq(
     b_q_weight: np.ndarray, size_k: int, size_n: int, perm: np.ndarray | None = None
 ) -> np.ndarray:
     """Transcription of ``gptq_marlin_repack_kernel`` (4-bit, non-a8bit).
 
     ``b_q_weight`` is the GPTQ-layout packed weight ``[size_k/8, size_n]``.
-    ``perm`` is the act-order / ``g_idx`` sort order: when given (``has_perm``), output
-    k-slot ``i`` of a k-tile takes source k ``perm[k_tile*16 + i]``
-    (``gptq_marlin_repack.cu:61-70, 90-97, 146-162``). The *layout* permutation is not an
-    argument here -- it is intrinsic to the kernel indexing.
+    ``perm`` is the act-order / ``g_idx`` sort order, in either of upstream's two frames (see
+    ``layout.resolve_perm``): the op frame is ``argsort(g_idx)`` with one entry per k, the test frame
+    is ``get_weight_perm(4)``'s 16 entries. Its value is used *directly* as a global k, because that
+    is what the kernel does -- ``src_k`` goes straight into ``b_q_weight_ptr``
+    (``gptq_marlin_repack.cu:90-97, 146-151``) with no tile offset added. The earlier transcription
+    here added ``k_tile * TILE_K`` on top, which is indistinguishable from the correct result at
+    K == 16 and wrong for every larger K; the two-frame resolver is what keeps that honest.
     """
     w = unpack_rows(b_q_weight, size_k, size_n)
     out = np.zeros((size_k // TILE_K, 2 * size_n), dtype=np.int64)
+    perm_global = None if perm is None else _global_perm(perm, size_k)
     for k_tile, n_tile, word, nib, k_local, n_local, _, _ in cuda_tile_placement(
         size_k, size_n
     ):
-        src_k = k_local
-        if perm is not None:
-            src_k = int(perm[k_tile * TILE_K + k_local])
-        val = w[k_tile * TILE_K + src_k, n_tile * TILE_N + n_local]
+        k_dst = k_tile * TILE_K + k_local
+        src_k = k_dst if perm_global is None else int(perm_global[k_dst])
+        val = w[src_k, n_tile * TILE_N + n_local]
         out[k_tile, n_tile * TILE_WORDS_4BIT + word] |= int(val) << (4 * nib)
     return out
 
@@ -341,6 +355,25 @@ def marlin_permute_scales(
     else:
         s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
     return s.reshape((-1, size_n))
+
+
+def marlin_unpermute_scales(
+    s: np.ndarray, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
+) -> np.ndarray:
+    """Inverse of :func:`marlin_permute_scales` -- the direction the *host* path needs.
+
+    Upstream does not have this function because its kernel consumes the permuted frame directly.
+    MATE's kernel takes plain ``(N, G)`` row-major scales, so the conversion is explicit. Both
+    branches must invert the matching branch above: getting this backwards is silent, because a
+    wrong inverse is still shape-correct.
+    """
+    scale_perm, scale_perm_single = get_scale_perms()
+    if group_size < size_k and group_size != -1 and not is_a_8bit:
+        width, perm = len(scale_perm), scale_perm
+    else:
+        width, perm = len(scale_perm_single), scale_perm_single
+    rows = s.reshape((-1, width))[:, np.argsort(np.array(perm))]
+    return rows.reshape((-1, size_n))
 
 
 def marlin_zero_points(
