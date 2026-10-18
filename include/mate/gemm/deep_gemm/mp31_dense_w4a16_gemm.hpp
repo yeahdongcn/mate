@@ -38,6 +38,18 @@ struct GidxKPermuteHook {
   }
 };
 
+// What a split launch needs on the device. It is a *base* of `Params` only in the split
+// instantiation: measured on the whole-K path, 24 unused bytes of kernel argument cost 0.1% on the
+// K=8960 shapes and 0.6-1.0% on the K=1536 ones, which is most of the regression this switch removes.
+struct Mp31SplitParamsFields {
+  float*  ptr_partial;
+  int64_t partial_split_stride;
+  int     k_split;
+};
+
+// Empty, and an empty base occupies no space, so the whole-K `Params` is the original struct.
+struct Mp31NoSplitParamsFields {};
+
 // fp16 activations, signed INT4 weights, one fp16 scale per K128 weight group. Zero points are
 // optional: without them the kernel is the symmetric fast path, which computes no correction.
 template <class ElementA_,
@@ -49,6 +61,7 @@ template <class ElementA_,
           class TileShape_,
           uint32_t Stages_,
           bool     ZeroPoints_,
+          bool     kSplit_    = false,
           class GidxPermute_ = GidxKPermuteHook>
 struct Mp31DenseW4A16Gemm {
   using ElementA      = ElementA_;
@@ -62,6 +75,12 @@ struct Mp31DenseW4A16Gemm {
   using GidxPermute   = GidxPermute_;
 
   static constexpr bool IsZeroPoints = ZeroPoints_;
+
+  // Compile-time K-split switch. `false` is the whole-K launch this kernel always was: no K range
+  // indirection, no split branch, no second store path, and the persistent scheduler walk verbatim.
+  // A split launch costs a couple of percent on the whole-K path when the two share one instantiation
+  // (measured through a captured graph at cc=8: 933 vs 960 tok/s), so the two do not share one.
+  static constexpr bool KSplit = kSplit_;
 
   // Act order is a property of the packed operand, not of this kernel's indexing: the K extent of a
   // tile is copied contiguously, so a permutation has to be materialized before launch.
@@ -262,13 +281,23 @@ struct Mp31DenseW4A16Gemm {
     StrideZeroB  stride_zero_b;
     StrideD      stride_d;
 
+    // K-split output. When `k_split > 1` each split writes its own fp32 partial accumulator here and
+    // `ptr_d` is left untouched, so the reduction across splits stays outside the kernel and needs no
+    // atomics. The buffer is `[k_split, m_pad, n]` fp32, n-contiguous, so a split's plane starts
+    // `partial_split_stride` elements after the previous one. Both are unused when `k_split == 1`.
+    float*  ptr_partial          = nullptr;
+    int64_t partial_split_stride = 0;
+    int     k_split              = 1;
+
     int m       = 0;
     int n       = 0;
     int k       = 0;
     int num_mps = 0;
   };
 
-  struct Params {
+  // The split payload rides in the base, which is empty for the whole-K instantiation: every field
+  // below keeps its offset and the argument block is the one this kernel always took.
+  struct Params : std::conditional_t<KSplit, Mp31SplitParamsFields, Mp31NoSplitParamsFields> {
     TME_A      tme_a;
     TME_B      tme_b;
     TME_ScaleB tme_scale_b;
@@ -288,6 +317,7 @@ struct Mp31DenseW4A16Gemm {
   static Params to_underlying_arguments(Arguments const& args) {
     const int k_blocks       = ceil_div(args.k, BlockK);
     const int scale_k_blocks = k_blocks * ScaleBlocksPerTile;
+    const int k_split        = args.k_split > 0 ? args.k_split : 1;
 
     auto  gA    = make_tensor(make_gmem_ptr(args.ptr_a), make_shape(args.m, args.k, 1), args.stride_a);
     TME_A tme_a = make_tme_copy<TmeAInnerHint, TmeAOuterHint>(MP31_TME_LOAD{}, gA, take<0, 2>(SmemLayoutA{}));
@@ -307,25 +337,82 @@ struct Mp31DenseW4A16Gemm {
     TME_ZeroB tme_zero_b    = make_tme_copy<TmeScaleBInnerHint, TmeScaleBOuterHint>(
         MP31_TME_LOAD{}, gZeroB, take<0, 2>(SmemLayoutZeroB{}), make_shape(Int<BlockN>{}, Int<TmeScaleKBlocks>{}));
 
-    return Params{
-        tme_a,
-        tme_b,
-        tme_scale_b,
-        tme_zero_b,
-        args.ptr_d,
-        args.stride_d,
-        args.m,
-        args.n,
-        args.k,
-        args.num_mps,
-        k_blocks,
-        scale_k_blocks,
-    };
+    // The base initialises first, and there are two of them, so the list is spelled once per
+    // instantiation. Everything after the base is identical.
+    if constexpr (KSplit) {
+      return Params{
+          Mp31SplitParamsFields{k_split > 1 ? args.ptr_partial : nullptr, args.partial_split_stride, k_split},
+          tme_a,
+          tme_b,
+          tme_scale_b,
+          tme_zero_b,
+          args.ptr_d,
+          args.stride_d,
+          args.m,
+          args.n,
+          args.k,
+          args.num_mps,
+          k_blocks,
+          scale_k_blocks,
+      };
+    } else {
+      return Params{
+          Mp31NoSplitParamsFields{},
+          tme_a,
+          tme_b,
+          tme_scale_b,
+          tme_zero_b,
+          args.ptr_d,
+          args.stride_d,
+          args.m,
+          args.n,
+          args.k,
+          args.num_mps,
+          k_blocks,
+          scale_k_blocks,
+      };
+    }
   }
 
   static dim3 get_grid_shape_persistent(Params const& params) {
     const int num_mps = params.num_mps > 0 ? params.num_mps : 1;
+    // A split launch has `tiles * k_split` units of work, each of which streams a fixed K range,
+    // so the grid is the number of units when the machine is wider than the problem. That is the
+    // whole point: without the split, N=1536 at M=8 leaves 24 of the 60 MPs with nothing to do.
+    if constexpr (KSplit) {
+      const int tiles     = ceil_div(params.m, BlockM) * ceil_div(params.n, BlockN);
+      const int num_units = tiles * params.k_split;
+      return dim3(static_cast<uint32_t>(num_units < num_mps ? num_units : num_mps), 1u, 1u);
+    }
     return dim3(static_cast<uint32_t>(num_mps), 1u, 1u);
+  }
+
+  // The slice of the K axis one split owns. Every split takes `chunk` K blocks of the shared axis, so
+  // the last one may be short (and empty if `k_split` exceeds the block count). The load, cast and
+  // compute pipelines all walk exactly this range, which is what keeps them in lockstep; the scale and
+  // zero-point indexing inside the loop stays absolute, so each partial is a valid partial sum.
+  struct KRange {
+    int begin;
+    int end;
+  };
+
+  MUTLASS_DEVICE static KRange k_range_for(Params const& params, int split_id) {
+    const int k_split = params.k_split > 0 ? params.k_split : 1;
+    const int chunk   = ceil_div(params.k_blocks, k_split);
+    const int begin   = split_id * chunk;
+    const int end     = begin + chunk < params.k_blocks ? begin + chunk : params.k_blocks;
+    return KRange{begin, end};
+  }
+
+  // A split launch numbers its work units itself, because the tile scheduler has no split axis. The
+  // tile index covers the output tiles in the same row-major (m block, n block) order the scheduler's
+  // flat block index uses, and the record is the one the scheduler builds for a Normal-type problem.
+  MUTLASS_DEVICE static WorkTileInfo unit_work_tile(Params const& params, int tile_idx) {
+    const int      num_m_blocks = ceil_div(params.m, BlockM);
+    const int      m_block_idx  = tile_idx % num_m_blocks;
+    const int      n_block_idx  = tile_idx / num_m_blocks;
+    const uint32_t m_row_offset = uint32_t(m_block_idx * BlockM);
+    return WorkTileInfo{int32_t(m_block_idx), int32_t(n_block_idx), 0, m_row_offset, true, true};
   }
 
   MUTLASS_DEVICE
@@ -336,7 +423,8 @@ struct Mp31DenseW4A16Gemm {
                    PipelineLoadAState& pipe_a_write,
                    PipelineLoadBState& pipe_b_write,
                    WorkTileInfo const& work_tile,
-                   int                 warp_idx_in_squad) {
+                   int                 warp_idx_in_squad,
+                   int                 split_id) {
     const bool is_tme_issue_warp = warp_idx_in_squad == 0;
 
     Tensor sA      = make_tensor(make_smem_ptr(shared_storage.smem_a.begin()), SmemLayoutA{});
@@ -370,8 +458,17 @@ struct Mp31DenseW4A16Gemm {
 
     auto mZeroB = params.tme_zero_b.get_tme_tensor(make_shape(params.n, params.scale_k_blocks, 1))(_, _, _0{});
 
+    // The whole-K instantiation folds these back into the `0 .. params.k_blocks` loop it has always
+    // run; the split instantiation walks the slice its split owns.
+    int k_begin = 0;
+    int k_end   = params.k_blocks;
+    if constexpr (KSplit) {
+      const KRange slice = k_range_for(params, split_id);
+      k_begin            = slice.begin;
+      k_end              = slice.end;
+    }
     MUTLASS_PRAGMA_NO_UNROLL
-    for (int k_block = 0; k_block < params.k_blocks; ++k_block) {
+    for (int k_block = k_begin; k_block < k_end; ++k_block) {
       if (is_tme_issue_warp) {
         pipeline_load_a.producer_acquire(pipe_a_write);
         const uint32_t barrier_id_a = pipeline_load_a.producer_get_barrier_id(pipe_a_write);
@@ -413,7 +510,8 @@ struct Mp31DenseW4A16Gemm {
                         PipelineCastA&      pipeline_cast_a,
                         PipelineLoadAState& pipe_a_read,
                         PipelineCastAState& pipe_cast_a_write,
-                        int                 caster_thread_idx) {
+                        int                 caster_thread_idx,
+                        int                 split_id) {
     Tensor sA    = make_tensor(make_smem_ptr(shared_storage.smem_a.begin()), SmemLayoutA{});
     Tensor sMmaA = make_tensor(make_smem_ptr(shared_storage.smem_mma_a.begin()), SmemLayoutMmaA{});
 
@@ -453,8 +551,17 @@ struct Mp31DenseW4A16Gemm {
     Tensor rMmaAArray          = recast<StoreVector>(tCrMmaAStore);
     MUTE_STATIC_ASSERT_V(size(rMmaAArray) == Int<VectorsPerThread>{});
 
+    // The whole-K instantiation folds these back into the `0 .. params.k_blocks` loop it has always
+    // run; the split instantiation walks the slice its split owns.
+    int k_begin = 0;
+    int k_end   = params.k_blocks;
+    if constexpr (KSplit) {
+      const KRange slice = k_range_for(params, split_id);
+      k_begin            = slice.begin;
+      k_end              = slice.end;
+    }
     MUTLASS_PRAGMA_NO_UNROLL
-    for (int k_block = 0; k_block < params.k_blocks; ++k_block) {
+    for (int k_block = k_begin; k_block < k_end; ++k_block) {
       pipeline_load_a.consumer_wait(pipe_a_read);
 
       Tensor sAVec = recast<StoreVector>(sA(_, _, int(pipe_a_read.index())));
@@ -504,15 +611,21 @@ struct Mp31DenseW4A16Gemm {
     }
   }
 
-  template <class AccumTensor>
-  MUTLASS_DEVICE static void epilogue(Params const&       params,
-                                      AccumTensor const&  rAcc,
-                                      WorkTileInfo const& work_tile,
-                                      int                 consumer_thread_idx) {
+  // The one store shape every path shares: rAcc into `dst` (fp16/bf16 for a whole-K launch, fp32 for a
+  // split partial) with the same M/N indexing, bounds test and tail masking. `dst` and its stride are
+  // the only things that differ between the two, so a split partial is stored by exactly the code the
+  // final output is stored by.
+  template <class AccumTensor, class ElementStore, class StrideStore>
+  MUTLASS_DEVICE static void store_tile(ElementStore*       dst,
+                                        StrideStore const&  stride_dst,
+                                        Params const&       params,
+                                        AccumTensor const&  rAcc,
+                                        WorkTileInfo const& work_tile,
+                                        int                 consumer_thread_idx) {
     TiledMma tiled_mma;
     auto     thr_mma = tiled_mma.get_thread_slice(consumer_thread_idx);
 
-    auto mD  = make_tensor(make_gmem_ptr(params.ptr_d), make_shape(params.m, params.n, 1), params.stride_d);
+    auto mD  = make_tensor(make_gmem_ptr(dst), make_shape(params.m, params.n, 1), stride_dst);
     auto gD_ = local_tile(mD, make_shape(Int<BlockM>{}, Int<BlockN>{}, _1{}), make_coord(_, _, _));
     auto gD  = gD_(_, _, _0{}, int(work_tile.M_idx), int(work_tile.N_idx), _0{});
 
@@ -524,7 +637,7 @@ struct Mp31DenseW4A16Gemm {
     if (m0 + uint32_t(BlockM) <= uint32_t(params.m) && n0 + uint32_t(BlockN) <= uint32_t(params.n)) {
       MUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(rAcc); ++i) {
-        tCgD(i) = ElementD(rAcc(i));
+        tCgD(i) = ElementStore(rAcc(i));
       }
     } else {
       auto cD   = make_identity_tensor(make_shape(Int<BlockM>{}, Int<BlockN>{}));
@@ -536,9 +649,31 @@ struct Mp31DenseW4A16Gemm {
         const uint32_t coord_m = m0 + uint32_t(get<0>(coord));
         const uint32_t coord_n = n0 + uint32_t(get<1>(coord));
         if (coord_m < uint32_t(params.m) && coord_n < uint32_t(params.n)) {
-          tCgD(i) = ElementD(rAcc(i));
+          tCgD(i) = ElementStore(rAcc(i));
         }
       }
+    }
+  }
+
+  template <class AccumTensor>
+  MUTLASS_DEVICE static void epilogue(Params const&       params,
+                                      AccumTensor const&  rAcc,
+                                      WorkTileInfo const& work_tile,
+                                      int                 consumer_thread_idx,
+                                      int                 split_id) {
+    // A split launch accumulates fp32 partials only: the cross-split reduction happens after the
+    // kernel, so `ptr_d` is not touched at all. The whole-K instantiation compiles just the store it
+    // always had -- one path, not a branch between two copies of the tail logic.
+    if constexpr (KSplit) {
+      store_tile(params.ptr_partial + int64_t(split_id) * params.partial_split_stride,
+                 make_stride(params.n, _1{}, int64_t(0)),
+                 params,
+                 rAcc,
+                 work_tile,
+                 consumer_thread_idx);
+    } else {
+      (void)split_id;
+      store_tile(params.ptr_d, params.stride_d, params, rAcc, work_tile, consumer_thread_idx);
     }
   }
 
@@ -626,7 +761,8 @@ struct Mp31DenseW4A16Gemm {
                       PipelineLoadBState& pipe_b_read,
                       PipelineCastAState& pipe_cast_a_read,
                       WorkTileInfo const& work_tile,
-                      int                 consumer_thread_idx) {
+                      int                 consumer_thread_idx,
+                      int                 split_id) {
     TiledMma tiled_mma;
     auto     thr_mma = tiled_mma.get_thread_slice(consumer_thread_idx);
 
@@ -665,8 +801,17 @@ struct Mp31DenseW4A16Gemm {
     MUTE_STATIC_ASSERT_V(size(rAcc) == size(tCrScaleBPacked));
     MUTE_STATIC_ASSERT_V(size(rAcc) == size(tCrZeroBPacked));
 
+    // The whole-K instantiation folds these back into the `0 .. params.k_blocks` loop it has always
+    // run; the split instantiation walks the slice its split owns.
+    int k_begin = 0;
+    int k_end   = params.k_blocks;
+    if constexpr (KSplit) {
+      const KRange slice = k_range_for(params, split_id);
+      k_begin            = slice.begin;
+      k_end              = slice.end;
+    }
     MUTLASS_PRAGMA_NO_UNROLL
-    for (int k_block = 0; k_block < params.k_blocks; ++k_block) {
+    for (int k_block = k_begin; k_block < k_end; ++k_block) {
       pipeline_cast_a.consumer_wait(pipe_cast_a_read);
       pipeline_load_b.consumer_wait(pipe_b_read);
 
@@ -783,9 +928,39 @@ struct Mp31DenseW4A16Gemm {
 
     __syncthreads();
 
-    auto work_tile = scheduler.initial_work_tile_info();
+    // Split-launch state. Both loads are compile-time-absent from the whole-K instantiation, so that
+    // instantiation is the kernel it was before the split existed.
+    int k_split   = 1;
+    int num_units = 0;
+    if constexpr (KSplit) {
+      k_split   = params.k_split > 0 ? params.k_split : 1;
+      num_units = ceil_div(params.m, BlockM) * ceil_div(params.n, BlockN) * k_split;
+    }
+
+    WorkTileInfo work_tile = WorkTileInfo::invalid_work_tile();
+    if constexpr (!KSplit) {
+      work_tile = scheduler.initial_work_tile_info();
+    }
 
     if (is_producer_squad) {
+      if constexpr (KSplit) {
+        MUTLASS_PRAGMA_NO_UNROLL
+        for (int unit = int(blockIdx.x); unit < num_units; unit += int(gridDim.x)) {
+#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
+          __musa_loop_transparent_outermost();
+#endif
+          load(params,
+               shared_storage,
+               pipeline_load_a,
+               pipeline_load_b,
+               pipe_a_write,
+               pipe_b_write,
+               unit_work_tile(params, unit / k_split),
+               warp_idx_in_squad,
+               unit % k_split);
+        }
+        return;
+      }
       MUTLASS_PRAGMA_NO_UNROLL
       for (; work_tile.is_valid();) {
 #if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
@@ -798,7 +973,8 @@ struct Mp31DenseW4A16Gemm {
              pipe_a_write,
              pipe_b_write,
              work_tile,
-             warp_idx_in_squad);
+             warp_idx_in_squad,
+             0);
         scheduler.advance_to_next_work();
         work_tile = scheduler.get_work_tile_info();
       }
@@ -810,6 +986,23 @@ struct Mp31DenseW4A16Gemm {
     PipelineCastAState pipe_cast_a_read;
 
     if (is_caster_squad) {
+      if constexpr (KSplit) {
+        MUTLASS_PRAGMA_NO_UNROLL
+        for (int unit = int(blockIdx.x); unit < num_units; unit += int(gridDim.x)) {
+#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
+          __musa_loop_transparent_outermost();
+#endif
+          prepare_a(params,
+                    shared_storage,
+                    pipeline_load_a,
+                    pipeline_cast_a,
+                    pipe_a_read,
+                    pipe_cast_a_write,
+                    caster_thread_idx,
+                    unit % k_split);
+        }
+        return;
+      }
       MUTLASS_PRAGMA_NO_UNROLL
       for (; work_tile.is_valid();) {
 #if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
@@ -821,7 +1014,8 @@ struct Mp31DenseW4A16Gemm {
                   pipeline_cast_a,
                   pipe_a_read,
                   pipe_cast_a_write,
-                  caster_thread_idx);
+                  caster_thread_idx,
+                  0);
         scheduler.advance_to_next_work();
         work_tile = scheduler.get_work_tile_info();
       }
@@ -829,6 +1023,27 @@ struct Mp31DenseW4A16Gemm {
     }
 
     if (is_consumer_squad) {
+      if constexpr (KSplit) {
+        MUTLASS_PRAGMA_NO_UNROLL
+        for (int unit = int(blockIdx.x); unit < num_units; unit += int(gridDim.x)) {
+#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
+          __musa_loop_transparent_outermost();
+#endif
+          const int          split_id = unit % k_split;
+          const WorkTileInfo tile     = unit_work_tile(params, unit / k_split);
+          auto               rAcc     = compute(params,
+                                  shared_storage,
+                                  pipeline_load_b,
+                                  pipeline_cast_a,
+                                  pipe_b_read,
+                                  pipe_cast_a_read,
+                                  tile,
+                                  consumer_thread_idx,
+                                  split_id);
+          epilogue(params, rAcc, tile, consumer_thread_idx, split_id);
+        }
+        return;
+      }
       MUTLASS_PRAGMA_NO_UNROLL
       for (; work_tile.is_valid();) {
 #if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
@@ -841,8 +1056,9 @@ struct Mp31DenseW4A16Gemm {
                             pipe_b_read,
                             pipe_cast_a_read,
                             work_tile,
-                            consumer_thread_idx);
-        epilogue(params, rAcc, work_tile, consumer_thread_idx);
+                            consumer_thread_idx,
+                            0);
+        epilogue(params, rAcc, work_tile, consumer_thread_idx, 0);
 
         scheduler.advance_to_next_work();
         work_tile = scheduler.get_work_tile_info();

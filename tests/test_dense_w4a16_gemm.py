@@ -5,6 +5,8 @@ algebra, the act-order gate, input validation, and the JIT source rendering. Eve
 rendered source is covered by the on-device tests.
 """
 
+import pathlib
+
 import pytest
 import torch
 
@@ -12,8 +14,11 @@ from mate.jit.gemm.dense_w4a16_gemm import (
     DENSE_W4A16_GEMM_NIBBLE_BIAS,
     MATE_W4A16_WEIGHT_LAYOUT,
     apply_gidx_permutation,
+    DENSE_W4A16_GEMM_TILE,
+    DENSE_W4A16_GEMM_TILE_NARROW,
     dense_w4a16_gemm_dispatch_name,
     dense_w4a16_gemm_mutlass,
+    dense_w4a16_splitk_for,
     fold_zero_points,
     render_dense_w4a16_gemm_source,
 )
@@ -28,15 +33,91 @@ def test_weight_layout_contract_is_explicit() -> None:
 def test_dispatch_name_does_not_depend_on_m() -> None:
     # One compiled op serves every M, so the name is a function of the dtypes and the zero-point mode
     # only. A name that grew with M would mean a shape-independent trace had been frozen somewhere.
+    # The trailing tag is the launcher ABI, which the split-K arguments bumped: it is part of the JIT
+    # cache key, so a module compiled against the old signature is never loaded.
     assert dense_w4a16_gemm_dispatch_name(torch.float16, False) == (
-        "mp31_dense_w4a16_gemm_fp16_32x256x256_s2_sym"
+        "mp31_dense_w4a16_gemm_fp16_32x256x256_s2_sym_sk2"
     )
     assert dense_w4a16_gemm_dispatch_name(torch.float16, True) == (
-        "mp31_dense_w4a16_gemm_fp16_32x256x256_s2_zp"
+        "mp31_dense_w4a16_gemm_fp16_32x256x256_s2_zp_sk2"
     )
     assert dense_w4a16_gemm_dispatch_name(torch.bfloat16, True) != (
         dense_w4a16_gemm_dispatch_name(torch.float16, True)
     )
+
+
+def test_splitk_policy_leaves_a_full_wave_alone(monkeypatch) -> None:
+    # The split exists to fill the 60 MPs one wave covers. A launch that already has a wave of tiles
+    # must not be touched, and a narrow one takes the largest split whose partials stay small.
+    narrow = DENSE_W4A16_GEMM_TILE_NARROW
+    assert dense_w4a16_splitk_for(8, 1536, narrow) == 2  # 24 tiles
+    assert dense_w4a16_splitk_for(8, 3840, narrow) == 1  # exactly one wave
+    assert dense_w4a16_splitk_for(8, 3968, narrow) == 1  # past one wave
+    assert dense_w4a16_splitk_for(16, 128, narrow) == 8  # single tile, capped
+    # A short K cannot repay the reduction: at K=1536 the tile count says 2, the cost model says no.
+    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=35) == 2
+    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=6) == 1
+    assert dense_w4a16_splitk_for(16, 128, narrow, k_blocks=4) == 1
+    # The override is a benchmark seam, and it is the only way to force a split count.
+    monkeypatch.setattr(
+        "mate.jit.gemm.dense_w4a16_gemm.DENSE_W4A16_SPLITK_OVERRIDE", 3
+    )
+    assert dense_w4a16_splitk_for(8, 3840, narrow) == 3
+
+
+def test_splitk_override_is_a_working_env_seam(monkeypatch) -> None:
+    # An env var that silently does nothing is worse than no knob: the A/B has to be one export.
+    import mate.jit.gemm.dense_w4a16_gemm as G
+
+    monkeypatch.setenv("DENSE_W4A16_SPLITK_OVERRIDE", "3")
+    assert G._splitk_override_from_env() == 3
+    monkeypatch.setenv("DENSE_W4A16_SPLITK_OVERRIDE", "  ")
+    assert G._splitk_override_from_env() is None
+    monkeypatch.setenv("DENSE_W4A16_SPLITK_OVERRIDE", "two")
+    with pytest.raises(ValueError, match="must be an integer split count"):
+        G._splitk_override_from_env()
+
+
+def test_splitk_policy_names_its_arguments() -> None:
+    # The A/B recipe is easy to get wrong: 1536 lands in `tile` if the call is (m, k, n).
+    with pytest.raises(TypeError, match="tile must be"):
+        dense_w4a16_splitk_for(8, 8960, 1536)
+    # (size_m, size_n, tile, k_blocks): 24 tiles over 60 MPs is two units each, and 35 K blocks is
+    # enough that halving them saves more than the guard demands.
+    assert dense_w4a16_splitk_for(8, 1536, DENSE_W4A16_GEMM_TILE_NARROW, 35) == 2
+    # The same shape read with N and K swapped is a full wave and must not split at all.
+    assert dense_w4a16_splitk_for(8, 8960, DENSE_W4A16_GEMM_TILE_NARROW, 35) == 1
+
+
+def test_rendered_source_instantiates_both_k_split_modes() -> None:
+    # The whole-K path must be its own instantiation, not a runtime branch of the split one: that is
+    # what keeps an unsplit launch at the cost it had before split-K existed.
+    source = render_dense_w4a16_gemm_source(torch.float16, False)
+    assert "using KernelSplit" in source
+    assert "kZeroPoints, false>" in source.replace("\n", " ").replace("  ", " ")
+    assert "kZeroPoints, true>" in source.replace("\n", " ").replace("  ", " ")
+    # Exactly one host-side launch site, reached through one dispatch on the split count: a guard over
+    # the partial-argument checks, then the launch itself.
+    assert source.count("if (ks > 1)") == 2
+    assert source.count("launch_kernel(KernelTag<") == 2
+    # And no device-side split branch to pay for on the way through the unsplit kernel.
+    header = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "include/mate/gemm/deep_gemm/mp31_dense_w4a16_gemm.hpp"
+    ).read_text()
+    assert "if (params.k_split" not in header
+    assert "if (k_split" not in header
+
+
+def test_dispatch_name_carries_the_launcher_abi() -> None:
+    # The cache key has to move with the exported signature, or a module built for the old arguments
+    # is loaded and called with the new ones.
+    from mate.jit.gemm.dense_w4a16_gemm import DENSE_W4A16_GEMM_DISPATCH_ABI
+
+    assert DENSE_W4A16_GEMM_DISPATCH_ABI == "sk2"
+    assert dense_w4a16_gemm_dispatch_name(torch.float16, False, DENSE_W4A16_GEMM_TILE_NARROW)[
+        -4:
+    ] == "_sk2"
 
 
 def test_symmetric_zero_points_produce_no_correction() -> None:

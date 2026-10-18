@@ -8,6 +8,7 @@ covers the whole range; the persistent scheduler adapts the work distribution in
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -48,6 +49,74 @@ def dense_w4a16_gemm_tile_for(size_m: int, size_n: int) -> tuple:
         return DENSE_W4A16_GEMM_TILE_NARROW
     return DENSE_W4A16_GEMM_TILE
 DENSE_W4A16_GEMM_GROUP_SIZE = 128
+
+# Split-K. One CTA streams a whole column block, so its wall time is set by the bytes it reads and not
+# by how many CTAs are resident: measured on S5000 (60 MPs) at [M=8, K=8960], time was flat at ~62 us
+# from N=512 (8 tiles) to N=3840 (60 tiles) and only one wave of 60 tiles fills the machine. Below that
+# the idle MPs are the whole problem, so splitting K spreads one tile's column block over several CTAs
+# and divides its stream time by the split count.
+#
+# The rule is pure arithmetic on the tile count: a launch that already fills a wave must not be touched
+# (a split would only add a reduction), and anything narrower takes the largest split that fits, capped
+# so the extra partials stay small. 60 is the S5000 MP count.
+DENSE_W4A16_SPLITK_WAVE = 60
+DENSE_W4A16_SPLITK_MAX = 8
+# What a split costs and what it buys, measured on S5000 by sweeping K at [M=8, N=1536] (tile
+# 16x64x256): a launch costs ~11.3 us before it streams a byte, one K block of one column block costs
+# ~1.1 us, and the cross-split reduction adds ~4.5 us. A split therefore only pays when it takes more
+# than ~4 K blocks off every CTA. At K=1536 (6 K blocks) a 2-way split measures 15.6 -> 18.8 us on the
+# device, so the policy must not split a short K even when the tile count is small.
+DENSE_W4A16_SPLITK_MIN_BLOCKS_SAVED = 6
+# Test and benchmark seam: when set, every SQMMA launch runs with this split count. Never set by the
+# serving path -- a traced/captured graph must read the same policy value on every replay. The env var
+# is read once at import so an A/B is one `DENSE_W4A16_SPLITK_OVERRIDE=1` away; a malformed value is
+# loud here rather than silently ignored.
+def _splitk_override_from_env() -> Optional[int]:
+    raw = os.environ.get("DENSE_W4A16_SPLITK_OVERRIDE")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"DENSE_W4A16_SPLITK_OVERRIDE must be an integer split count, got {raw!r}"
+        ) from exc
+
+
+DENSE_W4A16_SPLITK_OVERRIDE: Optional[int] = _splitk_override_from_env()
+
+
+def dense_w4a16_splitk_for(size_m: int, size_n: int, tile=None, k_blocks: Optional[int] = None) -> int:
+    """The K-split count for one launch. Pure, so the policy is testable without a device.
+
+    Arguments, in order:
+
+    ``size_m``    problem M (rows of the activation).
+    ``size_n``    problem N (columns of the output).
+    ``tile``      optional ``(tile_m, tile_n, tile_k, stages)``; defaults to DENSE_W4A16_GEMM_TILE.
+                  A plain number here is a mistake, not a tile.
+    ``k_blocks``  optional K axis in tile units. When it is given, a split that cannot remove
+                  DENSE_W4A16_SPLITK_MIN_BLOCKS_SAVED blocks from every CTA is rejected, because the
+                  reduction would cost more than the streaming it saves.
+
+    Returns 1 for a whole-K launch or the split count for a split launch.
+    """
+    if tile is not None and not isinstance(tile, (tuple, list)):
+        raise TypeError(
+            f"tile must be (tile_m, tile_n, tile_k, stages) or None, got {tile!r}; "
+            f"call as dense_w4a16_splitk_for(size_m, size_n, tile, k_blocks)"
+        )
+    if DENSE_W4A16_SPLITK_OVERRIDE is not None:
+        return max(1, int(DENSE_W4A16_SPLITK_OVERRIDE))
+    tile_m, tile_n, _, _ = DENSE_W4A16_GEMM_TILE if tile is None else tile
+    tiles = -(-size_m // tile_m) * -(-size_n // tile_n)
+    if tiles <= 0 or tiles >= DENSE_W4A16_SPLITK_WAVE:
+        return 1
+    k_split = max(1, min(DENSE_W4A16_SPLITK_MAX, DENSE_W4A16_SPLITK_WAVE // tiles))
+    if k_blocks is not None:
+        while k_split > 1 and (k_blocks - -(-k_blocks // k_split)) < DENSE_W4A16_SPLITK_MIN_BLOCKS_SAVED:
+            k_split -= 1
+    return k_split
 
 # The MMA atom reads each 4-bit weight field as a signed two's-complement integer; measured on the
 # K256 tile, nibble 0x0 yields 0, 0x3 yields +3 and 0x8 yields -8. A checkpoint whose unsigned nibble
@@ -91,13 +160,23 @@ class MateW4A16WeightLayout:
 
 MATE_W4A16_WEIGHT_LAYOUT = MateW4A16WeightLayout()
 
+# The dispatch name is the JIT cache key, so it also has to carry the launcher ABI: the split-K
+# arguments changed the exported function's signature, and a module compiled against the old one would
+# be loaded and called with the new argument list. Bump this tag whenever that signature changes, or
+# when the kernels behind an unchanged signature change enough that a cached .so must not be reused
+# ("sk2" is the two-instantiation form, where the whole-K path is no longer a runtime-branched copy).
+DENSE_W4A16_GEMM_DISPATCH_ABI = "sk2"
+
 
 def dense_w4a16_gemm_dispatch_name(out_dtype: torch.dtype, zero_points: bool, tile=None) -> str:
     if out_dtype not in DENSE_W4A16_GEMM_OUTPUT_DTYPE_TAGS:
         raise ValueError(f"out_dtype must be fp16 or bf16, got {out_dtype!r}")
     tile_m, tile_n, tile_k, stages = DENSE_W4A16_GEMM_TILE if tile is None else tile
     zp_tag = "zp" if zero_points else "sym"
-    return f"mp31_dense_w4a16_gemm_{DENSE_W4A16_GEMM_OUTPUT_DTYPE_TAGS[out_dtype]}_{tile_m}x{tile_n}x{tile_k}_s{stages}_{zp_tag}"
+    return (
+        f"mp31_dense_w4a16_gemm_{DENSE_W4A16_GEMM_OUTPUT_DTYPE_TAGS[out_dtype]}"
+        f"_{tile_m}x{tile_n}x{tile_k}_s{stages}_{zp_tag}_{DENSE_W4A16_GEMM_DISPATCH_ABI}"
+    )
 
 
 def render_dense_w4a16_gemm_source(out_dtype: torch.dtype, zero_points: bool, tile=None) -> str:
@@ -464,6 +543,26 @@ def get_dense_w4a16_gemm_module(out_dtype: torch.dtype, zero_points: bool, tile=
     )
 
 
+@functools.cache
+def _dense_w4a16_gemm_entry(out_dtype: torch.dtype, zero_points: bool, tile=None, reduce_entry=False):
+    dispatch_name, module = get_dense_w4a16_gemm_module(out_dtype, zero_points, tile)
+    suffix = "_reduce" if reduce_entry else ""
+    return module.get_function(f"{dispatch_name}{suffix}")
+
+
+def get_dense_w4a16_gemm_functions(out_dtype: torch.dtype, zero_points: bool, tile=None):
+    """``(launch, reduce)`` for one instantiation.
+
+    ``launch`` also performs the cross-split reduction, because a split costs one extra kernel launch
+    and the host-side dispatch of a second entry point was measured at ~6 us against a 32 us kernel.
+    ``reduce`` is the same reduction on its own, for measuring it.
+    """
+    return (
+        _dense_w4a16_gemm_entry(out_dtype, zero_points, tile),
+        _dense_w4a16_gemm_entry(out_dtype, zero_points, tile, True),
+    )
+
+
 def apply_gidx_permutation(
     weight: torch.Tensor, g_idx: Optional[torch.Tensor]
 ) -> torch.Tensor:
@@ -666,19 +765,26 @@ def dense_w4a16_gemm_mutlass(
         )
         return out
 
-    dispatch_name, module = get_dense_w4a16_gemm_module(
-        out.dtype,
-        correction is not None,
-        dense_w4a16_gemm_tile_for(input_a.shape[0], out.shape[1]),
+    tile = dense_w4a16_gemm_tile_for(input_a.shape[0], out.shape[1])
+    launch_mps = resolve_num_mps(input_a.device, num_mps)
+    # A split can never be wider than the K axis it splits, so the tile count the policy sees is
+    # capped by the K block count; the last split is allowed to be shorter than the others.
+    k_blocks = -(-k // tile[2])
+    k_split = min(dense_w4a16_splitk_for(input_a.shape[0], out.shape[1], tile, k_blocks), k_blocks)
+    launch = _dense_w4a16_gemm_entry(out.dtype, correction is not None, tile)
+    if k_split <= 1:
+        # One split is the whole-K launch: the kernel writes `out` directly. `out` is handed over as
+        # the unused partial operand only to keep the argument list fixed across both modes.
+        launch(input_a, weight_b, scale_b_padded, correction_or_scale, out, out, launch_mps, 1)
+        return out
+    # Each split accumulates its own fp32 partial over its K range, so the cross-split reduction is a
+    # plain deterministic sum in a fixed order with no atomics: capture-safe, and the same inputs give
+    # the same bits. The same launch reduces the partials into `out` once the GEMM is done.
+    m_pad = -(-input_a.shape[0] // tile[0]) * tile[0]
+    partials = torch.empty(
+        (k_split, m_pad, out.shape[1]), dtype=torch.float32, device=input_a.device
     )
-    module.get_function(dispatch_name)(
-        input_a,
-        weight_b,
-        scale_b_padded,
-        correction_or_scale,
-        out,
-        resolve_num_mps(input_a.device, num_mps),
-    )
+    launch(input_a, weight_b, scale_b_padded, correction_or_scale, out, partials, launch_mps, k_split)
     return out
 
 
