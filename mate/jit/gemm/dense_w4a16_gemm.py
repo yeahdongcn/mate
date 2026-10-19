@@ -36,6 +36,18 @@ DENSE_W4A16_GEMM_TILE_NARROW = (16, 64, 256, 3)
 DENSE_W4A16_GEMM_NARROW_MAX_M = 32
 DENSE_W4A16_GEMM_NARROW_MAX_N = 4096
 
+# A wide-N tile for a small-M launch -- the decode gate_up shape, M=8 K=1536 N=17920. It is wider than
+# the narrow tile because N is large enough that the extra columns amortise the shorter K stage, and it
+# runs on the SQMMA GEMM family rather than the prefill kernel: the prefill tile has no tile_m/tile_k
+# freedom (the spec generator hard-guards 128x?x128), so this shape is only reachable by also moving the
+# family boundary in dense_w4a16_use_prefill. Measured on S5000 at M=8 K=1536 N=17920: 43.98 us on the
+# prefill path against 31.17 us here, and 43.98 -> 31.17 across 28 calls a decode step is -0.39 ms/step.
+#
+# The benefit is bounded by M: at M=32 this tile gives 280 CTAs over 6 waves and measures 21.0% WORSE
+# than the prefill path, so the rectangle stops at 16 and M=17..32 keeps prefill.
+DENSE_W4A16_GEMM_WIDE_N_TILE = (16, 128, 256, 3)
+DENSE_W4A16_GEMM_WIDE_N_MAX_M = 16
+
 
 def dense_w4a16_gemm_tile_for(size_m: int, size_n: int) -> tuple:
     """Pick the tile for one launch. Pure, so the choice is testable without a device.
@@ -47,6 +59,8 @@ def dense_w4a16_gemm_tile_for(size_m: int, size_n: int) -> tuple:
     """
     if size_m <= DENSE_W4A16_GEMM_NARROW_MAX_M and size_n <= DENSE_W4A16_GEMM_NARROW_MAX_N:
         return DENSE_W4A16_GEMM_TILE_NARROW
+    if size_m <= DENSE_W4A16_GEMM_WIDE_N_MAX_M and size_n > DENSE_W4A16_GEMM_NARROW_MAX_N:
+        return DENSE_W4A16_GEMM_WIDE_N_TILE
     return DENSE_W4A16_GEMM_TILE
 DENSE_W4A16_GEMM_GROUP_SIZE = 128
 
@@ -343,6 +357,9 @@ def dense_w4a16_use_prefill(size_m: int, size_n: int) -> bool:
         return True
     if size_m > DENSE_W4A16_GEMM_NARROW_MAX_M:
         return True
+    # This rectangle is served by the wide GEMM tile above, not by prefill.
+    if size_m <= DENSE_W4A16_GEMM_WIDE_N_MAX_M and size_n > DENSE_W4A16_GEMM_NARROW_MAX_N:
+        return False
     return size_m >= 8 and size_n > DENSE_W4A16_GEMM_NARROW_MAX_N
 
 def dense_w4a16_prefill_tile_for(m: int, n: int, k: int, num_mps: int):

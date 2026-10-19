@@ -16,9 +16,12 @@ from mate.jit.gemm.dense_w4a16_gemm import (
     apply_gidx_permutation,
     DENSE_W4A16_GEMM_TILE,
     DENSE_W4A16_GEMM_TILE_NARROW,
+    DENSE_W4A16_GEMM_WIDE_N_TILE,
     dense_w4a16_gemm_dispatch_name,
     dense_w4a16_gemm_mutlass,
+    dense_w4a16_gemm_tile_for,
     dense_w4a16_splitk_for,
+    dense_w4a16_use_prefill,
     fold_zero_points,
     render_dense_w4a16_gemm_source,
 )
@@ -44,6 +47,27 @@ def test_dispatch_name_does_not_depend_on_m() -> None:
     assert dense_w4a16_gemm_dispatch_name(torch.bfloat16, True) != (
         dense_w4a16_gemm_dispatch_name(torch.float16, True)
     )
+
+
+def test_wide_n_small_m_tile_takes_the_gemm_family() -> None:
+    # The decode gate_up shape (M=8, N=17920) is too wide for the narrow rectangle and too small for the
+    # prefill band, so it used to run the prefill kernel at a tile with no tile_m/tile_k freedom and
+    # measured 43.98 us against 31.17 us on the wide GEMM tile. The two decisions must agree: the tile
+    # selector returns the wide tile exactly where the family boundary routes away from prefill, because
+    # the prefill spec generator hard-guards 128x?x128 and cannot express this tile.
+    wide = DENSE_W4A16_GEMM_WIDE_N_TILE
+    assert wide == (16, 128, 256, 3)
+    for n in (8960, 17920):
+        assert dense_w4a16_gemm_tile_for(8, n) == wide
+        assert dense_w4a16_gemm_tile_for(16, n) == wide
+        assert dense_w4a16_use_prefill(8, n) is False
+        assert dense_w4a16_use_prefill(16, n) is False
+    # M=17..32 stays on prefill: at M=32 the wide tile gives 280 CTAs over 6 waves and measures 21% worse.
+    assert dense_w4a16_use_prefill(32, 17920) is True
+    assert dense_w4a16_gemm_tile_for(32, 17920) != wide
+    # N <= 4096 is the narrow rectangle, which keeps its own tile and its own prefill decision.
+    assert dense_w4a16_gemm_tile_for(8, 1536) == DENSE_W4A16_GEMM_TILE_NARROW
+    assert dense_w4a16_use_prefill(8, 1536) is False
 
 
 def test_splitk_policy_leaves_a_full_wave_alone(monkeypatch) -> None:
