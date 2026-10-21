@@ -82,7 +82,9 @@ def test_splitk_policy_leaves_a_full_wave_alone(monkeypatch) -> None:
     # split still measures 14.4 -> 12.2 us at M=8 and 13.6 -> 12.0 us at M=16, because 24 tiles leave
     # 36 of the 60 MPs without a CTA. Where the split would leave one block per CTA the reduction
     # dominates: [M=16, K=512, N=128] has 2 blocks and measures 10.5 -> 12.3 us, so it must not split.
-    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=35) == 2
+    # 35 K blocks is the long-K regime, where the wave-aligned model takes over: see
+    # test_splitk_wave_model_covers_the_long_k_shapes for the measurement behind the 5.
+    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=35) == 5
     assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=6) == 2
     assert dense_w4a16_splitk_for(16, 128, narrow, k_blocks=4) == 1
     assert dense_w4a16_splitk_for(16, 128, narrow, k_blocks=2) == 1
@@ -129,7 +131,7 @@ def test_splitk_policy_names_its_arguments() -> None:
         dense_w4a16_splitk_for(8, 8960, 1536)
     # (size_m, size_n, tile, k_blocks): 24 tiles over 60 MPs is two units each, and 35 K blocks is
     # enough that halving them keeps more than the floor of streaming blocks per CTA.
-    assert dense_w4a16_splitk_for(8, 1536, DENSE_W4A16_GEMM_TILE_NARROW, 35) == 2
+    assert dense_w4a16_splitk_for(8, 1536, DENSE_W4A16_GEMM_TILE_NARROW, 35) == 5
     # The same shape read with N and K swapped is a full wave and must not split at all.
     assert dense_w4a16_splitk_for(8, 8960, DENSE_W4A16_GEMM_TILE_NARROW, 35) == 1
     # The machine is keyword-only: a fifth positional argument is a mis-read of the signature, and
@@ -310,3 +312,23 @@ def test_launcher_passes_the_resolved_mp_count_to_the_split_policy() -> None:
         isinstance(node.value, ast.Call) and getattr(node.value.func, "id", "") == "resolve_num_mps"
         for node in assignments
     ), "launch_mps must come from resolve_num_mps, not from a constant"
+
+
+def test_splitk_wave_model_covers_the_long_k_shapes() -> None:
+    # Every expectation below is the argmin of a brute-force split sweep on S5000 (60 MPs, cold cache,
+    # grid 60). The model only runs at kb >= 16, so it can only ever raise what the fill rule chose.
+    narrow, wide = DENSE_W4A16_GEMM_TILE_NARROW, DENSE_W4A16_GEMM_WIDE_N_TILE
+    # down: K=8960 is 35 K blocks, 24 tiles at M=8/16 and 48 at M=32. Split 5 is two full waves of 120
+    # work items at 7 blocks each; the fill rule's split 2 fills 48 of 60 MPs at 18 blocks. Measured
+    # 27.72 -> 24.03 us (M=8), 27.20 -> 23.87 (M=16), 43.06 -> 39.36 (M=32).
+    assert dense_w4a16_splitk_for(8, 1536, narrow, 35) == 5
+    assert dense_w4a16_splitk_for(16, 1536, narrow, 35) == 5
+    assert dense_w4a16_splitk_for(32, 1536, narrow, 35) == 5
+    # Long K that the old rule already got right must not move: K=4096 is 16 blocks at 24 tiles.
+    assert dense_w4a16_splitk_for(8, 1536, narrow, 16) == 2
+    # Below the boundary the fill rule still owns the answer, and every measured shape keeps its split.
+    assert dense_w4a16_splitk_for(8, 1536, narrow, 11) == 2
+    assert dense_w4a16_splitk_for(8, 1536, narrow, 6) == 2  # o, 24 tiles
+    assert dense_w4a16_splitk_for(32, 1536, narrow, 6) == 1  # o at M=32, 48 tiles
+    assert dense_w4a16_splitk_for(8, 2048, narrow, 6) == 1  # qkv, 32 tiles
+    assert dense_w4a16_splitk_for(8, 17920, wide, 6) == 1  # gate_up, 140 tiles

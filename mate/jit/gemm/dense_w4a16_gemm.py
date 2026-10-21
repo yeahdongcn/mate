@@ -94,6 +94,23 @@ DENSE_W4A16_SPLITK_MAX = 8
 # was approximating is "streaming blocks per CTA versus the ~4.5 us reduction"; the floor below states
 # the break-even for that trade empirically, at two blocks, rather than deriving it.
 DENSE_W4A16_SPLITK_MIN_BLOCKS_PER_CTA = 2
+# Long K is the one regime where the fill rule is provably leaving time on the table, because there the
+# split can be aligned to whole waves instead of to a single one. Measured on S5000 (60 MPs, cold cache,
+# grid 60): `down` at K=8960 has 35 K blocks and 24 tiles, so the fill rule picks 2 -- 48 CTAs, 12 MPs
+# idle, 18 blocks each -- while 5 loads the machine with 120 work items, exactly two waves, at 7 blocks
+# each: 28.11 -> 24.26 us at M=8, 27.43 -> 24.00 at M=16, and at M=32 (48 tiles) 43.31 -> 40.05 us.
+# The curve is not monotonic in the split: 3 and 4 land on a fractional wave and measure 34.2 and 28.4 us
+# at M=8, which is why this is a cost model and not a bigger constant.
+#
+# The model prices every split by `waves * blocks_per_cta` plus a per-extra-split reduction term, and is
+# only consulted above this K. Below it the block count is too small for that trade: at K=1536 (6 blocks)
+# the fill rule already matches the measured optimum on `qkv`, `o` and `gate_up` at every M.
+DENSE_W4A16_SPLITK_LONG_K_BLOCKS = 16
+# Model constants. A CTA that gets fewer than three K blocks never fills the 3-stage pipeline, and each
+# extra split adds a partial to the final sum, priced here at a third of a K block. Fitted on the table
+# above; every pick below is unchanged for any value in [0.2, 0.6].
+DENSE_W4A16_SPLITK_PIPELINE_BLOCKS = 3
+DENSE_W4A16_SPLITK_REDUCTION_BLOCKS = 0.3
 # Test and benchmark seam: when set, every SQMMA launch runs with this split count. Never set by the
 # serving path -- a traced/captured graph must read the same policy value on every replay. The env var
 # is read once at import so an A/B is one `DENSE_W4A16_SPLITK_OVERRIDE=1` away; a malformed value is
@@ -111,6 +128,25 @@ def _splitk_override_from_env() -> Optional[int]:
 
 
 DENSE_W4A16_SPLITK_OVERRIDE: Optional[int] = _splitk_override_from_env()
+
+
+def _dense_w4a16_splitk_wave_cost(tiles: int, k_blocks: int, num_mps: int) -> int:
+    """The split that minimises modelled time when K is long enough to be worth re-aligning.
+
+    Time is priced in K blocks stepped: every wave of CTAs steps its own blocks, so the streaming term is
+    `waves * blocks_per_cta`, and each extra split adds a partial to the final sum. Ties keep the smaller
+    split, so this never splits for free.
+    """
+    best, best_cost = 1, None
+    for split in range(1, min(DENSE_W4A16_SPLITK_MAX, k_blocks) + 1):
+        blocks = -(-k_blocks // split)
+        if blocks < DENSE_W4A16_SPLITK_PIPELINE_BLOCKS:
+            continue
+        waves = -(-tiles * split // num_mps)
+        cost = waves * blocks + DENSE_W4A16_SPLITK_REDUCTION_BLOCKS * (split - 1)
+        if best_cost is None or cost < best_cost:
+            best, best_cost = split, cost
+    return best
 
 
 def dense_w4a16_splitk_for(
@@ -154,6 +190,10 @@ def dense_w4a16_splitk_for(
     if k_split > 1 and k_blocks is not None:
         if k_blocks // k_split < DENSE_W4A16_SPLITK_MIN_BLOCKS_PER_CTA:
             k_split = 1
+    if k_blocks is not None and k_blocks >= DENSE_W4A16_SPLITK_LONG_K_BLOCKS:
+        # Long K: a wave-aligned split can beat the one-wave fill rule. `max` keeps this strictly
+        # additive -- the model may raise the split, never lower the one the rules above already chose.
+        k_split = max(k_split, _dense_w4a16_splitk_wave_cost(tiles, k_blocks, num_mps))
     return k_split
 
 # The MMA atom reads each 4-bit weight field as a signed two's-complement integer; measured on the
