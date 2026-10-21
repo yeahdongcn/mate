@@ -269,3 +269,44 @@ def test_input_validation_rejects_a_broken_contract() -> None:
         dense_w4a16_gemm_mutlass(a, b.to(torch.float16), scale, out)
     with pytest.raises(ValueError):
         dense_w4a16_gemm_mutlass(a, b, scale, torch.zeros(m, n, dtype=torch.float32))
+
+
+def test_launcher_passes_the_resolved_mp_count_to_the_split_policy() -> None:
+    # The policy sizes a split against a machine; the launcher owns the resolved count. A call site that
+    # dropped the keyword would silently size every split against the module default again, which is the
+    # bug this guards, so assert the plumbing and not just the arithmetic.
+    import ast
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "mate/jit/gemm/dense_w4a16_gemm.py"
+    ).read_text()
+    launcher = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "dense_w4a16_gemm_mutlass"
+    )
+    calls = [
+        node
+        for node in ast.walk(launcher)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "dense_w4a16_splitk_for"
+    ]
+    assert len(calls) == 1, "the launcher must size the split in exactly one place"
+    keywords = {kw.arg: kw.value for kw in calls[0].keywords}
+    assert isinstance(keywords.get("num_mps"), ast.Name)
+    assert keywords["num_mps"].id == "launch_mps"
+    # ...and `launch_mps` has to be the resolved count, not a literal that happens to look like one.
+    assignments = [
+        node
+        for node in ast.walk(launcher)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id == "launch_mps"
+    ]
+    assert assignments, "launch_mps is never assigned in the launcher"
+    assert all(
+        isinstance(node.value, ast.Call) and getattr(node.value.func, "id", "") == "resolve_num_mps"
+        for node in assignments
+    ), "launch_mps must come from resolve_num_mps, not from a constant"
