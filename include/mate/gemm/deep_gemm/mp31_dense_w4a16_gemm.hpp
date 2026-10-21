@@ -168,7 +168,7 @@ struct Mp31DenseW4A16Gemm {
   static constexpr uint32_t Num1DBlocksPerSchedulerGroup = 4;
 
   static constexpr uint32_t NumProducerWarpSquads  = 1;
-  static constexpr uint32_t NumCasterWarpSquads    = 1;
+  static constexpr uint32_t NumCasterWarpSquads    = 2;
   static constexpr uint32_t NumConsumerWarpSquads  = AtomsAlongN;
   static constexpr uint32_t NumThreadsPerWarp      = mutlass::NumThreadsPerWarp;
   static constexpr uint32_t NumThreadsPerWarpSquad = mutlass::NumThreadsPerWarpSquad;
