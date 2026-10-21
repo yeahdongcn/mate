@@ -75,12 +75,19 @@ DENSE_W4A16_GEMM_GROUP_SIZE = 128
 # so the extra partials stay small. 60 is the S5000 MP count.
 DENSE_W4A16_SPLITK_WAVE = 60
 DENSE_W4A16_SPLITK_MAX = 8
-# What a split costs and what it buys, measured on S5000 by sweeping K at [M=8, N=1536] (tile
-# 16x64x256): a launch costs ~11.3 us before it streams a byte, one K block of one column block costs
-# ~1.1 us, and the cross-split reduction adds ~4.5 us. A split therefore only pays when it takes more
-# than ~4 K blocks off every CTA. At K=1536 (6 K blocks) a 2-way split measures 15.6 -> 18.8 us on the
-# device, so the policy must not split a short K even when the tile count is small.
-DENSE_W4A16_SPLITK_MIN_BLOCKS_SAVED = 6
+# This guard is about occupancy, not about how many K blocks a split saves. Measured on S5000 (60 MPs,
+# cold cache, tile 16x64x256, two independent timers agreeing): [M=8, K=1536, N=1536] has 24 tiles, so
+# 36 of the 60 MPs hold no CTA, and a 2-way split takes 14.4 -> 12.2 us; at [M=16] the same shape
+# measures 13.6 -> 12.0 us. Once the tile count covers most of the machine the split is a loss: at
+# [M=32] that shape has 48 tiles and measures 13.2 -> 15.7 us, and [M=32, K=8960] has 48 tiles and
+# measures 44.4 -> 46.9 us. And where the split leaves every CTA with a single K block the reduction
+# dominates outright: [M=16, K=512, N=128] has 2 tiles and 2 K blocks and measures 10.5 -> 12.3 us.
+#
+# The previous rule counted saved blocks instead (a split had to remove >= 6 from every CTA). At
+# K=1536 there are only 6 blocks, so it vetoed the very split that wins by 15% at M=8. The trade it
+# was approximating is "streaming blocks per CTA versus the ~4.5 us reduction"; the floor below states
+# the break-even for that trade empirically, at two blocks, rather than deriving it.
+DENSE_W4A16_SPLITK_MIN_BLOCKS_PER_CTA = 2
 # Test and benchmark seam: when set, every SQMMA launch runs with this split count. Never set by the
 # serving path -- a traced/captured graph must read the same policy value on every replay. The env var
 # is read once at import so an A/B is one `DENSE_W4A16_SPLITK_OVERRIDE=1` away; a malformed value is
@@ -109,9 +116,9 @@ def dense_w4a16_splitk_for(size_m: int, size_n: int, tile=None, k_blocks: Option
     ``size_n``    problem N (columns of the output).
     ``tile``      optional ``(tile_m, tile_n, tile_k, stages)``; defaults to DENSE_W4A16_GEMM_TILE.
                   A plain number here is a mistake, not a tile.
-    ``k_blocks``  optional K axis in tile units. When it is given, a split that cannot remove
-                  DENSE_W4A16_SPLITK_MIN_BLOCKS_SAVED blocks from every CTA is rejected, because the
-                  reduction would cost more than the streaming it saves.
+    ``k_blocks``  optional K axis in tile units. When it is given, a split that would leave every CTA
+                  with a single K block is rejected: at that point the ~4.5 us reduction costs more
+                  than the one block of streaming it removes.
 
     Returns 1 for a whole-K launch or the split count for a split launch.
     """
@@ -127,9 +134,9 @@ def dense_w4a16_splitk_for(size_m: int, size_n: int, tile=None, k_blocks: Option
     if tiles <= 0 or tiles >= DENSE_W4A16_SPLITK_WAVE:
         return 1
     k_split = max(1, min(DENSE_W4A16_SPLITK_MAX, DENSE_W4A16_SPLITK_WAVE // tiles))
-    if k_blocks is not None:
-        while k_split > 1 and (k_blocks - -(-k_blocks // k_split)) < DENSE_W4A16_SPLITK_MIN_BLOCKS_SAVED:
-            k_split -= 1
+    if k_split > 1 and k_blocks is not None:
+        if k_blocks // k_split < DENSE_W4A16_SPLITK_MIN_BLOCKS_PER_CTA:
+            k_split = 1
     return k_split
 
 # The MMA atom reads each 4-bit weight field as a signed two's-complement integer; measured on the

@@ -78,10 +78,20 @@ def test_splitk_policy_leaves_a_full_wave_alone(monkeypatch) -> None:
     assert dense_w4a16_splitk_for(8, 3840, narrow) == 1  # exactly one wave
     assert dense_w4a16_splitk_for(8, 3968, narrow) == 1  # past one wave
     assert dense_w4a16_splitk_for(16, 128, narrow) == 8  # single tile, capped
-    # A short K cannot repay the reduction: at K=1536 the tile count says 2, the cost model says no.
+    # A split pays only while every CTA keeps more than one K block. At K=1536 (6 blocks) a 2-way
+    # split still measures 14.4 -> 12.2 us at M=8 and 13.6 -> 12.0 us at M=16, because 24 tiles leave
+    # 36 of the 60 MPs without a CTA. Where the split would leave one block per CTA the reduction
+    # dominates: [M=16, K=512, N=128] has 2 blocks and measures 10.5 -> 12.3 us, so it must not split.
     assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=35) == 2
-    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=6) == 1
+    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=6) == 2
     assert dense_w4a16_splitk_for(16, 128, narrow, k_blocks=4) == 1
+    assert dense_w4a16_splitk_for(16, 128, narrow, k_blocks=2) == 1
+    # The floor sits between 3 and 4 blocks, and the batch dimension moves the answer the other way:
+    # at M=32 the same shape is 48 tiles and a split measures 13.2 -> 15.7 us, so it must stay whole.
+    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=3) == 1
+    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=4) == 2
+    assert dense_w4a16_splitk_for(16, 1536, narrow, k_blocks=6) == 2
+    assert dense_w4a16_splitk_for(32, 1536, narrow, k_blocks=6) == 1
     # The override is a benchmark seam, and it is the only way to force a split count.
     monkeypatch.setattr(
         "mate.jit.gemm.dense_w4a16_gemm.DENSE_W4A16_SPLITK_OVERRIDE", 3
