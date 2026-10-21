@@ -72,7 +72,13 @@ DENSE_W4A16_GEMM_GROUP_SIZE = 128
 #
 # The rule is pure arithmetic on the tile count: a launch that already fills a wave must not be touched
 # (a split would only add a reduction), and anything narrower takes the largest split that fits, capped
-# so the extra partials stay small. 60 is the S5000 MP count.
+# so the extra partials stay small.
+#
+# "A wave" is the machine the launch actually gets, which is why the policy takes the resolved MP count
+# as an argument: the launcher resolves it with resolve_num_mps(input_a.device, num_mps) -- an explicit
+# caller override, a set_num_mps() limit, or the device's own count -- and the prefill tile chooser in
+# this file already reads it the same way. The default below is only the S5000 figure for a caller that
+# has no device in hand.
 DENSE_W4A16_SPLITK_WAVE = 60
 DENSE_W4A16_SPLITK_MAX = 8
 # This guard is about occupancy, not about how many K blocks a split saves. Measured on S5000 (60 MPs,
@@ -107,7 +113,14 @@ def _splitk_override_from_env() -> Optional[int]:
 DENSE_W4A16_SPLITK_OVERRIDE: Optional[int] = _splitk_override_from_env()
 
 
-def dense_w4a16_splitk_for(size_m: int, size_n: int, tile=None, k_blocks: Optional[int] = None) -> int:
+def dense_w4a16_splitk_for(
+    size_m: int,
+    size_n: int,
+    tile=None,
+    k_blocks: Optional[int] = None,
+    *,
+    num_mps: int = DENSE_W4A16_SPLITK_WAVE,
+) -> int:
     """The K-split count for one launch. Pure, so the policy is testable without a device.
 
     Arguments, in order:
@@ -119,6 +132,8 @@ def dense_w4a16_splitk_for(size_m: int, size_n: int, tile=None, k_blocks: Option
     ``k_blocks``  optional K axis in tile units. When it is given, a split that would leave every CTA
                   with a single K block is rejected: at that point the ~4.5 us reduction costs more
                   than the one block of streaming it removes.
+    ``num_mps``   keyword-only: the machine this launch actually gets, as the launcher resolves it.
+                  Defaults to the S5000 figure for callers with no device in hand.
 
     Returns 1 for a whole-K launch or the split count for a split launch.
     """
@@ -129,11 +144,13 @@ def dense_w4a16_splitk_for(size_m: int, size_n: int, tile=None, k_blocks: Option
         )
     if DENSE_W4A16_SPLITK_OVERRIDE is not None:
         return max(1, int(DENSE_W4A16_SPLITK_OVERRIDE))
+    if num_mps <= 0:
+        raise ValueError(f"num_mps must be a positive MP count, got {num_mps!r}")
     tile_m, tile_n, _, _ = DENSE_W4A16_GEMM_TILE if tile is None else tile
     tiles = -(-size_m // tile_m) * -(-size_n // tile_n)
-    if tiles <= 0 or tiles >= DENSE_W4A16_SPLITK_WAVE:
+    if tiles <= 0 or tiles >= num_mps:
         return 1
-    k_split = max(1, min(DENSE_W4A16_SPLITK_MAX, DENSE_W4A16_SPLITK_WAVE // tiles))
+    k_split = max(1, min(DENSE_W4A16_SPLITK_MAX, num_mps // tiles))
     if k_split > 1 and k_blocks is not None:
         if k_blocks // k_split < DENSE_W4A16_SPLITK_MIN_BLOCKS_PER_CTA:
             k_split = 1
@@ -794,7 +811,14 @@ def dense_w4a16_gemm_mutlass(
     # A split can never be wider than the K axis it splits, so the tile count the policy sees is
     # capped by the K block count; the last split is allowed to be shorter than the others.
     k_blocks = -(-k // tile[2])
-    k_split = min(dense_w4a16_splitk_for(input_a.shape[0], out.shape[1], tile, k_blocks), k_blocks)
+    # Pass the resolved machine, not the module default: the policy sizes the split to fill a wave, and
+    # a caller override or a smaller part would otherwise be told to fill someone else's machine.
+    k_split = min(
+        dense_w4a16_splitk_for(
+            input_a.shape[0], out.shape[1], tile, k_blocks, num_mps=launch_mps
+        ),
+        k_blocks,
+    )
     launch = _dense_w4a16_gemm_entry(out.dtype, correction is not None, tile)
     if k_split <= 1:
         # One split is the whole-K launch: the kernel writes `out` directly. `out` is handed over as

@@ -71,7 +71,7 @@ def test_wide_n_small_m_tile_takes_the_gemm_family() -> None:
 
 
 def test_splitk_policy_leaves_a_full_wave_alone(monkeypatch) -> None:
-    # The split exists to fill the 60 MPs one wave covers. A launch that already has a wave of tiles
+    # The split exists to fill the wave the launch gets. A launch that already has a wave of tiles
     # must not be touched, and a narrow one takes the largest split whose partials stay small.
     narrow = DENSE_W4A16_GEMM_TILE_NARROW
     assert dense_w4a16_splitk_for(8, 1536, narrow) == 2  # 24 tiles
@@ -92,6 +92,17 @@ def test_splitk_policy_leaves_a_full_wave_alone(monkeypatch) -> None:
     assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=4) == 2
     assert dense_w4a16_splitk_for(16, 1536, narrow, k_blocks=6) == 2
     assert dense_w4a16_splitk_for(32, 1536, narrow, k_blocks=6) == 1
+    # A wave is the machine the launch gets, not a constant. The same 24-tile shape is two units on
+    # both shipping parts (48 and 60 MPs) but already a whole launch on a 24-MP one, where the unsplit
+    # grid covers the machine and a split would only add the reduction.
+    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=6, num_mps=60) == 2
+    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=6, num_mps=48) == 2
+    assert dense_w4a16_splitk_for(8, 1536, narrow, k_blocks=6, num_mps=24) == 1
+    # 48 tiles is one wave on a 48-MP part and stays whole on 60, where the fill rule also declines.
+    assert dense_w4a16_splitk_for(32, 1536, narrow, k_blocks=6, num_mps=48) == 1
+    assert dense_w4a16_splitk_for(32, 1536, narrow, k_blocks=6, num_mps=60) == 1
+    with pytest.raises(ValueError, match="num_mps must be a positive MP count"):
+        dense_w4a16_splitk_for(8, 1536, narrow, num_mps=0)
     # The override is a benchmark seam, and it is the only way to force a split count.
     monkeypatch.setattr(
         "mate.jit.gemm.dense_w4a16_gemm.DENSE_W4A16_SPLITK_OVERRIDE", 3
@@ -117,10 +128,14 @@ def test_splitk_policy_names_its_arguments() -> None:
     with pytest.raises(TypeError, match="tile must be"):
         dense_w4a16_splitk_for(8, 8960, 1536)
     # (size_m, size_n, tile, k_blocks): 24 tiles over 60 MPs is two units each, and 35 K blocks is
-    # enough that halving them saves more than the guard demands.
+    # enough that halving them keeps more than the floor of streaming blocks per CTA.
     assert dense_w4a16_splitk_for(8, 1536, DENSE_W4A16_GEMM_TILE_NARROW, 35) == 2
     # The same shape read with N and K swapped is a full wave and must not split at all.
     assert dense_w4a16_splitk_for(8, 8960, DENSE_W4A16_GEMM_TILE_NARROW, 35) == 1
+    # The machine is keyword-only: a fifth positional argument is a mis-read of the signature, and
+    # silently treating it as `num_mps` would size the split against the wrong machine.
+    with pytest.raises(TypeError):
+        dense_w4a16_splitk_for(8, 1536, DENSE_W4A16_GEMM_TILE_NARROW, 35, 48)
 
 
 def test_rendered_source_instantiates_both_k_split_modes() -> None:
