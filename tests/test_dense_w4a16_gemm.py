@@ -19,7 +19,9 @@ from mate.jit.gemm.dense_w4a16_gemm import (
     DENSE_W4A16_GEMM_WIDE_N_TILE,
     dense_w4a16_gemm_dispatch_name,
     dense_w4a16_gemm_mutlass,
+    dense_w4a16_gemm_plan,
     dense_w4a16_gemm_tile_for,
+    dense_w4a16_plan_cost,
     dense_w4a16_splitk_for,
     dense_w4a16_use_prefill,
     fold_zero_points,
@@ -68,6 +70,35 @@ def test_wide_n_small_m_tile_takes_the_gemm_family() -> None:
     # N <= 4096 is the narrow rectangle, which keeps its own tile and its own prefill decision.
     assert dense_w4a16_gemm_tile_for(8, 1536) == DENSE_W4A16_GEMM_TILE_NARROW
     assert dense_w4a16_use_prefill(8, 1536) is False
+
+
+def test_gemm_plan_prices_the_tile_against_the_k_axis() -> None:
+    # The tile decides the tile count, the split turns that count into work items, and the product is
+    # how many K blocks each CTA streams -- the number the per-CTA fixed cost multiplies. So the tile
+    # cannot be a rectangle in (M, N): `down` at K=8960 has 24 tiles on the narrow tile, so filling 60
+    # MPs makes 120 items and leaves 14 blocks per CTA, while the wide tile's 12 tiles take the same
+    # 60-item grid at 7 blocks each. Measured on S5000 (60 MPs, cold cache, best split per tile):
+    #   down    M=8 24.6 -> 17.3   M=16 24.5 -> 17.2   M=32 40.5 -> 26.0
+    #   qkv     M=8 14.2 -> 12.2 (N=2048)   M=16 13.2 -> 11.7   M=32 19.5 -> 13.7
+    #   gate_up M=8 42.7 -> 29.5   (N=17920, already on the wide tile)
+    #   o       M=8 12.33 against 12.24 -- a tie, which the model resolves by its own prediction.
+    wide = DENSE_W4A16_GEMM_WIDE_N_TILE
+    narrow = DENSE_W4A16_GEMM_TILE_NARROW
+    for m in (8, 16, 32):
+        # 12 tiles x 5 = 60 work items, one per CTA, seven K blocks each.
+        assert dense_w4a16_gemm_plan(m, 1536, 8960) == (wide, 5)
+    assert dense_w4a16_gemm_plan(8, 2048, 1536)[0] == wide
+    assert dense_w4a16_gemm_plan(8, 17920, 1536) == (wide, 1)
+    # The narrow tile keeps the shapes whose tile count already fills the wave, and the model must not
+    # widen a shape to no purpose: at M=16, N=1536 the pair measures 12.00 us against the wide tile's
+    # 12.39, so the cheaper prediction and the cheaper measurement agree.
+    assert dense_w4a16_gemm_plan(16, 1536, 1536) == (narrow, 2)
+    assert dense_w4a16_gemm_plan(8, 1536, 1536) == (narrow, 2)
+    # At M=32 the same shape is 48 narrow tiles and measures 13.07 against the wide tile's 12.50.
+    assert dense_w4a16_gemm_plan(32, 1536, 1536) == (wide, 2)
+    # A split is never wider than the K axis it splits.
+    tile, split = dense_w4a16_gemm_plan(8, 1536, 256)
+    assert split == 1 and tile == narrow
 
 
 def test_splitk_policy_leaves_a_full_wave_alone(monkeypatch) -> None:
@@ -293,7 +324,7 @@ def test_launcher_passes_the_resolved_mp_count_to_the_split_policy() -> None:
         for node in ast.walk(launcher)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "dense_w4a16_splitk_for"
+        and node.func.id == "dense_w4a16_gemm_plan"
     ]
     assert len(calls) == 1, "the launcher must size the split in exactly one place"
     keywords = {kw.arg: kw.value for kw in calls[0].keywords}
@@ -337,3 +368,20 @@ def test_splitk_wave_model_covers_the_long_k_shapes() -> None:
     # its answer instead of paying for partials that save nothing.
     assert dense_w4a16_splitk_for(128, 1536, DENSE_W4A16_GEMM_TILE, 35) == 2
     assert dense_w4a16_splitk_for(256, 1536, DENSE_W4A16_GEMM_TILE, 35) == 1
+
+
+def test_gemm_plan_forwards_the_machine_it_was_given() -> None:
+    # The plan adds the tile to the search; it must not add a second split heuristic. For whichever tile
+    # it picks, the split has to be exactly what `dense_w4a16_splitk_for` answers for that tile and that
+    # machine -- otherwise the two rules can drift apart and only the benchmark would notice.
+    for num_mps in (24, 48, 60):
+        tile, split = dense_w4a16_gemm_plan(8, 1536, 1536, num_mps=num_mps)
+        k_blocks = -(-1536 // tile[2])
+        assert split == dense_w4a16_splitk_for(
+            8, 1536, tile, k_blocks, num_mps=num_mps
+        )
+    # ...and the machine does reach it: the 24-tile shape is already a whole wave on a 24-MP part, where
+    # the narrow tile must not split, while on 60 MPs the same tile takes 2.
+    narrow = DENSE_W4A16_GEMM_TILE_NARROW
+    assert dense_w4a16_splitk_for(8, 1536, narrow, 6, num_mps=24) == 1
+    assert dense_w4a16_splitk_for(8, 1536, narrow, 6, num_mps=60) == 2

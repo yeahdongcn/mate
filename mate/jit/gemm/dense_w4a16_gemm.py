@@ -56,6 +56,10 @@ def dense_w4a16_gemm_tile_for(size_m: int, size_n: int) -> tuple:
     argument and must not become one: the ported suite forbids M-shaped parameters precisely so a
     caller cannot freeze a shape-specific decision at trace time, and keeping the choice internal is
     also what makes the op graph-capture safe.
+
+    This is the answer when K is unknown -- the rectangle the tile was validated in. The launch path
+    does not use it: `dense_w4a16_gemm_plan` prices both decode tiles against the actual K, because
+    the tile count a tile produces decides the split, and the split decides the blocks per CTA.
     """
     if size_m <= DENSE_W4A16_GEMM_NARROW_MAX_M and size_n <= DENSE_W4A16_GEMM_NARROW_MAX_N:
         return DENSE_W4A16_GEMM_TILE_NARROW
@@ -63,6 +67,89 @@ def dense_w4a16_gemm_tile_for(size_m: int, size_n: int) -> tuple:
         return DENSE_W4A16_GEMM_WIDE_N_TILE
     return DENSE_W4A16_GEMM_TILE
 DENSE_W4A16_GEMM_GROUP_SIZE = 128
+
+# A launch on the SQMMA family costs two things that a tile count alone does not show: a fixed
+# prologue/epilogue per CTA and a serial per-K-block stream inside it. Measured on S5000 (60 MPs,
+# cold cache) by holding the tile count and sweeping K, so the slope and the intercept separate:
+# [M=8, N=1536, tile 16x64] measures 9.95 us at 2 K blocks and 33.41 us at 24, i.e.
+#     time = 7.9 us + 1.07 us/block
+# and the same fit on the wide tile gives 8.7 + 1.15, so the per-block price barely moves when the B
+# tile doubles: the stream is latency-bound per CTA, not bandwidth-bound (an 8 KB and a 16 KB block
+# cost the same). Two consequences drive the plan below.
+#
+# First, the intercept is per CTA, not per work item: at 24 tiles, K=1536, 8 blocks per CTA measures
+# 18.15 us as one work item and 18.32 us as two items of 4 blocks, so there is nothing to hoist out
+# of the item loop. What the intercept punishes is a launch whose CTAs have too few K blocks to
+# amortise it -- at K=1536 the fixed part is ~55% of the run.
+#
+# Second, whose CTAs those are is decided by the tile, because the tile decides the tile count and
+# the split then decides how many work items that count becomes. That is why the tile cannot be
+# chosen from M and N alone: `down` at K=8960 is 24 tiles on the narrow tile, so the split that
+# fills 60 MPs has to make 120 items and each CTA still streams 14 blocks, while the wide tile makes
+# 12 tiles and the same 60-item grid leaves 7 blocks each: 24.5 -> 17.3 us at M=8, 24.5 -> 17.2 at
+# M=16, 40.5 -> 26.0 at M=32. The K axis is what turns the wide tile from a N-driven special case
+# into the better tile for every decode projection.
+DENSE_W4A16_PLAN_OVERHEAD_US = 8.0
+DENSE_W4A16_PLAN_BLOCK_US_NARROW = 1.05
+DENSE_W4A16_PLAN_BLOCK_US_WIDE = 1.15
+
+
+def dense_w4a16_plan_cost(
+    size_m: int,
+    size_n: int,
+    tile: tuple,
+    k_split: int,
+    k_blocks: int,
+    num_mps: int,
+) -> float:
+    """Price one (tile, split) pair in microseconds. Pure, so the choice is testable without a device.
+
+    Every CTA that ends up holding work pays the prologue once and then streams its own K blocks
+    serially, so a work item that lands on top of another one costs a whole extra block chain rather
+    than eliding it: blocks per CTA is waves times blocks per item, not the total divided by the grid.
+    """
+    tile_m, tile_n, tile_k, _ = tile
+    tiles = -(-size_m // tile_m) * -(-size_n // tile_n)
+    items = tiles * k_split
+    waves = -(-items // num_mps)
+    blocks_per_cta = waves * -(-k_blocks // k_split)
+    block_us = (
+        DENSE_W4A16_PLAN_BLOCK_US_NARROW
+        if tile_n <= DENSE_W4A16_GEMM_TILE_NARROW[1]
+        else DENSE_W4A16_PLAN_BLOCK_US_WIDE
+    )
+    return (
+        DENSE_W4A16_PLAN_OVERHEAD_US
+        + blocks_per_cta * block_us
+        + DENSE_W4A16_SPLITK_REDUCTION_BLOCKS * (k_split - 1)
+    )
+
+
+def dense_w4a16_gemm_plan(
+    size_m: int, size_n: int, size_k: int, num_mps: Optional[int] = None
+) -> tuple:
+    """Pick (tile, k_split) for one launch by pricing every candidate. Pure and device-free.
+
+    The candidates are the two decode instantiations. The prefill family is chosen earlier, before
+    this runs, by `dense_w4a16_use_prefill`, and the GEMV keeps its own rectangle, so neither is
+    priced here. The split for each tile comes from `dense_w4a16_splitk_for`, which is the rule the
+    shipped path already used for a fixed tile -- the plan adds the tile to the search, not a second
+    split heuristic.
+    """
+    if num_mps is None:
+        # The S5000 figure, for a caller with no device in hand. The launch path passes the machine it
+        # actually resolved, because a split sized to fill 60 MPs is wrong on a smaller part.
+        num_mps = DENSE_W4A16_SPLITK_WAVE
+    best = None
+    for tile in (DENSE_W4A16_GEMM_TILE_NARROW, DENSE_W4A16_GEMM_WIDE_N_TILE):
+        k_blocks = -(-size_k // tile[2])
+        k_split = min(
+            dense_w4a16_splitk_for(size_m, size_n, tile, k_blocks, num_mps=num_mps), k_blocks
+        )
+        cost = dense_w4a16_plan_cost(size_m, size_n, tile, k_split, k_blocks, num_mps)
+        if best is None or cost < best[0]:
+            best = (cost, tile, k_split)
+    return best[1], best[2]
 
 # Split-K. One CTA streams a whole column block, so its wall time is set by the bytes it reads and not
 # by how many CTAs are resident: measured on S5000 (60 MPs) at [M=8, K=8960], time was flat at ~62 us
@@ -862,19 +949,15 @@ def dense_w4a16_gemm_mutlass(
         )
         return out
 
-    tile = dense_w4a16_gemm_tile_for(input_a.shape[0], out.shape[1])
     launch_mps = resolve_num_mps(input_a.device, num_mps)
-    # A split can never be wider than the K axis it splits, so the tile count the policy sees is
-    # capped by the K block count; the last split is allowed to be shorter than the others.
-    k_blocks = -(-k // tile[2])
-    # Pass the resolved machine, not the module default: the policy sizes the split to fill a wave, and
-    # a caller override or a smaller part would otherwise be told to fill someone else's machine.
-    k_split = min(
-        dense_w4a16_splitk_for(
-            input_a.shape[0], out.shape[1], tile, k_blocks, num_mps=launch_mps
-        ),
-        k_blocks,
+    # Price both decode tiles against this launch's K and keep the cheaper (tile, split) pair. Choosing
+    # one argmaxes nothing: the tile fixes the tile count, the split turns that count into work items,
+    # and the blocks each CTA streams is the product the cost model prices.
+    tile, k_split = dense_w4a16_gemm_plan(
+        input_a.shape[0], out.shape[1], k, num_mps=launch_mps
     )
+    # A split can never be wider than the K axis it splits.
+    k_split = min(k_split, -(-k // tile[2]))
     launch = _dense_w4a16_gemm_entry(out.dtype, correction is not None, tile)
     if k_split <= 1:
         # One split is the whole-K launch: the kernel writes `out` directly. `out` is handed over as
