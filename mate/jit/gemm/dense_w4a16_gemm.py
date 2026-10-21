@@ -130,12 +130,17 @@ def _splitk_override_from_env() -> Optional[int]:
 DENSE_W4A16_SPLITK_OVERRIDE: Optional[int] = _splitk_override_from_env()
 
 
+@functools.lru_cache(maxsize=256)
 def _dense_w4a16_splitk_wave_cost(tiles: int, k_blocks: int, num_mps: int) -> int:
     """The split that minimises modelled time when K is long enough to be worth re-aligning.
 
     Time is priced in K blocks stepped: every wave of CTAs steps its own blocks, so the streaming term is
     `waves * blocks_per_cta`, and each extra split adds a partial to the final sum. Ties keep the smaller
     split, so this never splits for free.
+
+    Cached because it is pure over three integers and sits on a path called once per GEMM: the search
+    measured 4.4 us per call against the 0.6 us the previous rule needed, which is invisible under graph
+    capture but not for an eager caller.
     """
     best, best_cost = 1, None
     for split in range(1, min(DENSE_W4A16_SPLITK_MAX, k_blocks) + 1):
