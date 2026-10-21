@@ -332,3 +332,8 @@ def test_splitk_wave_model_covers_the_long_k_shapes() -> None:
     assert dense_w4a16_splitk_for(32, 1536, narrow, 6) == 1  # o at M=32, 48 tiles
     assert dense_w4a16_splitk_for(8, 2048, narrow, 6) == 1  # qkv, 32 tiles
     assert dense_w4a16_splitk_for(8, 17920, wide, 6) == 1  # gate_up, 140 tiles
+    # The prefill tile is bandwidth-bound and split-invariant -- `down` measures 71.8 / 71.9 / 72.3 us
+    # at splits 2 / 5 / 1 for M=128 / 256 / 512 -- so the model stays out of it and the fill rule keeps
+    # its answer instead of paying for partials that save nothing.
+    assert dense_w4a16_splitk_for(128, 1536, DENSE_W4A16_GEMM_TILE, 35) == 2
+    assert dense_w4a16_splitk_for(256, 1536, DENSE_W4A16_GEMM_TILE, 35) == 1

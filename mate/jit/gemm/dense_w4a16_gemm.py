@@ -111,6 +111,12 @@ DENSE_W4A16_SPLITK_LONG_K_BLOCKS = 16
 # above; every pick below is unchanged for any value in [0.2, 0.6].
 DENSE_W4A16_SPLITK_PIPELINE_BLOCKS = 3
 DENSE_W4A16_SPLITK_REDUCTION_BLOCKS = 0.3
+# The model prices K blocks stepped per CTA, which is the binding cost only on the narrow tile: there the
+# part is latency-bound and a CTA that stalls on its block stream is time nobody reclaims. On the prefill
+# tile the same shape is bandwidth-bound and the split does not matter -- `down` at M=128/256/512 measures
+# 71.8 / 71.9 / 72.3 us at splits 2, 5 and 1 alike (within +-0.3 %), so consulting the model there would
+# only add partials traffic. Gate on the tile the policy was validated on.
+DENSE_W4A16_SPLITK_WAVE_TILE_M = 16
 # Test and benchmark seam: when set, every SQMMA launch runs with this split count. Never set by the
 # serving path -- a traced/captured graph must read the same policy value on every replay. The env var
 # is read once at import so an A/B is one `DENSE_W4A16_SPLITK_OVERRIDE=1` away; a malformed value is
@@ -195,9 +201,14 @@ def dense_w4a16_splitk_for(
     if k_split > 1 and k_blocks is not None:
         if k_blocks // k_split < DENSE_W4A16_SPLITK_MIN_BLOCKS_PER_CTA:
             k_split = 1
-    if k_blocks is not None and k_blocks >= DENSE_W4A16_SPLITK_LONG_K_BLOCKS:
-        # Long K: a wave-aligned split can beat the one-wave fill rule. `max` keeps this strictly
-        # additive -- the model may raise the split, never lower the one the rules above already chose.
+    if (
+        k_blocks is not None
+        and k_blocks >= DENSE_W4A16_SPLITK_LONG_K_BLOCKS
+        and tile[0] <= DENSE_W4A16_SPLITK_WAVE_TILE_M
+    ):
+        # Long K on the narrow tile: a wave-aligned split can beat the one-wave fill rule. `max` keeps
+        # this strictly additive -- the model may raise the split, never lower the one the rules above
+        # already chose.
         k_split = max(k_split, _dense_w4a16_splitk_wave_cost(tiles, k_blocks, num_mps))
     return k_split
 
